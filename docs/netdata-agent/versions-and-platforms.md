@@ -1,69 +1,102 @@
 # Netdata Agent Versions & Platforms
 
-Netdata is evolving rapidly and new features are added at a constant pace. Therefore, we have a frequent release cadence to deliver all these features to use as soon as possible.
+Netdata is evolving rapidly and new features are added at a constant pace. Therefore, we have a frequent release cadence to deliver all these features to you as soon as possible.
 
-Netdata Agents are available in 2 versions:
+You can choose from 2 Netdata Agent release channels:
 
-| Release Channel |               Release Frequency               |                 Support Policy & Features                 |             Support Duration             |                              Backwards Compatibility                              |
-|:---------------:|:---------------------------------------------:|:---------------------------------------------------------:|:----------------------------------------:|:---------------------------------------------------------------------------------:|
-|     Stable      | At most once per month, usually every 45 days | Receiving bug fixes and security updates between releases | Up to the 2nd stable release after them  |     Previous configuration semantics and data are supported by newer releases     |
-|     Nightly     |           Every night at 00:00 UTC            |               Latest pre-released features                | Up to the 2nd nightly release after them | Configuration and data of unreleased features may change between nightly releases |
+| Release Channel |                            Release Frequency                            |                 Support Policy & Features                 |             Support Duration             |                              Backwards Compatibility                              |
+| :-------------: | :---------------------------------------------------------------------: | :-------------------------------------------------------: | :--------------------------------------: | :-------------------------------------------------------------------------------: |
+|   **Stable**    | Usually 4-6 major/minor releases per year plus patch releases as needed | Receiving bug fixes and security updates between releases | Up to the 2nd stable release after them  |     Previous configuration semantics and data are supported by newer releases     |
+|   **Nightly**   |                      Most nights around 02:00 UTC                       |               Latest pre-released features                | Up to the 2nd nightly release after them | Configuration and data of unreleased features may change between nightly releases |
 
-> "Support Duration" defines the time we consider the release as actively used by users in production systems, so that all features of Netdata should be working like the day they were released. However, after the latest release, previous releases stop receiving bug fixes and security updates. All users are advised to update to the latest release to get the latest bug fixes.
+:::info
+
+"Support Duration" defines how long we consider each release actively used in production systems. After this period, you should update to the latest release to continue receiving bug fixes and security updates.
+
+:::
+
+:::tip
+
+**Switching Between Stable and Nightly Builds**: You can switch between stable and nightly channels depending on your needs. The method depends on how you originally installed Netdata. For further information, please reference our [switching guide](https://learn.netdata.cloud/docs/netdata-agent/installation/linux/switch-install-types-and-release-channels).
+
+:::
 
 ## Binary Distribution Packages
 
-Binary distribution packages are provided by Netdata, via CI integration, for the following platforms and architectures:
+We provide binary distribution packages via CI integration for the following platforms and architectures:
 
-|        Platform         |        Platform Versions         |          Released Packages Architecture          |    Format    |
-|:-----------------------:|:--------------------------------:|:------------------------------------------------:|:------------:|
-|   Docker under Linux    |         19.03 and later          | `x86_64`, `i386`, `ARMv7`, `AArch64`, `POWER8+`  | docker image |
-|      Static Builds      |                -                 | `x86_64`, `ARMv6`, `ARMv7`, `AArch64`, `POWER8+` |   .gz.run    |
-|       Alma Linux        |             8.x, 9.x             |               `x86_64`, `AArch64`                |     RPM      |
-|      Amazon Linux       |             2, 2023              |               `x86_64`, `AArch64`                |     RPM      |
-|         Centos          |               7.x                |                     `x86_64`                     |     RPM      |
-|         Debian          |         10.x, 11.x, 12.x         |       `x86_64`, `i386`, `ARMv7`, `AArch64`       |     DEB      |
-|         Fedora          |            37, 38, 39            |               `x86_64`, `AArch64`                |     RPM      |
-|        OpenSUSE         | Leap 15.4, Leap 15.5, Tumbleweed |               `x86_64`, `AArch64`                |     RPM      |
-|      Oracle Linux       |             8.x, 9.x             |               `x86_64`, `AArch64`                |     RPM      |
-| Redhat Enterprise Linux |               7.x                |                     `x86_64`                     |     RPM      |
-| Redhat Enterprise Linux |             8.x, 9.x             |               `x86_64`, `AArch64`                |     RPM      |
-|         Ubuntu          |       20.04, 22.04, 23.10        |       `x86_64`, `i386`, `ARMv7`, `AArch64`       |     DEB      |
+|          Platform           |     Platform Versions      |    Released Packages Architecture     |    Format    |
+| :-------------------------: | :------------------------: | :-----------------------------------: | :----------: |
+|   **Docker under Linux**    |      19.03 and later       | `x86_64`, `i386`, `ARMv7`, `AArch64`  | docker image |
+|      **Static Builds**      |             -              | `x86_64`, `ARMv6`, `ARMv7`, `AArch64` |   .gz.run    |
+|       **Alma Linux**        |       8.x, 9.x, 10.x       |          `x86_64`, `AArch64`          |     RPM      |
+|      **Amazon Linux**       |          2, 2023           |          `x86_64`, `AArch64`          |     RPM      |
+|         **Centos**          |            7.x             |               `x86_64`                |     RPM      |
+|         **Debian**          |         11.x, 12.x         | `x86_64`, `i386`, `ARMv7`, `AArch64`  |     DEB      |
+|         **Debian**          |            13.x            |     `x86_64`, `ARMv7`, `AArch64`      |     DEB      |
+|         **Fedora**          |           41, 42           |          `x86_64`, `AArch64`          |     RPM      |
+|        **OpenSUSE**         |   Leap 15.6, Tumbleweed    |          `x86_64`, `AArch64`          |     RPM      |
+|      **Oracle Linux**       |       8.x, 9.x, 10.x       |          `x86_64`, `AArch64`          |     RPM      |
+| **Redhat Enterprise Linux** |            7.x             |               `x86_64`                |     RPM      |
+| **Redhat Enterprise Linux** |       8.x, 9.x, 10.x       |          `x86_64`, `AArch64`          |     RPM      |
+|         **Ubuntu**          | 20.04, 22.04, 24.04, 25.04 |     `x86_64`, `ARMv7`, `AArch64`      |     DEB      |
 
-> IMPORTANT: Linux distributions frequently provide binary packages of Netdata. However, the packages you will find in the distributions' repositories may be outdated, incomplete, missing significant features or completely broken. We recommend using the packages we provide.
+:::important
+
+Linux distributions frequently provide binary packages of Netdata. However, **the packages you will find in the distributions' repositories may be outdated, incomplete, missing significant features or completely broken**. We recommend using the packages we provide.
+
+:::
 
 ## Third-party Supported Binary Packages
 
 The following distributions always provide the latest stable version of Netdata:
 
-|  Platform  | Platform Versions |    Released Packages Architecture    |
-|:----------:|:-----------------:|:------------------------------------:|
-| Arch Linux |      Latest       | All the Arch supported architectures |
-| MacOS Brew |      Latest       | All the Brew supported architectures |
+|    Platform    | Platform Versions |    Released Packages Architecture    |
+| :------------: | :---------------: | :----------------------------------: |
+| **Arch Linux** |      Latest       | All the Arch supported architectures |
 
 ## Builds from Source
 
-We guarantee Netdata builds from source for the platforms we provide automated binary packages. These platforms are automatically checked via our CI, and fixes are always applied to allow merging new code into the nightly versions.
+We guarantee that you can build Netdata from source for the platforms where we provide automated binary packages. These platforms are automatically checked via our CI, and fixes are always applied to allow merging new code into the nightly versions.
 
-The following builds from source should usually work, although we don't regularly monitor if there are issues:
+The following builds from source should usually work for you, although we don't regularly monitor if there are issues:
 
-|              Platform               |     Platform Versions      |
-|:-----------------------------------:|:--------------------------:|
-|         Linux Distributions         | Latest unreleased versions |
-|       FreeBSD and derivatives       |         13-STABLE          |
-|       Gentoo and derivatives        |           Latest           |
-|     Arch Linux and derivatives      |      latest from AUR       |
-|                MacOS                |         11, 12, 13         |
-| Linux under Microsoft Windows (WSL) |           Latest           |
+|            Platform            |     Platform Versions      |
+| :----------------------------: | :------------------------: |
+|    **Linux Distributions**     | Latest unreleased versions |
+|  **FreeBSD and derivatives**   |         14-STABLE          |
+|   **Gentoo and derivatives**   |           Latest           |
+| **Arch Linux and derivatives** |      latest from AUR       |
+|           **MacOS**            |         13, 14, 15         |
 
 ## Static Builds and Unsupported Linux Versions
 
-The static builds of Netdata can be used on any Linux platform of the supported architectures. The only requirement these static builds have is a working Linux kernel, any version. Everything else required for Netdata to run is inside the package itself.
+You can run Netdata's static builds on any Linux platform with a supported CPU architecture, requiring only a kernel version of 2.6 or newer. These self-contained packages include everything you need for Netdata to operate effectively.
 
-Static builds usually miss certain features that require operating-system support and can’t be provided generically. These features include:
+### Limitations of Static Builds
 
-- IPMI hardware sensors support
-- systemd-journal features
-- eBPF related features
+When you use static builds, you'll miss certain features that require specific operating system support, including:
 
-When platforms are removed from the [Binary Distribution Packages](/packaging/makeself/README.md) list, they default to install or update Netdata to a static build. This may mean that after platforms become EOL, Netdata on them may lose some of its features. We recommend upgrading the operating system before it becomes EOL, to continue using all the features of Netdata.
+- IPMI hardware sensors monitoring
+- eBPF-related capabilities
+
+### Impact of Platform End-of-Life (EOL)
+
+When a platform is removed from the Binary Distribution Packages list:
+
+- **No automatic transitions occur**: Your existing native package installations will remain as they are
+- **Your local updater will report the Agent as up-to-date** even when newer versions exist.
+- **When a new Netdata version is published, you'll see** "_Nodes are below the recommended Agent version_" **warnings** in the Netdata Cloud UI.
+- **You will stop receiving new features, improvements, and security updates**.
+
+:::important
+
+**We strongly recommend upgrading your operating system before it reaches EOL** to maintain full Netdata functionality and continued updates.
+
+:::
+
+:::tip
+
+**Migrating from Native Package to Static Build**: If upgrading your operating system isn't possible, you can manually switch to a static build. For more information, please reference our [switching guide](https://learn.netdata.cloud/docs/netdata-agent/installation/linux/switch-install-types-and-release-channels).
+
+:::

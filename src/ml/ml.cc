@@ -18,7 +18,15 @@
 #define WORKER_TRAIN_FLUSH_MODELS      7
 
 sqlite3 *ml_db = NULL;
-static netdata_mutex_t db_mutex = NETDATA_MUTEX_INITIALIZER;
+static netdata_mutex_t db_mutex;
+
+static void __attribute__((constructor)) init_mutex(void) {
+    netdata_mutex_init(&db_mutex);
+}
+
+static void __attribute__((destructor)) destroy_mutex(void) {
+    netdata_mutex_destroy(&db_mutex);
+}
 
 typedef struct {
     // First/last entry of the dimension in DB when generating the response
@@ -48,13 +56,28 @@ ml_dimension_calculated_numbers(ml_worker_t *worker, ml_dimension_t *dim)
     training_response.first_entry_on_response = rrddim_first_entry_s_of_tier(dim->rd, 0);
     training_response.last_entry_on_response = rrddim_last_entry_s_of_tier(dim->rd, 0);
 
-    size_t min_n = Cfg.min_train_samples;
-    size_t max_n = Cfg.max_train_samples;
+    unsigned chart_update_every = dim->rd->rrdset->update_every;
+    size_t smoothing_window = (chart_update_every > nd_profile.update_every) ? 1 : Cfg.max_samples_to_smooth;
+    size_t min_required_samples = Cfg.diff_n + smoothing_window + Cfg.lag_n;
+
+    auto round_up_div = [](time_t window, unsigned step) -> size_t {
+        if (window <= 0 || step == 0)
+            return 0;
+        return static_cast<size_t>((window + step - 1) / step);
+    };
+
+    size_t min_n = round_up_div(Cfg.min_training_window, chart_update_every);
+    size_t max_n = round_up_div(Cfg.training_window, chart_update_every);
+
+    if (min_n < min_required_samples)
+        min_n = min_required_samples;
+    if (max_n < min_required_samples)
+        max_n = min_required_samples;
 
     // Figure out what our time window should be.
     training_response.query_before_t = training_response.last_entry_on_response;
     training_response.query_after_t = std::max(
-        training_response.query_before_t - static_cast<time_t>((max_n - 1) * dim->rd->rrdset->update_every),
+        training_response.query_before_t - Cfg.training_window,  // Fixed time window
         training_response.first_entry_on_response
     );
 
@@ -116,6 +139,9 @@ ml_dimension_calculated_numbers(ml_worker_t *worker, ml_dimension_t *dim)
     // Overwrite NaN values.
     if (idx != 0)
         memmove(worker->training_cns, &worker->training_cns[idx], sizeof(calculated_number_t) * training_response.total_values);
+
+    if (training_response.total_values < min_required_samples)
+        return { ML_WORKER_RESULT_NOT_ENOUGH_COLLECTED_VALUES, training_response };
 
     return { ML_WORKER_RESULT_OK, training_response };
 }
@@ -371,7 +397,7 @@ int ml_dimension_load_models(RRDDIM *rd, sqlite3_stmt **active_stmt) {
     if (unlikely(rc != SQLITE_OK))
         goto bind_fail;
 
-    rc = sqlite3_bind_int64(res, ++param, now_realtime_sec() - (Cfg.num_models_to_use * Cfg.max_train_samples));
+    rc = sqlite3_bind_int64(res, ++param, now_realtime_sec() - (Cfg.num_models_to_use * Cfg.train_every));
     if (unlikely(rc != SQLITE_OK))
         goto bind_fail;
 
@@ -544,6 +570,7 @@ ml_dimension_deserialize_kmeans(const char *json_str)
     ml_dimension_t *Dim = reinterpret_cast<ml_dimension_t *>(AcqDim.dimension());
     if (!Dim) {
         pulse_ml_models_ignored();
+        json_object_put(root);
         return true;
     }
 
@@ -616,8 +643,6 @@ static void ml_dimension_update_models(ml_worker_t *worker, ml_dimension_t *dim)
     dim->suppression_anomaly_counter = 0;
     dim->suppression_window_counter = 0;
 
-    dim->last_training_time = rrddim_last_entry_s(dim->rd);
-
     // Add the newly generated model to the list of pending models to flush
     ml_model_info_t model_info;
     nd_uuid_t *rd_uuid = uuidmap_uuid_ptr(dim->rd->uuid);
@@ -626,6 +651,9 @@ static void ml_dimension_update_models(ml_worker_t *worker, ml_dimension_t *dim)
     worker->pending_model_info.push_back(model_info);
 
     ml_dimension_stream_kmeans(dim);
+
+    // Clear the training in progress flag
+    dim->training_in_progress = false;
 
     spinlock_unlock(&dim->slock);
 }
@@ -640,6 +668,16 @@ ml_dimension_train_model(ml_worker_t *worker, ml_dimension_t *dim)
         spinlock_unlock(&dim->slock);
         return ML_WORKER_RESULT_OK;
     }
+
+    // Check if training is already in progress for this dimension
+    // If so, skip this training request to prevent concurrent access to dim->kmeans
+    if (dim->training_in_progress) {
+        spinlock_unlock(&dim->slock);
+        return ML_WORKER_RESULT_OK;
+    }
+
+    // Mark training as in progress
+    dim->training_in_progress = true;
     spinlock_unlock(&dim->slock);
 
     auto P = ml_dimension_calculated_numbers(worker, dim);
@@ -652,7 +690,7 @@ ml_dimension_train_model(ml_worker_t *worker, ml_dimension_t *dim)
         dim->mt = METRIC_TYPE_CONSTANT;
         dim->suppression_anomaly_counter = 0;
         dim->suppression_window_counter = 0;
-        dim->last_training_time = training_response.last_entry_on_response;
+        dim->training_in_progress = false;
 
         spinlock_unlock(&dim->slock);
 
@@ -665,13 +703,29 @@ ml_dimension_train_model(ml_worker_t *worker, ml_dimension_t *dim)
         memcpy(worker->scratch_training_cns, worker->training_cns,
                training_response.total_values * sizeof(calculated_number_t));
 
+        size_t smoothing_window = (dim->rd->rrdset->update_every > nd_profile.update_every) ? 1 : Cfg.max_samples_to_smooth;
+
         ml_features_t features = {
-            Cfg.diff_n, Cfg.smooth_n, Cfg.lag_n,
+            Cfg.diff_n, smoothing_window, Cfg.lag_n,
             worker->scratch_training_cns, training_response.total_values,
             worker->training_cns, training_response.total_values,
             worker->training_samples
         };
-        ml_features_preprocess(&features);
+        
+        // Calculate dynamic sampling ratio based on expected output size
+        // After diff and smooth, we'll have approximately this many vectors
+        size_t expected_vectors = training_response.total_values;
+        if (Cfg.diff_n > 0) expected_vectors--;
+        if (smoothing_window > 1) expected_vectors = expected_vectors - smoothing_window + 1;
+        expected_vectors = expected_vectors - Cfg.lag_n;
+        
+        double sampling_ratio = 1.0;
+        if (expected_vectors > Cfg.max_training_vectors) {
+            sampling_ratio = (double)Cfg.max_training_vectors / expected_vectors;
+        }
+
+        // Apply sampling during lag feature extraction
+        ml_features_preprocess(&features, sampling_ratio);
 
         ml_kmeans_init(&dim->kmeans);
         ml_kmeans_train(&dim->kmeans, &features,  Cfg.max_kmeans_iters, training_response.query_after_t, training_response.query_before_t);
@@ -697,7 +751,7 @@ ml_dimension_predict(ml_dimension_t *dim, calculated_number_t value, bool exists
     }
 
     // Save the value and return if we don't have enough values for a sample
-    unsigned n = Cfg.diff_n + Cfg.smooth_n + Cfg.lag_n;
+    unsigned n = Cfg.diff_n + Cfg.max_samples_to_smooth + Cfg.lag_n;
     if (dim->cns.size() < n) {
         dim->cns.push_back(value);
         return false;
@@ -722,11 +776,11 @@ ml_dimension_predict(ml_dimension_t *dim, calculated_number_t value, bool exists
     memcpy(dst_cns, dim->cns.data(), n * sizeof(calculated_number_t));
 
     ml_features_t features = {
-        Cfg.diff_n, Cfg.smooth_n, Cfg.lag_n,
+        Cfg.diff_n, Cfg.max_samples_to_smooth, Cfg.lag_n,
         dst_cns, n, src_cns, n,
         dim->feature
     };
-    ml_features_preprocess(&features);
+    ml_features_preprocess(&features, 1.0);
 
     /*
      * Lock to predict
@@ -757,7 +811,7 @@ ml_dimension_predict(ml_dimension_t *dim, calculated_number_t value, bool exists
         models_consulted++;
 
         calculated_number_t anomaly_score = ml_kmeans_anomaly_score(&km_ctx, features.preprocessed_features[0]);
-        if (anomaly_score == std::numeric_limits<calculated_number_t>::quiet_NaN())
+        if (std::isnan(anomaly_score))
             continue;
 
         if (anomaly_score < (100 * Cfg.dimension_anomaly_score_threshold)) {
@@ -888,13 +942,13 @@ ml_host_detect_once(ml_host_t *host)
             host->mls.num_anomalous_dimensions += chart_mls.num_anomalous_dimensions;
             host->mls.num_normal_dimensions += chart_mls.num_normal_dimensions;
 
-            if (spinlock_trylock(&host->type_anomaly_rate_spinlock))
+            if (spinlock_trylock(&host->context_anomaly_rate_spinlock))
             {
-                STRING *key = rs->parts.type;
-                auto &um = host->type_anomaly_rate;
+                STRING *key = rs->context;
+                auto &um = host->context_anomaly_rate;
                 auto it = um.find(key);
                 if (it == um.end()) {
-                    um[key] = ml_type_anomaly_rate_t {
+                    um[key] = ml_context_anomaly_rate_t {
                         .rd = NULL,
                         .normal_dimensions = 0,
                         .anomalous_dimensions = 0
@@ -904,7 +958,7 @@ ml_host_detect_once(ml_host_t *host)
 
                 it->second.anomalous_dimensions += chart_mls.num_anomalous_dimensions;
                 it->second.normal_dimensions += chart_mls.num_normal_dimensions;
-                spinlock_unlock(&host->type_anomaly_rate_spinlock);
+                spinlock_unlock(&host->context_anomaly_rate_spinlock);
             }
         }
         rrdset_foreach_done(rsp);
@@ -926,9 +980,9 @@ ml_host_detect_once(ml_host_t *host)
     } else {
         host->host_anomaly_rate = 0.0;
 
-        auto &um = host->type_anomaly_rate;
+        auto &um = host->context_anomaly_rate;
         for (auto &entry: um) {
-            entry.second = ml_type_anomaly_rate_t {
+            entry.second = ml_context_anomaly_rate_t {
                 .rd = NULL,
                 .normal_dimensions = 0,
                 .anomalous_dimensions = 0
@@ -937,8 +991,7 @@ ml_host_detect_once(ml_host_t *host)
     }
 }
 
-void *
-ml_detect_main(void *arg)
+void ml_detect_main(void *arg)
 {
     UNUSED(arg);
 
@@ -982,15 +1035,14 @@ ml_detect_main(void *arg)
         }
     }
     Cfg.training_stop = true;
-
-    return NULL;
+    finalize_self_prepared_sql_statements();
 }
 
 static void ml_flush_pending_models(ml_worker_t *worker) {
     int op_no = 1;
 
     // begin transaction
-    int rc = db_execute(ml_db, "BEGIN TRANSACTION;");
+    int rc = db_execute(ml_db, "BEGIN TRANSACTION;", NULL);
 
     // add/delete models
     if (!rc) {
@@ -1017,14 +1069,14 @@ static void ml_flush_pending_models(ml_worker_t *worker) {
     // commit transaction
     if (!rc) {
         op_no++;
-        rc = db_execute(ml_db, "COMMIT TRANSACTION;");
+        rc = db_execute(ml_db, "COMMIT TRANSACTION;", NULL);
     }
 
     // rollback transaction on failure
     if (rc) {
         netdata_log_error("Trying to rollback ML transaction because it failed with rc=%d, op_no=%d", rc, op_no);
         op_no++;
-        rc = db_execute(ml_db, "ROLLBACK;");
+        rc = db_execute(ml_db, "ROLLBACK;", NULL);
         if (rc)
             netdata_log_error("ML transaction rollback failed with rc=%d", rc);
     }
@@ -1066,13 +1118,22 @@ static enum ml_worker_result ml_worker_add_existing_model(ml_worker_t *worker, m
         return ML_WORKER_RESULT_OK;
     }
 
+    // Check if training is in progress and skip if so to avoid race condition
+    spinlock_lock(&Dim->slock);
+    if (Dim->training_in_progress) {
+        spinlock_unlock(&Dim->slock);
+        pulse_ml_models_ignored();
+        return ML_WORKER_RESULT_OK;
+    }
+    spinlock_unlock(&Dim->slock);
+
     Dim->kmeans = req.inlined_km;
     ml_dimension_update_models(worker, Dim);
     pulse_ml_models_received();
     return ML_WORKER_RESULT_OK;
 }
 
-void *ml_train_main(void *arg) {
+void ml_train_main(void *arg) {
     ml_worker_t *worker = (ml_worker_t *) arg;
 
     char worker_name[1024];
@@ -1210,6 +1271,5 @@ void *ml_train_main(void *arg) {
         worker_is_idle();
         std::this_thread::sleep_for(std::chrono::microseconds{remaining_ut});
     }
-
-    return NULL;
+    finalize_self_prepared_sql_statements();
 }

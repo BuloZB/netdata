@@ -13,6 +13,19 @@
 #include "sentry-native/sentry-native.h"
 #endif
 
+// External configuration structures that need cleanup
+extern struct config netdata_config;
+extern struct config cloud_config;
+
+// Functions to free various configurations
+void claim_config_free(void);
+void rrd_functions_inflight_destroy(void);
+void cgroup_netdev_link_destroy(void);
+void bearer_tokens_destroy(void);
+void alerts_by_x_cleanup(void);
+void websocket_threads_join(void);
+void mcp_functions_registry_cleanup(void);
+
 static bool abort_on_fatal = true;
 
 void abort_on_fatal_disable(void) {
@@ -59,8 +72,7 @@ void cancel_main_threads(void) {
     if (!static_threads)
         return;
 
-    int i, found = 0;
-    usec_t max = 5 * USEC_PER_SEC, step = 100000;
+    int i;
     for (i = 0; static_threads[i].name != NULL ; i++) {
         if (static_threads[i].enabled == NETDATA_MAIN_THREAD_RUNNING) {
             if (static_threads[i].thread) {
@@ -70,47 +82,32 @@ void cancel_main_threads(void) {
                 netdata_log_info("EXIT: No thread running (marking as EXITED): %s", static_threads[i].name);
                 static_threads[i].enabled = NETDATA_MAIN_THREAD_EXITED;
             }
-            found++;
         }
     }
 
-    while(found && max > 0) {
-        max -= step;
-        netdata_log_info("Waiting %d threads to finish...", found);
-        sleep_usec(step);
-        found = 0;
-        for (i = 0; static_threads[i].name != NULL ; i++) {
+    for (i = 0; static_threads[i].name != NULL ; i++) {
+        if(static_threads[i].thread && !nd_thread_is_me(static_threads[i].thread)) {
             if (static_threads[i].enabled == NETDATA_MAIN_THREAD_EXITED)
-                continue;
-
-            // Don't wait ourselves.
-            if (nd_thread_is_me(static_threads[i].thread))
-                continue;
-
-            found++;
+                nd_thread_join(static_threads[i].thread);
         }
     }
-
-    if(found) {
-        for (i = 0; static_threads[i].name != NULL ; i++) {
-            if (static_threads[i].enabled != NETDATA_MAIN_THREAD_EXITED)
-                netdata_log_error("Main thread %s takes too long to exit. Giving up...", static_threads[i].name);
-        }
-    }
-    else
-        netdata_log_info("All threads finished.");
+    netdata_log_info("All threads finished.");
 
     freez(static_threads);
     static_threads = NULL;
 }
 
 #ifdef ENABLE_DBENGINE
-static void *rrdeng_exit_background(void *ptr) {
+static void rrdeng_exit_background(void *ptr) {
     struct rrdengine_instance *ctx = ptr;
     rrdeng_exit(ctx);
-    return NULL;
 }
 
+static void rrdeng_quiesce_all()
+{
+    for (size_t tier = 0; tier < nd_profile.storage_tiers; tier++)
+        rrdeng_quiesce(multidb_ctx[tier]);
+}
 
 static void rrdeng_flush_everything_and_wait(bool wait_flush, bool wait_collectors, bool dirty_only) {
     static size_t starting_size_to_flush = 0;
@@ -119,8 +116,12 @@ static void rrdeng_flush_everything_and_wait(bool wait_flush, bool wait_collecto
         return;
 
     nd_log(NDLS_DAEMON, NDLP_INFO, "Flushing DBENGINE %s dirty pages...", dirty_only ? "only" : "hot &");
-    for (size_t tier = 0; tier < nd_profile.storage_tiers; tier++)
-        rrdeng_quiesce(multidb_ctx[tier], dirty_only);
+    for (size_t tier = 0; tier < nd_profile.storage_tiers; tier++) {
+        if (dirty_only)
+            rrdeng_flush_dirty(multidb_ctx[tier]);
+        else
+            rrdeng_flush_all(multidb_ctx[tier]);
+    }
 
     struct pgc_statistics pgc_main_stats = pgc_get_statistics(main_cache);
     size_t size_to_flush = pgc_main_stats.queues[PGC_QUEUE_HOT].size + pgc_main_stats.queues[PGC_QUEUE_DIRTY].size;
@@ -194,23 +195,22 @@ static void netdata_cleanup_and_exit(EXIT_REASON reason, bool abnormal, bool exi
     watcher_shutdown_begin();
 
 #ifdef ENABLE_DBENGINE
-    if(!abnormal && dbengine_enabled)
-        // flush all dirty pages asap
+    if(!abnormal && dbengine_enabled) {
+        rrdeng_quiesce_all();
         rrdeng_flush_everything_and_wait(false, false, true);
+    }
 #endif
-
-    // notify we are exiting
-    //analytics_statistic_t statistic = (analytics_statistic_t) {"EXIT", abnormal?"ERROR":"OK","-"};
-    //analytics_statistic_send(&statistic);
 
     webrtc_close_all_connections();
     watcher_step_complete(WATCHER_STEP_ID_CLOSE_WEBRTC_CONNECTIONS);
 
-    service_signal_exit(SERVICE_MAINTENANCE | ABILITY_DATA_QUERIES | ABILITY_WEB_REQUESTS |
-                        ABILITY_STREAMING_CONNECTIONS | SERVICE_SYSTEMD);
+    service_signal_exit(ABILITY_WEB_REQUESTS | SERVICE_ACLK | ABILITY_STREAMING_CONNECTIONS | SERVICE_SYSTEMD);
+
+    service_signal_exit(SERVICE_EXPORTERS | SERVICE_HEALTH | SERVICE_WEB_SERVER | SERVICE_HTTPD);
+
     watcher_step_complete(WATCHER_STEP_ID_DISABLE_MAINTENANCE_NEW_QUERIES_NEW_WEB_REQUESTS_NEW_STREAMING_CONNECTIONS);
 
-    service_wait_exit(SERVICE_MAINTENANCE | SERVICE_SYSTEMD, 3 * USEC_PER_SEC);
+    service_wait_exit(SERVICE_SYSTEMD, 5 * USEC_PER_SEC);
     watcher_step_complete(WATCHER_STEP_ID_STOP_MAINTENANCE_THREAD);
 
     service_wait_exit(SERVICE_EXPORTERS | SERVICE_HEALTH | SERVICE_WEB_SERVER | SERVICE_HTTPD, 3 * USEC_PER_SEC);
@@ -227,14 +227,14 @@ static void netdata_cleanup_and_exit(EXIT_REASON reason, bool abnormal, bool exi
         rrdeng_flush_everything_and_wait(false, false, true);
 #endif
 
-    service_wait_exit(SERVICE_REPLICATION, 3 * USEC_PER_SEC);
+    service_wait_exit(SERVICE_REPLICATION, 5 * USEC_PER_SEC);
     watcher_step_complete(WATCHER_STEP_ID_STOP_REPLICATION_THREADS);
 
     ml_stop_threads();
     ml_fini();
     watcher_step_complete(WATCHER_STEP_ID_DISABLE_ML_DETEC_AND_TRAIN_THREADS);
 
-    service_wait_exit(SERVICE_CONTEXT, 3 * USEC_PER_SEC);
+    service_wait_exit(SERVICE_CONTEXT, 5 * USEC_PER_SEC);
     watcher_step_complete(WATCHER_STEP_ID_STOP_CONTEXT_THREAD);
 
     web_client_cache_destroy();
@@ -248,14 +248,11 @@ static void netdata_cleanup_and_exit(EXIT_REASON reason, bool abnormal, bool exi
     service_wait_exit(SERVICE_ACLK, 3 * USEC_PER_SEC);
     watcher_step_complete(WATCHER_STEP_ID_STOP_ACLK_MQTT_THREAD);
 
-    service_wait_exit(~0, 10 * USEC_PER_SEC);
+    service_wait_exit(~0, 20 * USEC_PER_SEC);
     watcher_step_complete(WATCHER_STEP_ID_STOP_ALL_REMAINING_WORKER_THREADS);
 
     cancel_main_threads();
     watcher_step_complete(WATCHER_STEP_ID_CANCEL_MAIN_THREADS);
-
-    metadata_sync_shutdown_background();
-    watcher_step_complete(WATCHER_STEP_ID_PREPARE_METASYNC_SHUTDOWN);
 
     if (abnormal) {
         watcher_step_complete(WATCHER_STEP_ID_STOP_COLLECTION_FOR_ALL_HOSTS);
@@ -277,7 +274,7 @@ static void netdata_cleanup_and_exit(EXIT_REASON reason, bool abnormal, bool exi
 
             ND_THREAD *th[nd_profile.storage_tiers];
             for (size_t tier = 0; tier < nd_profile.storage_tiers; tier++)
-                th[tier] = nd_thread_create("rrdeng-exit", NETDATA_THREAD_OPTION_JOINABLE, rrdeng_exit_background, multidb_ctx[tier]);
+                th[tier] = nd_thread_create("rrdeng-exit", NETDATA_THREAD_OPTION_DEFAULT, rrdeng_exit_background, multidb_ctx[tier]);
 
             // flush anything remaining again - just in case
             rrdeng_flush_everything_and_wait(true, true, false);
@@ -299,7 +296,7 @@ static void netdata_cleanup_and_exit(EXIT_REASON reason, bool abnormal, bool exi
         watcher_step_complete(WATCHER_STEP_ID_STOP_DBENGINE_TIERS);
 #endif
 
-        metadata_sync_shutdown_background_wait();
+        metadata_sync_shutdown();
         watcher_step_complete(WATCHER_STEP_ID_STOP_METASYNC_THREADS);
     }
 
@@ -307,9 +304,15 @@ static void netdata_cleanup_and_exit(EXIT_REASON reason, bool abnormal, bool exi
     if (!abnormal)
         add_agent_event(EVENT_AGENT_SHUTDOWN_TIME, (int64_t)(now_monotonic_usec() - shutdown_start_time));
 
+    websocket_threads_join();
+    watcher_step_complete(WATCHER_STEP_ID_STOP_WEBSOCKET_THREADS);
+
+    nd_thread_join_threads();
+    watcher_step_complete(WATCHER_STEP_ID_JOIN_STATIC_THREADS);
+
     sqlite_close_databases();
-    watcher_step_complete(WATCHER_STEP_ID_CLOSE_SQL_DATABASES);
     sqlite_library_shutdown();
+    watcher_step_complete(WATCHER_STEP_ID_CLOSE_SQL_DATABASES);
 
     // unlink the pid
     if(pidfile && *pidfile && unlink(pidfile) != 0)
@@ -328,9 +331,6 @@ static void netdata_cleanup_and_exit(EXIT_REASON reason, bool abnormal, bool exi
     watcher_shutdown_end();
     watcher_thread_stop();
 
-    daemon_status_file_shutdown_step(NULL);
-    daemon_status_file_update_status(DAEMON_STATUS_EXITED);
-
 #if defined(FSANITIZE_ADDRESS)
     fprintf(stderr, "\n");
 
@@ -338,13 +338,22 @@ static void netdata_cleanup_and_exit(EXIT_REASON reason, bool abnormal, bool exi
     netdata_main_spawn_server_cleanup();
 
     fprintf(stderr, "Freeing all RRDHOSTs...\n");
+    mcp_functions_registry_cleanup();
     rrdhost_free_all();
+    dyncfg_shutdown();
+    rrd_functions_inflight_destroy();
+    health_plugin_destroy();
+    cgroup_netdev_link_destroy();
+    bearer_tokens_destroy();
 
     fprintf(stderr, "Cleaning up destroyed dictionaries...\n");
-    size_t dictionaries_referenced = cleanup_destroyed_dictionaries();
+    size_t dictionaries_referenced = cleanup_destroyed_dictionaries(true);
     if(dictionaries_referenced)
         fprintf(stderr, "WARNING: There are %zu dictionaries with references in them, that cannot be destroyed.\n",
                 dictionaries_referenced);
+                
+    // Always report dictionary allocations during ASAN builds
+    dictionary_print_still_allocated_stacktraces();
 
 #ifdef ENABLE_DBENGINE
     // destroy the caches in reverse order (extent and open depend on main cache)
@@ -360,7 +369,15 @@ static void netdata_cleanup_and_exit(EXIT_REASON reason, bool abnormal, bool exi
     if(metrics_referenced)
         fprintf(stderr, "WARNING: MRG had %zu metrics referenced.\n",
             metrics_referenced);
-#endif    
+
+    for(size_t tier = 0; tier < nd_profile.storage_tiers; tier++) {
+        if(multidb_ctx[tier]) {
+            fprintf(stderr, "Finalizing data files for tier %zu...\n", tier);
+            finalize_rrd_files(multidb_ctx[tier]);
+            memset(multidb_ctx[tier], 0, sizeof(*multidb_ctx[tier]));
+        }
+    }
+#endif
 
     fprintf(stderr, "Destroying UUIDMap...\n");
     size_t uuid_referenced = uuidmap_destroy();
@@ -368,10 +385,24 @@ static void netdata_cleanup_and_exit(EXIT_REASON reason, bool abnormal, bool exi
         fprintf(stderr, "WARNING: UUIDMAP had %zu UUIDs referenced.\n",
             uuid_referenced);
 
+    fprintf(stderr, "Freeing configuration resources...\n");
+    claim_config_free();
+    exporting_config_free();
+    stream_config_free();
+    inicfg_free(&cloud_config);
+    inicfg_free(&netdata_config);
+
+    fprintf(stderr, "Cleaning up worker utilization...\n");
+    worker_utilization_cleanup();
+
+    alerts_by_x_cleanup();
     size_t strings_referenced = string_destroy();
     if(strings_referenced)
         fprintf(stderr, "WARNING: STRING has %zu strings still allocated.\n",
                 strings_referenced);
+
+    rrdlabels_aral_destroy(true);
+    fprintf(stderr, "RRDLABELS remaining in registry: %d.\n", rrdlabels_registry_count());
 
     fprintf(stderr, "All done, exiting...\n");
 #endif

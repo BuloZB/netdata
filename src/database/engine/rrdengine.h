@@ -20,7 +20,34 @@
 #include "pdc.h"
 #include "page.h"
 
+#include "daemon/protected-access.h"
+
 extern unsigned rrdeng_pages_per_extent;
+
+#define BLOCK_TO_OFFSET(block) ((uint64_t)(block) << 12)
+#define OFFSET_TO_BLOCK(ofs) ((uint64_t)(ofs) >> 12)
+
+#define UNLINK_FILE(ctx, path, ret_var)                                                                                \
+    do {                                                                                                               \
+        uv_fs_t _req;                                                                                                  \
+        (ret_var) = uv_fs_unlink(NULL, &(_req), (path), NULL);                                                         \
+        if ((ret_var) < 0) {                                                                                           \
+            netdata_log_error("DBENGINE: uv_fs_unlink(\"%s\"): %s", (path), uv_strerror(ret_var));                     \
+            ctx_fs_error(ctx);                                                                                         \
+        }                                                                                                              \
+        uv_fs_req_cleanup(&(_req));                                                                                   \
+    } while (0)
+
+#define CLOSE_FILE(ctx, path, file, ret_var)                                                                           \
+    do {                                                                                                               \
+        uv_fs_t _req;                                                                                                  \
+        (ret_var) = uv_fs_close(NULL, &(_req), (file), NULL);                                                          \
+        if ((ret_var) < 0) {                                                                                           \
+            netdata_log_error("DBENGINE: uv_fs_close(\"%s\"): %s", (path), uv_strerror(ret_var));                      \
+            ctx_fs_error(ctx);                                                                                         \
+        }                                                                                                              \
+        uv_fs_req_cleanup(&(_req));                                                                                    \
+    } while (0)
 
 /* Forward declarations */
 struct rrdengine_instance;
@@ -112,13 +139,8 @@ PDC *pdc_get(void);
 struct page_details {
     struct {
         struct rrdengine_datafile *ptr;
-        uv_file file;
-        unsigned fileno;
-
-        struct {
-            uint64_t pos;
-            uint32_t bytes;
-        } extent;
+        uint32_t block;     // the block in the datafile. Offset in the datafile is block * RRDENG_BLOCK_SIZE
+        uint32_t bytes;
     } datafile;
 
     struct pgc_page *page;
@@ -141,18 +163,19 @@ struct page_details *page_details_get(void);
 #define pdc_page_status_clear(pd, flag) __atomic_and_fetch(&((od)->status), ~(flag), __ATOMIC_RELEASE)
 
 struct jv2_extents_info {
-    size_t index;
-    uint64_t pos;
+    uint32_t index;
+    uint32_t block;
     unsigned bytes;
-    size_t number_of_pages;
+    uint32_t number_of_pages;
 };
 
 struct jv2_metrics_info {
     nd_uuid_t *uuid;
+    void *metric;
     uint32_t page_list_header;
+    uint32_t number_of_pages;
     time_t first_time_s;
     time_t last_time_s;
-    size_t number_of_pages;
     Pvoid_t JudyL_pages_by_start_time;
 };
 
@@ -256,9 +279,11 @@ enum rrdeng_opcode {
     RRDENG_OPCODE_EVICT_EXTENT,
     RRDENG_OPCODE_CTX_SHUTDOWN,
     RRDENG_OPCODE_CTX_FLUSH_DIRTY,
+    RRDENG_OPCODE_CTX_FLUSH_HOT_DIRTY,
     RRDENG_OPCODE_CTX_QUIESCE,
     RRDENG_OPCODE_CTX_POPULATE_MRG,
     RRDENG_OPCODE_SHUTDOWN_EVLOOP,
+    RRDENG_OPCODE_PARALLEL_WEIGHT,
     RRDENG_OPCODE_CLEANUP,
 
     RRDENG_OPCODE_MAX
@@ -276,18 +301,17 @@ enum rrdeng_opcode {
 
 struct extent_io_data {
     unsigned fileno;
-    uv_file file;
-    uint64_t pos;
+    uint32_t block;
     unsigned bytes;
-    uint16_t page_length;
 };
 
 struct extent_io_descriptor {
     struct rrdengine_instance *ctx;
     void *buf;
     uint64_t pos;
-    unsigned descr_count;
-    unsigned bytes;
+    uint32_t descr_count;
+    uint32_t bytes;
+    uint32_t real_io_size;
     struct wal *wal;
     uv_file file;
     struct page_descr_with_data *descr_array[MAX_PAGES_PER_EXTENT];
@@ -371,8 +395,11 @@ struct rrdengine_instance {
     TIER_CONFIG_PROTOTYPE config;
 
     struct {
-        uv_rwlock_t rwlock;                         // the linked list of datafiles is protected by this lock
-        struct rrdengine_datafile *first;           // oldest - the newest with ->first->prev
+        netdata_rwlock_t rwlock;                         // the JudyL of datafiles is protected by this lock
+        bool disk_time;                             // true: delete for disk quota, false: delete for retention
+        bool pending_rotate;                        // Change from event loop
+        bool pending_index;                         // Change from event loop
+        Pvoid_t JudyL;                              // the datafiles, indexed by fileno
     } datafiles;
 
     struct {
@@ -393,6 +420,7 @@ struct rrdengine_instance {
 
         PAD64(bool) migration_to_v2_running;
         PAD64(bool) now_deleting_files;
+        PAD64(bool) needs_indexing;
         PAD64(unsigned) extents_currently_being_flushed;   // non-zero until we commit data to disk (both datafile and journal file)
 
         PAD64(time_t) first_time_s;
@@ -406,11 +434,7 @@ struct rrdengine_instance {
     } quiesce;
 
     struct {
-        struct {
-            size_t size;
-            struct completion *array;
-        } populate_mrg;
-
+        struct completion load_mrg;
         bool create_new_datafile_pair;
     } loading;
 
@@ -531,7 +555,12 @@ static inline time_t max_acceptable_collected_time(void) {
     return now_realtime_sec() + 1;
 }
 
-void datafile_delete(struct rrdengine_instance *ctx, struct rrdengine_datafile *datafile, bool update_retention, bool worker);
+void datafile_delete(
+    struct rrdengine_instance *ctx,
+    struct rrdengine_datafile *datafile,
+    bool update_retention,
+    bool disk_time,
+    bool worker);
 
 // --------------------------------------------------------------------------------------------------------------------
 // the following functions are used to sort UUIDs in the journal files
@@ -550,5 +579,11 @@ uint64_t rrdeng_get_used_disk_space(struct rrdengine_instance *ctx, bool having_
 void rrdeng_calculate_tier_disk_space_percentage(void);
 uint64_t rrdeng_get_directory_free_bytes_space(struct rrdengine_instance *ctx);
 void dbengine_shutdown();
+size_t datafile_count(struct rrdengine_instance *ctx, bool with_lock);
+struct rrdengine_datafile *get_first_ctx_datafile(struct rrdengine_instance *ctx, bool with_lock);
+struct rrdengine_datafile *get_last_ctx_datafile(struct rrdengine_instance *ctx, bool with_lock);
+struct rrdengine_datafile *
+get_next_datafile(struct rrdengine_datafile *this_datafile, struct rrdengine_instance *ctx, bool with_lock);
+
 
 #endif /* NETDATA_RRDENGINE_H */

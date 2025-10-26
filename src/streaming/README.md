@@ -1,661 +1,922 @@
-# Streaming and replication reference
+# Parent-Child Configuration Reference
 
-This document contains advanced streaming options and suggested deployment options for production. 
-If you haven't already done so, we suggest you first go through the 
-[quick introduction to streaming](/docs/observability-centralization-points/README.md)
-, for your first, basic parent child setup.
+## Introduction
 
-## Configuration
+This guide covers Netdata's advanced streaming and replication capabilities, which allow you to build centralized observability points across your infrastructure.
 
-There are two files responsible for configuring Netdata's streaming capabilities: `stream.conf` and `netdata.conf`.
+**[Streaming and replication](https://learn.netdata.cloud/docs/developer-and-contributor-corner/glossary#r)** work together to send metrics data from one Netdata Agent (Child) to another Netdata Agent (Parent). Streaming sends metrics in real-time, while replication ensures historical data is copied, as well, maintaining complete data integrity even after connection interruptions.
 
-From within your Netdata config directory (typically `/etc/netdata`), [use `edit-config`](/docs/netdata-agent/configuration/README.md) to
-open either `stream.conf` or `netdata.conf`.
+:::tip
 
+If you're new to Netdata streaming or prefer a guided approach, [jump to our step-by-step guide](#step-by-step-setup-guide) at the end of this document. The guide will walk you through setting up a basic streaming configuration and then connecting to the comprehensive reference sections as needed.
+
+For a quick reference on setting up the Parent-Child relationship, see the [Configuration Examples](#complete-configuration-examples) or refer to our comprehensive [Parents: Your Centralization Points](https://learn.netdata.cloud/docs/deployment-guides/parents-your-centralization-points) documentation for more details.
+
+:::
+
+## Understanding Streaming Architecture
+
+Before diving into configuration details, it's important to understand the key concepts behind Netdata's streaming architecture:
+
+<details>
+<summary><strong>Click to see how streaming and replication work</strong></summary><br/>
+
+```mermaid
+flowchart TB
+    subgraph infrastructure["Your Infrastructure"]
+        direction TB
+        C1[C1]
+        C2[C2]
+        P[P]
+        C1("**Child 1**<br/>Collects metrics")
+        C2("**Child 2**<br/>Collects metrics")
+        P("**Parent**<br/>Stores all metrics")
+        C1 -->|Streams real - time metrics| P
+        C1 -.->|Replicates historical data| P
+        C2 -->|Streams real - time metrics| P
+        C2 -.->|Replicates historical data| P
+    end
+
+    U[U]
+    U("**You**<br/>Access unified dashboard")
+    P -->|Presents all data| U
+    classDef child fill: #e8f5e8, stroke: #27ae60, stroke-width: 2px, color: #2c3e50, rx: 10, ry: 10
+    classDef parent fill: #f3e8ff, stroke: #9b59b6, stroke-width: 2px, color: #2c3e50, rx: 10, ry: 10
+    classDef user fill: #fff2e8, stroke: #f39c12, stroke-width: 2px, color: #2c3e50, rx: 10, ry: 10
+    classDef subgraphStyle fill: #f8f9fa, stroke: #6c757d, stroke-width: 2px, color: #2c3e50, rx: 15, ry: 15
+    class C1 child
+    class C2 child
+    class P parent
+    class U user
+    class infrastructure subgraphStyle
 ```
+
+</details><br/>
+
+### Parent-Child Relationship
+
+- **Child nodes** (data sources) collect metrics directly from systems they monitor
+- **Parent nodes** (data centralization points) receive, store, and visualize metrics from multiple Child nodes
+- **A single Parent can receive data from many Children**, creating a centralized monitoring hub
+- **Child nodes maintain independence and continue collecting metrics** even if the connection to a Parent is lost
+
+### Data Flow
+
+1. **Collection**: Child nodes collect metrics from their local systems
+2. **Streaming**: Child nodes send real-time metrics to Parent nodes
+3. **Replication**: When a connection is established or restored, Child nodes replicate historical data to ensure Parents have complete history
+4. **Storage**: Parent nodes store metrics based on their configured retention policies
+5. **Visualization**: Users access the Parent node's dashboard to view metrics from all connected Child nodes
+
+### Benefits of This Architecture
+
+- **Efficiency**: Distribute collection workload across multiple nodes while centralizing visualization
+- **Resilience**: Maintain data collection even during network disruptions or Parent node failures
+- **Scalability**: Add more Child nodes or additional Parent nodes as your infrastructure grows
+- **Flexibility**: Configure retention, alerts, and dashboards according to your specific needs
+
+## Quick Reference
+
+| Task                                     | Configuration                             | Example                                                        |
+|------------------------------------------|-------------------------------------------|----------------------------------------------------------------|
+| Enable streaming on a Child              | Set `enabled = yes` in `[stream]` section | `[stream]`<br/>`enabled = yes`<br/>`destination = 192.168.1.5` |
+| Configure a Parent to accept connections | Create an `[API_KEY]` section             | `[API_KEY]`<br/>`enabled = yes`<br/>`allow from = *`           |
+| Set up high availability                 | Configure multiple destinations on Child  | `[stream]`<br/>`destination = parent1:19999 parent2:19999`     |
+| Filter which metrics to send             | Use `send charts matching` setting        | `send charts matching = system.* !system.uptime`               |
+
+## Configuration Overview
+
+Netdata's streaming capabilities are configured through two key files:
+
+- **`stream.conf`** – Controls streaming behavior, including Parent and Child configurations.
+- **`netdata.conf`** – Contains global settings that can impact streaming.
+
+To edit these files, navigate to your Netdata configuration directory (typically `/etc/netdata`) and run:
+
+```sh
+# Edit streaming configuration
 sudo ./edit-config stream.conf
+
+# Edit global Netdata settings
 sudo ./edit-config netdata.conf
 ```
 
-### `stream.conf`
+## Configuring `stream.conf`
 
-The `stream.conf` file contains three sections. The `[stream]` section is for configuring child nodes.
+The `stream.conf` file has three main sections:
 
-The `[API_KEY]` and `[MACHINE_GUID]` sections are both for configuring parent nodes, and share the same settings.
-`[API_KEY]` settings affect every child node using that key, whereas `[MACHINE_GUID]` settings affect only the child
-node with a matching GUID.
+1. **`[stream]`** – With these settings, you can configure how Child nodes send metrics.
+2. **`[API_KEY]`** – Here you can define settings for authentication and access control between Parents and Children.
+3. **`[MACHINE_GUID]`** – This area lets you customize settings for specific Child nodes by their unique ID.
 
-The file `/var/lib/netdata/registry/netdata.public.unique.id` contains a random GUID that **uniquely identifies each
-node**. This file is automatically generated by Netdata the first time it is started and remains unaltered forever.
+### Identifying a Node's GUID
 
-#### `[stream]` section
+Each Netdata node has a unique identifier stored in:
 
-This section is used by the sending Netdata.
+```sh
+/var/lib/netdata/registry/netdata.public.unique.id
+```
 
-| Setting                                         | Default                   | Description                                                                                                                                                                                                                                          |
-|-------------------------------------------------|---------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `enabled`                                       | `no`                      | Whether this node streams metrics to any parent. Change to `yes` to enable streaming.                                                                                                                                                                |
-| [`destination`](#destination)                   |                           | A space-separated list of parent nodes to attempt to stream to, with the first available parent receiving metrics, using the following format: `[PROTOCOL:]HOST[%INTERFACE][:PORT][:SSL]`. [Read more &rarr;](#destination)                          |
-| `ssl skip certificate verification`             | `yes`                     | If you want to accept self-signed or expired certificates, set to `yes` and uncomment.                                                                                                                                                               |
-| `CApath`                                        | `/etc/ssl/certs/`         | The directory where known certificates are found. Defaults to OpenSSL's default path.                                                                                                                                                                |
-| `CAfile`                                        | `/etc/ssl/certs/cert.pem` | Add a parent node certificate to the list of known certificates in `CAPath`.                                                                                                                                                                         |
-| `api key`                                       |                           | The `API_KEY` to use as the child node.                                                                                                                                                                                                              |
-| `timeout`                                       | `1m`                      | The timeout to connect and send metrics to a parent.                                                                                                                                                                                                 |
-| `default port`                                  | `19999`                   | The port to use if `destination` does not specify one.                                                                                                                                                                                               |
-| [`send charts matching`](#send-charts-matching) | `*`                       | A space-separated list of [Netdata simple patterns](/src/libnetdata/simple_pattern/README.md) to filter which charts are streamed. [Read more &rarr;](#send-charts-matching)                           |
-| `buffer size bytes`                             | `10485760`                | The size of the buffer to use when sending metrics. The default `10485760` equals a buffer of 10MB, which is good for 60 seconds of data. Increase this if you expect latencies higher than that. The buffer is flushed on reconnect.                |
-| `reconnect delay`                               | `5s`                      | How long to wait until retrying to connect to the parent node.                                                                                                                                                                                       |
-| `initial clock resync iterations`               | `60`                      | Sync the clock of charts for how many seconds when starting.                                                                                                                                                                                         |
-| `parent using h2o`                              | `no`                      | Set to yes if you are connecting to parent trough it's h2o webserver/port. Currently there is no reason to set this to `yes` unless you are testing the new h2o based netdata webserver. When production ready this will be set to `yes` as default. |
+This file is generated automatically the first time Netdata starts and remains unchanged.
 
-### `[API_KEY]` sections
+## Recommended Deployment Strategies
 
-This section defines an API key for other Agents to connect to this Netdata.
+For a production-ready streaming setup, consider the following best practices:
 
-| Setting                      | Default    | Description                                                                                                                                                                                              |
-|------------------------------|------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `enabled`                    | `no`       | Whether this API KEY enabled or disabled.                                                                                                                                                                |
-| `type`                       | `api`      | This section defines an API key.                                                                                                                                                                         |
-| [`allow from`](#allow-from)  | `*`        | A space-separated list of [Netdata simple patterns](/src/libnetdata/simple_pattern/README.md) matching the IPs of nodes that will stream metrics using this API key. [Read more &rarr;](#allow-from)     |
-| `retention`                  | `1h`       | The default amount of child metrics history to retain when using the `ram` db.                                                                                                                           |
-| [`db`](#default-memory-mode) | `dbengine` | The [database](/src/database/README.md) to use for all nodes using this `API_KEY`. Valid settings are `dbengine`, `ram`, or `none`. [Read more &rarr;](#default-memory-mode)                             |
-| `health enabled`             | `auto`     | Whether alerts and notifications should be enabled for nodes using this `API_KEY`. `auto` enables alerts when the child is connected. `yes` enables alerts always, and `no` disables alerts.             |
-| `postpone alerts on connect` | `1m`       | Postpone alerts and notifications for a period of time after the child connects.                                                                                                                         |
-| `health log retention`       | `5d`       | History of health log events (in seconds) kept in the database.                                                                                                                                          |
-| `proxy enabled`              |            | Route metrics through a proxy.                                                                                                                                                                           |
-| `proxy destination`          |            | Space-separated list of `IP:PORT` for proxies.                                                                                                                                                           |
-| `proxy api key`              |            | The `API_KEY` of the proxy.                                                                                                                                                                              |
-| `send charts matching`       | `*`        | See [`send charts matching`](#send-charts-matching).                                                                                                                                                     |
-| `enable compression`         | `yes`      | Enable/disable stream compression.                                                                                                                                                                       |
-| `enable replication`         | `yes`      | Enable/disable replication.                                                                                                                                                                              |
-| `replication period`         | `1d`       | Limits the maximum window that will be replicated from each child.                                                                                                                                       |
-| `replication step`           | `10m`      | The duration we want to replicate per each replication step.                                                                                                                                             |
-| `is ephemeral node`          | `no`       | Indicate whether this child is an ephemeral node. An ephemeral node will become unavailable after the specified duration of "cleanup ephemeral hosts after" from the time of the node's last connection. |
+<details>
+<summary><strong>Click to see deployment best practices</strong></summary><br/>
 
+```mermaid
+flowchart TB
+    A[A]
+    B[B]
+    C[C]
+    D[D]
+    E[E]
+    B1[B1]
+    C1[C1]
+    D1[D1]
+    E1[E1]
+    A("**Recommended Strategies**")
+    B("Multiple Parent Nodes")
+    C("Optimized Data Retention")
+    D("Secure Communications")
+    E("Performance Monitoring")
+    B1("Improved redundancy<br/>and resilience")
+    C1("Balance storage costs<br/>and data availability")
+    D1("Enable encryption<br/>and authentication")
+    E1("Regular log and<br/>metric reviews")
+    A --> B
+    A --> C
+    A --> D
+    A --> E
+    B --> B1
+    C --> C1
+    D --> D1
+    E --> E1
+    classDef default fill: #f9f9f9, stroke: #333, stroke-width: 2px, color: #2c3e50, rx: 10, ry: 10
+    classDef strategies fill: #e8f5e8, stroke: #27ae60, stroke-width: 2px, color: #2c3e50, rx: 10, ry: 10
+    class A default
+    class B strategies
+    class C strategies
+    class D strategies
+    class E strategies
+    class B1 strategies
+    class C1 strategies
+    class D1 strategies
+    class E1 strategies
+```
 
-### `[MACHINE_GUID]` sections
+</details><br/>
 
-This section is about customizing configuration for specific Agents. It allows many Agents to share the same API key, while providing customizability per remote Agent.
+:::tip
 
-| Setting                      | Default    | Description                                                                                                                                                                                              |
-|------------------------------|------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `enabled`                    | `no`       | Whether this MACHINE_GUID enabled or disabled.                                                                                                                                                           |
-| `type`                       | `machine`  | This section defines the configuration for a specific Agent.                                                                                                                                             |
-| [`allow from`](#allow-from)  | `*`        | A space-separated list of [Netdata simple patterns](/src/libnetdata/simple_pattern/README.md) matching the IPs of nodes that will stream metrics using this API key. [Read more &rarr;](#allow-from)     |
-| `retention`                  | `3600`     | The default amount of child metrics history to retain when using the `ram` db.                                                                                                                           |
-| [`db`](#default-memory-mode) | `dbengine` | The [database](/src/database/README.md) to use for all nodes using this `API_KEY`. Valid settings are `dbengine`, `ram`, or `none`. [Read more &rarr;](#default-memory-mode)                             |
-| `health enabled`             | `auto`     | Whether alerts and notifications should be enabled for nodes using this `API_KEY`. `auto` enables alerts when the child is connected. `yes` enables alerts always, and `no` disables alerts.             |
-| `postpone alerts on connect` | `1m`       | Postpone alerts and notifications for a period of time after the child connects.                                                                                                                         |
-| `health log retention`       | `5d`       | History of health log events (in seconds) kept in the database.                                                                                                                                          |
-| `proxy enabled`              |            | Route metrics through a proxy.                                                                                                                                                                           |
-| `proxy destination`          |            | Space-separated list of `IP:PORT` for proxies.                                                                                                                                                           |
-| `proxy api key`              |            | The `API_KEY` of the proxy.                                                                                                                                                                              |
-| `send charts matching`       | `*`        | See [`send charts matching`](#send-charts-matching).                                                                                                                                                     |
-| `enable compression`         | `yes`      | Enable/disable stream compression.                                                                                                                                                                       |
-| `enable replication`         | `yes`      | Enable/disable replication.                                                                                                                                                                              |
-| `replication period`         | `1d`       | Limits the maximum window that will be replicated from each child.                                                                                                                                       |
-| `replication step`           | `10m`      | The duration we want to replicate per each replication step.                                                                                                                                             |
-| `is ephemeral node`          | `no`       | Indicate whether this child is an ephemeral node. An ephemeral node will become unavailable after the specified duration of "cleanup ephemeral hosts after" from the time of the node's last connection. |
+### Multiple Parent Nodes
+
+Setting up multiple Parent nodes creates redundancy in your monitoring infrastructure. **If one Parent fails, Child nodes can automatically switch to another available Parent.** This approach:
+
+- **Prevents single points of failure** in your monitoring system
+- **Allows for maintenance** on Parent nodes without monitoring interruptions
+- Can be **geographically distributed to reduce latency** for global deployments
+
+### Optimized Data Retention
+
+Configure data retention settings based on your specific monitoring needs:
+
+- **Use longer retention periods** for critical systems and metrics
+- **Implement tiered storage strategies** with different retention policies
+- **Balance storage requirements with data availability** for historical analysis
+
+### Secure Communications
+
+**Protect your metrics data** during transmission:
+
+- **Enable SSL/TLS encryption** for all streaming connections
+- Implement **proper API key management** and rotation
+- Use **IP-based restrictions** to control which nodes can connect
+
+### Performance Monitoring
+
+Regularly evaluate the **health of your** streaming **setup**:
+
+- **Monitor network traffic** between Child and Parent nodes
+- **Check for buffer overflows** or connection issues
+- **Adjust settings** like buffer size based on actual performance
+
+**By following these guidelines, you can set up a scalable and reliable Netdata streaming environment.**
+
+:::
+
+## `stream.conf` Detailed Reference
+
+### `[stream]` Section (Child Node Settings)
+
+With these settings, you can configure how your Child nodes send metrics to Parent nodes.
+
+| Setting                                         | Default                   | Description                                                         |
+|-------------------------------------------------|---------------------------|---------------------------------------------------------------------|
+| `enabled`                                       | `no`                      | Enables streaming. Set to `yes` to allow this node to send metrics. |
+| [`destination`](#destination)                   | (empty)                   | Defines one or more Parent nodes to send data to.                   |
+| `ssl skip certificate verification`             | `yes`                     | Accepts self-signed or expired SSL certificates.                    |
+| `CApath`                                        | `/etc/ssl/certs/`         | Directory for trusted SSL certificates.                             |
+| `CAfile`                                        | `/etc/ssl/certs/cert.pem` | File containing trusted certificates.                               |
+| `api key`                                       | (empty)                   | API key used by the Child to authenticate with the Parent.          |
+| `timeout`                                       | `1m`                      | Connection timeout duration.                                        |
+| `default port`                                  | `19999`                   | Default port for streaming if not specified in `destination`.       |
+| [`send charts matching`](#send-charts-matching) | `*`                       | Filters which charts are streamed.                                  |
+| `buffer size bytes`                             | `10485760`                | Buffer size (10MB by default). Increase for higher latencies.       |
+| `reconnect delay`                               | `5s`                      | Time before retrying connection to the Parent.                      |
+| `initial clock resync iterations`               | `60`                      | Syncs chart clocks during startup.                                  |
+| `parent using h2o`                              | `no`                      | Set to `yes` if connecting to a Parent using the H2O web server.    |
+
+### `[API_KEY]` Section (Parent Node Authentication)
+
+Here you can define settings for authentication and access control between Parents and Children.
+
+| Setting                      | Default    | Description                                                 |
+|------------------------------|------------|-------------------------------------------------------------|
+| `enabled`                    | `no`       | Enables or disables this API key.                           |
+| `type`                       | `api`      | Defines the section as an API key configuration.            |
+| [`allow from`](#allow-from)  | `*`        | Specifies which Child nodes (IP addresses) can connect.     |
+| `retention`                  | `1h`       | How long to keep Child node metrics in RAM-based storage.   |
+| [`db`](#db)                  | `dbengine` | Specifies the database type for this API key.               |
+| `health enabled`             | `auto`     | Controls alerts and notifications (`auto`, `yes`, or `no`). |
+| `postpone alerts on connect` | `1m`       | Delay alerts for a period after the Child connects.         |
+| `health log retention`       | `5d`       | Duration (in seconds) to keep health log events.            |
+| `proxy enabled`              | (empty)    | Enables routing metrics through a proxy.                    |
+| `proxy destination`          | (empty)    | IP and port of the proxy server.                            |
+| `proxy api key`              | (empty)    | API key for the proxy server.                               |
+| `send charts matching`       | `*`        | Defines which charts to stream.                             |
+| `enable compression`         | `yes`      | Enables or disables data compression.                       |
+| `enable replication`         | `yes`      | Enables or disables data replication.                       |
+| `replication period`         | `1d`       | Maximum time window replicated from each Child.             |
+| `replication step`           | `10m`      | Time interval for each replication step.                    |
+| `is ephemeral node`          | `no`       | Marks the Child as ephemeral (removes it after inactivity). |
+
+### `[MACHINE_GUID]` Section (Per-Node Customization)
+
+This area lets you customize settings for specific Child nodes by their unique ID.
+
+| Setting                      | Default    | Description                                              |
+|------------------------------|------------|----------------------------------------------------------|
+| `enabled`                    | `no`       | Enables or disables this specific node's configuration.  |
+| `type`                       | `machine`  | Defines the section as a machine-specific configuration. |
+| [`allow from`](#allow-from)  | `*`        | Lists IP addresses allowed to stream metrics.            |
+| `retention`                  | `3600`     | Retention period for Child metrics in RAM-based storage. |
+| [`db`](#db)                  | `dbengine` | Database type for this node.                             |
+| `health enabled`             | `auto`     | Controls alerts (`auto`, `yes`, `no`).                   |
+| `postpone alerts on connect` | `1m`       | Delay alerts for a period after connection.              |
+| `health log retention`       | `5d`       | Duration to keep health log events.                      |
+| `proxy enabled`              | (empty)    | Routes metrics through a proxy if enabled.               |
+| `proxy destination`          | (empty)    | Proxy server IP and port.                                |
+| `proxy api key`              | (empty)    | API key for the proxy.                                   |
+| `send charts matching`       | `*`        | Filters streamed charts.                                 |
+| `enable compression`         | `yes`      | Enables or disables compression.                         |
+| `enable replication`         | `yes`      | Enables or disables replication.                         |
+| `replication period`         | `1d`       | Maximum replication window.                              |
+| `replication step`           | `10m`      | Time interval for each replication step.                 |
+| `is ephemeral node`          | `no`       | Marks the node as ephemeral (removes after inactivity).  |
+
+### Additional Settings
 
 #### `destination`
 
-A space-separated list of parent nodes to attempt to stream to, with the first available parent receiving metrics, using
-the following format: `[PROTOCOL:]HOST[%INTERFACE][:PORT][:SSL]`.
+Defines Parent nodes for streaming using the format:  
+`[PROTOCOL:]HOST[%INTERFACE][:PORT][:SSL]`
 
-- `PROTOCOL`: `tcp`, `udp`, or `unix`. (only tcp and unix are supported by parent nodes)
-- `HOST`: A IPv4, IPv6 IP, or a hostname, or a unix domain socket path. IPv6 IPs should be given with brackets
-  `[ip:address]`.
-- `INTERFACE` (IPv6 only): The network interface to use.
-- `PORT`: The port number or service name (`/etc/services`) to use.
-- `SSL`: To enable TLS/SSL encryption of the streaming connection.
+- **PROTOCOL**: `tcp`, `udp`, or `unix` (only `tcp` and `unix` are supported for Parents).
+- **HOST**: IPv4, IPv6 (in brackets `[ ]`), hostname, or Unix domain socket path.
+- **INTERFACE** (IPv6 only): Network interface to use.
+- **PORT**: Port number or service name.
+- **SSL**: Enables TLS/SSL encryption.
 
-To enable TCP streaming to a parent node at `203.0.113.0` on port `20000` and with TLS/SSL encryption: 
+Example (TCP connection with SSL to `203.0.113.0` on port `20000`):
 
-```text
+```ini
 [stream]
+    # Send metrics securely to the Parent at 203.0.113.0:20000
     destination = tcp:203.0.113.0:20000:SSL
 ```
 
 #### `send charts matching`
 
-A space-separated list of [Netdata simple patterns](/src/libnetdata/simple_pattern/README.md) to filter which charts are streamed.
+Controls which charts are streamed.
 
-The default is a single wildcard `*`, which streams all charts.
+- `*` (default) – Streams all charts.
+- Specific charts:
 
-To send only a few charts, list them explicitly, or list a group using a wildcard. To send _only_ the `apps.cpu` chart
-and charts with contexts beginning with `system.`: 
+  ```ini
+  [stream]
+      # Only send CPU application charts and all system charts
+      send charts matching = apps.cpu system.*
+  ```
 
-```text
-[stream]
-    send charts matching = apps.cpu system.*
-```
+- Exclude charts using `!`:
 
-To send all but a few charts, use `!` to create a negative match. To send _all_ charts _but_ `apps.cpu`:
-
-```text
-[stream]
-    send charts matching = !apps.cpu *
-```
+  ```ini
+  [stream]
+      # Send all charts except CPU application charts
+      send charts matching = !apps.cpu *
+  ```
 
 #### `allow from`
 
-A space-separated list of [Netdata simple patterns](/src/libnetdata/simple_pattern/README.md) matching the IPs of nodes that
-will stream metrics using this API key. The order is important, left to right, as the first positive or negative match is used.
+Defines which Child nodes (by IP) can connect.
 
-The default is `*`, which accepts all requests including the `API_KEY`.
+- Allow a single IP:
 
-To allow from only a specific IP address:
+  ```ini
+  [API_KEY]
+      # Only allow connections from 203.0.113.10
+      allow from = 203.0.113.10
+  ```
 
-```text
-[API_KEY]
-    allow from = 203.0.113.10
-```
+- Allow a range but exclude one:
 
-To allow all IPs starting with `10.*`, except `10.1.2.3`:
-
-```text
-[API_KEY]
-    allow from = !10.1.2.3 10.*
-```
-
-> If you set specific IP addresses here, and also use the `allow connections` setting in the `[web]` section of
-> `netdata.conf`, be sure to add the IP address there so that it can access the API port.
+  ```ini
+  [API_KEY]
+      # Allow all 10.*.*.* addresses except 10.1.2.3
+      allow from = !10.1.2.3 10.*
+  ```
 
 #### `db`
 
-The [database](/src/database/README.md) to use for all nodes using this `API_KEY`.
-Valid settings are `dbengine`, `ram`, , or `none`.
+Defines the database mode:
 
-- `dbengine`: The default, recommended time-series database (TSDB) for Netdata. Stores recent metrics in memory, then
-  efficiently spills them to disk for long-term storage.
-- `ram`: Stores metrics _only_ in memory, which means metrics are lost when Netdata stops or restarts. Ideal for
-  streaming configurations that use ephemeral nodes.
-- `none`: No database.
+- `dbengine` – Stores recent metrics in RAM and writes older data to disk.
+- `ram` – Stores metrics only in RAM (lost on restart).
+- `none` – No database.
 
-### `netdata.conf`
-
-| Setting                            | Default           | Description                                                                                                                                                                                                                                                                                                     |
-|------------------------------------|-------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `[db]` section                     |                   |                                                                                                                                                                                                                                                                                                                 |
-| `mode`                             | `dbengine`        | Determines the [database type](/src/database/README.md) to be used on that node. Other options settings include `none`, and `ram`. `none` disables the database at this host. This also disables alerts and notifications, as those can't run without a database. |
-| `[web]` section                    |                   |                                                                                                                                                                                                                                                                                                                 |
-| `mode`                             | `static-threaded` | Determines the [web server](/src/web/server/README.md) type. The other option is `none`, which disables the dashboard, API, and Registry.                                                                                                                             |
-| `accept a streaming request every` | `off`             | Set a limit on how often a parent node accepts streaming requests from child nodes. `0` equals no limit. If this is set, you may see `... too busy to accept new streaming request. Will be allowed in X secs` in Netdata's `error.log`.                                                                        |
-
-### Basic use cases
-
-This is an overview of how the main options can be combined:
-
-| target             | memory<br/>mode | web<br/>mode | stream<br/>enabled |               exporting               |    alerts    | dashboard |
-|--------------------|:---------------:|:------------:|:------------------:|:-------------------------------------:|:------------:|:---------:|
-| headless collector |     `none`      |    `none`    |       `yes`        | only for `data source = as collected` | not possible |    no     |
-| headless proxy     |     `none`      |  not `none`  |       `yes`        | only for `data source = as collected` | not possible |    no     |
-| proxy with db      |   not `none`    |  not `none`  |       `yes`        |               possible                |   possible   |    yes    |
-| central netdata    |   not `none`    |  not `none`  |        `no`        |               possible                |   possible   |    yes    |
-
-### Per-child settings
-
-While the `[API_KEY]` section applies settings for any child node using that key, you can also use per-child settings
-with the `[MACHINE_GUID]` section.
-
-For example, the metrics streamed from only the child node with `MACHINE_GUID` are saved in memory, not using the
-default `dbengine` as specified by the `API_KEY`, and alerts are disabled.
-
-```text
+```ini
 [API_KEY]
-    enabled = yes
+    # Use disk-based database for all metrics
     db = dbengine
-    health enabled = auto
+```
+
+## `netdata.conf` Settings Affecting Streaming
+
+The `netdata.conf` file is the primary configuration file for the Netdata agent. The following sections can impact streaming:
+
+### [global]
+
+This section defines global settings for the Netdata agent.
+
+- **hostname**: The hostname used by the agent.
+- **memory mode**: Choose the memory mode for data collection (e.g., `ram` or `swap`).
+- **error log file**: Path to the file where error logs are saved.
+
+### [web]
+
+Configure the web interface settings here.
+
+- **bind to**: Define the network address to which Netdata binds.
+- **port**: Set the port for the web interface (default: 19999).
+- **disable SSL**: Set to `yes` to disable SSL support.
+
+### [database]
+
+Manage database settings for data storage and retention.
+
+- **memory mode**: Choose between in-memory or disk-based storage.
+- **data retention**: Set how long to keep historical data.
+- **compression**: Enable or disable data compression.
+
+## Complete Configuration Examples
+
+### Basic Parent-Child Setup
+
+**Parent node configuration (stream.conf):**
+
+```ini
+# Generate a random UUID first: uuidgen
+[11111111-2222-3333-4444-555555555555]
+    # Enable this API key
+    enabled = yes
+    # Allow all IPs to connect with this key
     allow from = *
-
-[MACHINE_GUID]
-    enabled = yes
-    db = ram
-    health enabled = no
-```
-
-### Streaming compression
-
-[![Supported version Netdata Agent release](https://img.shields.io/badge/Supported%20Netdata%20Agent-v1.33%2B-brightgreen)](https://github.com/netdata/netdata/releases/latest)
-
-[![Supported version Netdata Agent release](https://img.shields.io/badge/Supported%20Netdata%20stream%20version-v5%2B-blue)](https://github.com/netdata/netdata/releases/latest)
-
-#### OS dependencies
-* Streaming compression is based on [lz4 v1.9.0+](https://github.com/lz4/lz4). The [lz4 v1.9.0+](https://github.com/lz4/lz4) library must be installed in your OS in order to enable streaming compression. Any lower version will disable Netdata streaming compression for compatibility purposes between the older versions of Netdata Agents.
-
-To check if your Netdata Agent supports stream compression run the following GET request in your browser or terminal:
-
-```
-curl -X GET http://localhost:19999/api/v1/info | grep 'Stream Compression'
-```
-
-**Output**
-```
-"buildinfo": "dbengine|Native HTTPS|Netdata Cloud|ACLK Next Generation|New Cloud Protocol Support|ACLK Legacy|TLS Host Verification|Machine Learning|Stream Compression|protobuf|JSON-C|libcrypto|libm|LWS v3.2.2|mosquitto|zlib|apps|cgroup Network Tracking|EBPF|perf|slabinfo",
-```
-> Note: If your OS doesn't support Netdata compression the `buildinfo` will not contain the `Stream Compression` statement.
-
-To check if your Netdata Agent has stream compression enabled, run the following GET request in your browser or terminal: 
-
-```
- curl -X GET http://localhost:19999/api/v1/info | grep 'stream-compression'
-```
-**Output**
-```
-"stream-compression": "enabled"
-```
-Note: The `stream-compression` status can be `"enabled" | "disabled" | "N/A"`.
-
-A compressed data packet is determined and decompressed on the fly.
-
-#### Limitations
-This limitation will be withdrawn asap and is work-in-progress.
-
-The current implementation of streaming data compression can support only a few number of dimensions in a chart with names that cannot exceed the size of 16384 bytes. In case your instance hit this limitation, the Agent will deactivate compression during runtime to avoid stream corruption. This limitation can be seen in the error.log file with the sequence of the following messages: 
-```
-netdata INFO  : STREAM_SENDER[child01] : STREAM child01 [send to my.parent.IP]: connecting...
-netdata INFO  : STREAM_SENDER[child01] : STREAM child01 [send to my.parent.IP]: initializing communication...
-netdata INFO  : STREAM_SENDER[child01] : STREAM child01 [send to my.parent.IP]: waiting response from remote netdata...
-netdata INFO  : STREAM_SENDER[child01] : STREAM_COMPRESSION: Compressor Reset
-netdata INFO  : STREAM_SENDER[child01] : STREAM child01 [send to my.parent.IP]: established communication with a parent using protocol version 5 - ready to send metrics...
-...
-netdata ERROR : PLUGINSD[go.d] : STREAM_COMPRESSION: Compression Failed - Message size 27847 above compression buffer limit: 16384 (errno 9, Bad file descriptor)
-netdata ERROR : PLUGINSD[go.d] : STREAM_COMPRESSION: Deactivating compression to avoid stream corruption
-netdata ERROR : PLUGINSD[go.d] : STREAM_COMPRESSION child01 [send to my.parent.IP]: Restarting connection without compression
-...
-netdata INFO  : STREAM_SENDER[child01] : STREAM child01 [send to my.parent.IP]: connecting...
-netdata INFO  : STREAM_SENDER[child01] : STREAM child01 [send to my.parent.IP]: initializing communication...
-netdata INFO  : STREAM_SENDER[child01] : STREAM child01 [send to my.parent.IP]: waiting response from remote netdata...
-netdata INFO  : STREAM_SENDER[child01] : Stream is uncompressed! One of the Agents (my.parent.IP <-> child01) does not support compression OR compression is disabled.
-netdata INFO  : STREAM_SENDER[child01] : STREAM child01 [send to my.parent.IP]: established communication with a parent using protocol version 4 - ready to send metrics...
-netdata INFO  : WEB_SERVER[static4] : STREAM child01 [send]: sending metrics...
-```
-
-#### How to enable stream compression
-Netdata Agents are shipped with data compression enabled by default. You can also configure which streams will use compression.
-
-With enabled stream compression, a Netdata Agent can negotiate streaming compression with other Netdata Agents. During the negotiation of streaming compression both Netdata Agents should support and enable compression in order to communicate over a compressed stream. The negotiation will result into an uncompressed stream, if one of the Netdata Agents doesn't support **or** has compression disabled.
-
-To enable stream compression: 
-
-1. Edit `stream.conf` by using the `edit-config` script: 
-`/etc/netdata/edit-config stream.conf`. 
-
-2. In the `[stream]` section, set `enable compression` to `yes`.
-```
-# This is the default stream compression flag for an Agent.
-
-[stream]
-    enable compression = yes | no
-```
-
-
-| Parent                               | Stream compression | Child                                |
-|--------------------------------------|--------------------|--------------------------------------|
-| Supported & Enabled                  | compressed         | Supported & Enabled                  |
-| (Supported & Disabled)/Not supported | uncompressed       | Supported & Enabled                  |
-| Supported & Enabled                  | uncompressed       | (Supported & Disabled)/Not supported |
-| (Supported & Disabled)/Not supported | uncompressed       | (Supported & Disabled)/Not supported |
-
-In case of parents with multiple children you can select which streams will be compressed by using the same configuration under the `[API_KEY]`, `[MACHINE_GUID]` section. 
-
-This configuration uses AND logic with the default stream compression configuration under the `[stream]` section. This means the stream compression from child to parent will be enabled only if the outcome of the AND logic operation is true (`default compression enabled` && `api key compression enabled`). So both should be enabled to get stream compression otherwise  stream compression is disabled.
-```  
-[API_KEY]
-    enable compression = yes | no
-```
-Same thing applies with the `[MACHINE_GUID]` configuration.
-```
-[MACHINE_GUID]
-    enable compression = yes | no
-```
-
-### Securing streaming with TLS/SSL
-
-Netdata does not activate TLS encryption by default. To encrypt streaming connections, you first need to [enable TLS
-support](/src/web/server/README.md#enabling-tls-support) on the parent. With encryption enabled on the receiving side, you
-need to instruct the child to use TLS/SSL as well. On the child's `stream.conf`, configure the destination as follows:
-
-```
-[stream]
-    destination = host:port:SSL
-```
-
-The word `SSL` appended to the end of the destination tells the child that connections must be encrypted.
-
-> While Netdata uses Transport Layer Security (TLS) 1.2 to encrypt communications rather than the obsolete SSL protocol,
-> it's still common practice to refer to encrypted web connections as `SSL`. Many vendors, like Nginx and even Netdata
-> itself, use `SSL` in configuration files, whereas documentation will always refer to encrypted communications as `TLS`
-> or `TLS/SSL`.
-
-#### Certificate verification
-
-When TLS/SSL is enabled on the child, the default behavior will be to not connect with the parent unless the server's
-certificate can be verified via the default chain. In case you want to avoid this check, add the following to the
-child's `stream.conf` file:
-
-```
-[stream]
-    ssl skip certificate verification = yes
-```
-
-#### Trusted certificate
-
-If you've enabled [certificate verification](#certificate-verification), you might see errors from the OpenSSL library
-when there's a problem with checking the certificate chain (`X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY`). More
-importantly, OpenSSL will reject self-signed certificates.
-
-Given these known issues, you have two options. If you trust your certificate, you can set the options `CApath` and
-`CAfile` to inform Netdata where your certificates, and the certificate trusted file, are stored.
-
-For more details about these options, you can read about [verify
-locations](https://www.openssl.org/docs/man1.1.1/man3/SSL_CTX_load_verify_locations.html).
-
-Before you changed your streaming configuration, you need to copy your trusted certificate to your child system and add
-the certificate to OpenSSL's list.
-
-On most Linux distributions, the `update-ca-certificates` command searches inside the `/usr/share/ca-certificates`
-directory for certificates. You should double-check by reading the `update-ca-certificate` manual (`man
-update-ca-certificate`), and then change the directory in the below commands if needed.
-
-If you have `sudo` configured on your child system, you can use that to run the following commands. If not, you'll have
-to log in as `root` to complete them.
-
-```
-# mkdir /usr/share/ca-certificates/netdata
-# cp parent_cert.pem /usr/share/ca-certificates/netdata/parent_cert.crt
-# chown -R netdata.netdata /usr/share/ca-certificates/netdata/
-```
-
-First, you create a new directory to store your certificates for Netdata. Next, you need to change the extension on your
-certificate from `.pem` to `.crt` so it's compatible with `update-ca-certificate`. Finally, you need to change
-permissions so the user that runs Netdata can access the directory where you copied in your certificate.
-
-Next, edit the file `/etc/ca-certificates.conf` and add the following line:
-
-```
-netdata/parent_cert.crt
-```
-
-Now you update the list of certificates running the following, again either as `sudo` or `root`:
-
-```
-# update-ca-certificates
-```
-
-> Some Linux distributions have different methods of updating the certificate list. For more details, please read this
-> guide on [adding trusted root certificates](https://github.com/Busindre/How-to-Add-trusted-root-certificates).
-
-Once you update your certificate list, you can set the stream parameters for Netdata to trust the parent certificate.
-Open `stream.conf` for editing and change the following lines:
-
-```
-[stream]
-    CApath = /etc/ssl/certs/
-    CAfile = /etc/ssl/certs/parent_cert.pem
-```
-
-With this configuration, the `CApath` option tells Netdata to search for trusted certificates inside `/etc/ssl/certs`.
-The `CAfile` option specifies the Netdata parent certificate is located at `/etc/ssl/certs/parent_cert.pem`. With this
-configuration, you can skip using the system's entire list of certificates and use Netdata's parent certificate instead.
-
-#### Expected behaviors
-
-With the introduction of TLS/SSL, the parent-child communication behaves as shown in the table below, depending on the
-following configurations:
-
--   **Parent TLS (Yes/No)**: Whether the `[web]` section in `netdata.conf` has `ssl key` and `ssl certificate`.
--   **Parent port TLS (-/force/optional)**: Depends on whether the `[web]` section `bind to` contains a `^SSL=force` or
-    `^SSL=optional` directive on the port(s) used for streaming.
--   **Child TLS (Yes/No)**: Whether the destination in the child's `stream.conf` has `:SSL` at the end.
--   **Child TLS Verification (yes/no)**: Value of the child's `stream.conf` `ssl skip certificate verification`
-    parameter (default is no).
-
-| Parent TLS enabled | Parent port SSL  | Child TLS | Child SSL Ver. | Behavior                                                                                                                                 |
-|:-------------------|:-----------------|:----------|:---------------|:-----------------------------------------------------------------------------------------------------------------------------------------|
-| No                 | -                | No        | no             | Legacy behavior. The parent-child stream is unencrypted.                                                                                 |
-| Yes                | force            | No        | no             | The parent rejects the child connection.                                                                                                 |
-| Yes                | -/optional       | No        | no             | The parent-child stream is unencrypted (expected situation for legacy child nodes and newer parent nodes)                                |
-| Yes                | -/force/optional | Yes       | no             | The parent-child stream is encrypted, provided that the parent has a valid TLS/SSL certificate. Otherwise, the child refuses to connect. |
-| Yes                | -/force/optional | Yes       | yes            | The parent-child stream is encrypted.                                                                                                    |
-
-### Proxy
-
-A proxy is a node that receives metrics from a child, then streams them onward to a parent. To configure a proxy,
-configure it as a receiving and a sending Netdata at the same time.
-
-Netdata proxies may or may not maintain a database for the metrics passing through them. When they maintain a database,
-they can also run health checks (alerts and notifications) for the remote host that is streaming the metrics.
-
-In the following example, the proxy receives metrics from a child node using the `API_KEY` of
-`66666666-7777-8888-9999-000000000000`, then stores metrics using `dbengine`. It then uses the `API_KEY` of
-`11111111-2222-3333-4444-555555555555` to proxy those same metrics on to a parent node at `203.0.113.0`.
-
-```text
-[stream]
-    enabled = yes 
-    destination = 203.0.113.0
-    api key = 11111111-2222-3333-4444-555555555555
-
-[66666666-7777-8888-9999-000000000000]
-    enabled = yes
+    # Store data using dbengine for persistence
     db = dbengine
 ```
 
-### Ephemeral nodes
+**Child node configuration (stream.conf):**
 
-Netdata can help you monitor ephemeral nodes, such as containers in an auto-scaling infrastructure, by always streaming
-metrics to any number of permanently-running parent nodes.
-
-On the parent, set the following in `stream.conf`:
-
-```text
-[11111111-2222-3333-4444-555555555555]
-	# enable/disable this API key
-    enabled = yes
-
-    # one hour of data for each of the child nodes
-    history = 1h
-
-    # do not save child metrics on disk
-    default memory = ram
-
-    # alerts checks, only while the child is connected
-    health enabled = auto
-```
-
-On the child nodes, set the following in `stream.conf`:
-
-```bash
+```ini
 [stream]
-    # stream metrics to another Netdata
+    # Enable streaming on this node
     enabled = yes
-
-    # the IP and PORT of the parent
-    destination = 10.11.12.13:19999
-
-	  # the API key to use
+    # Connect to Parent at 192.168.1.5 port 19999
+    destination = 192.168.1.5
+    # Use the same API key defined on the Parent
     api key = 11111111-2222-3333-4444-555555555555
 ```
 
-In addition, edit `netdata.conf` on each child node to disable the database and alerts.
+### High Availability Setup with Multiple Parents
 
-```bash
-[db]
-    # disable the local database
-	db = none
+**Parent nodes configuration (stream.conf on both Parents):**
 
-[health]
-    # disable health checks
-    enabled = no
-```
-
-## Replication
-
-Netdata streaming automatically replicates data from child nodes to parent nodes, ensuring that the parent node has a complete and up-to-date view of all metrics.
-This replication process ensures data continuity even if child nodes temporarily disconnect.
-
-Replication is enabled by default in Netdata, but you can customize the replication behavior by modifying the `[API_KEY]` section of the `stream.conf` file. Here's an example configuration:
-
-```text
+```ini
+# Configuration for accepting metrics from Children
 [11111111-2222-3333-4444-555555555555]
-    # Enable replication for all hosts using this api key. Default: yes.
-    enable replication = yes
+    enabled = yes
+    allow from = *
+    db = dbengine
 
-    # How many seconds of data to replicate from each child at a time. Default: a day.
-    replication period = 1d
-
-    # The duration we want to replicate per each replication step. Default: 10 minutes.
-    replication step = 10m
+# Configuration for accepting metrics from other Parents
+[22222222-3333-4444-5555-666666666666]
+    enabled = yes
+    # Only allow the other Parent's IP
+    allow from = 192.168.1.5 192.168.1.6
+    db = dbengine
 ```
 
-You can monitor the replication process in two ways:
+**First Parent node's configuration for streaming to the second Parent:**
 
-1. **Netdata Monitoring**: access the Netdata Monitoring section and look for the Replication charts. 
-2. **Streaming Function**: use the Streaming function (Top) to see the replication status of children nodes. This function provides real-time insights into the replication status of each child node.
+```ini
+[stream]
+    enabled = yes
+    destination = 192.168.1.6
+    api key = 22222222-3333-4444-5555-666666666666
+```
 
-### Replication history
+**Second Parent node's configuration for streaming to the first Parent:**
 
-Replication history in [dbengine](/src/database/README.md#modes) mode is limited
-by [Tier 0 retention](/src/database/README.md#tiers):
+```ini
+[stream]
+    enabled = yes
+    destination = 192.168.1.5
+    api key = 22222222-3333-4444-5555-666666666666
+```
 
-- Child instances replicate only Tier 0 data.
-- Parent instance calculates higher-level tiers using Tier 0 as the basis.
+**Child node configuration:**
 
-Extend replication history by increasing Tier 0 retention.
+```ini
+[stream]
+    enabled = yes
+    # List both Parents for failover
+    destination = 192.168.1.5 192.168.1.6
+    api key = 11111111-2222-3333-4444-555555555555
+```
 
-Checking Tier 0 retention:
+## Verifying Successful Connections
 
-- Using a web browser:
-    - Navigate to `http://{CHILD_IP}:19999/api/v2/node_instances`.
-    - Locate the `expected_retention` value for Tier 0 of your Agent.
-    - Convert the value from seconds to days for a more meaningful representation.
-- Using `curl` and `jq`:
-    - Execute the following command:
-      ```bash
-      $ curl -s "http://{CHILD_IP}:19999/api/v2/node_instances" | jq '.agents[] | {nm, retention: (.db_size[0].retention / 86400 | .*100 | round/100) }'
-      ```
-    - Example output:
-      ```json
-       {
-         "nm": "myhost",
-         "retention": 12.73
-       }
-      ```
+If the streaming configuration is working correctly, you'll see logs similar to the following.
 
-## Troubleshooting
-
-Both parent and child nodes log information at `/var/log/netdata/error.log`.
-
-If the child manages to connect to the parent you will see something like (on the parent):
+On the Parent side:
 
 ```
 2017-03-09 09:38:52: netdata: INFO : STREAM [receive from [10.11.12.86]:38564]: new client connection.
 2017-03-09 09:38:52: netdata: INFO : STREAM xxx [10.11.12.86]:38564: receive thread created (task id 27721)
-2017-03-09 09:38:52: netdata: INFO : STREAM xxx [receive from [10.11.12.86]:38564]: client willing to stream metrics for host 'xxx' with machine_guid '1234567-1976-11e6-ae19-7cdd9077342a': update every = 1, history = 3600, memory mode = ram, health auto
-2017-03-09 09:38:52: netdata: INFO : STREAM xxx [receive from [10.11.12.86]:38564]: initializing communication...
-2017-03-09 09:38:52: netdata: INFO : STREAM xxx [receive from [10.11.12.86]:38564]: receiving metrics...
 ```
 
-and something like this on the child:
+On the Child side:
 
 ```
 2017-03-09 09:38:28: netdata: INFO : STREAM xxx [send to box:19999]: connecting...
-2017-03-09 09:38:28: netdata: INFO : STREAM xxx [send to box:19999]: initializing communication...
-2017-03-09 09:38:28: netdata: INFO : STREAM xxx [send to box:19999]: waiting response from remote netdata...
 2017-03-09 09:38:28: netdata: INFO : STREAM xxx [send to box:19999]: established communication - sending metrics...
 ```
 
-The following sections describe the most common issues you might encounter when connecting parent and child nodes.
+Both Parent and Child nodes log information in `/var/log/netdata/error.log`.
 
-### Slow connections between parent and child
+## Troubleshooting
 
-When you have a slow connection between parent and child, Netdata raises a few different errors. Most of the
-errors will appear in the child's `error.log`.
+<details>
+<summary><strong>Slow Connection Issues</strong></summary>
+<br/>
 
-```bash
-netdata ERROR : STREAM_SENDER[CHILD HOSTNAME] : STREAM CHILD HOSTNAME [send to PARENT IP:PARENT PORT]: too many data pending - buffer is X bytes long,
-Y unsent - we have sent Z bytes in total, W on this connection. Closing connection to flush the data.
+**Symptoms:**
+
+- Buffer overflow errors
+- Connection resets
+- Partial message errors
+
+**Child logs:**
+
+```
+netdata ERROR : STREAM_SENDER[CHILD HOSTNAME] : STREAM CHILD HOSTNAME [send to PARENT IP:PARENT PORT]: too many data pending - buffer is X bytes long, Y unsent - we have sent Z bytes in total, W on this connection. Closing connection to flush the data.
 ```
 
-On the parent side, you may see various error messages, most commonly the following:
+**Parent logs:**
 
 ```
 netdata ERROR : STREAM_PARENT[CHILD HOSTNAME,[CHILD IP]:CHILD PORT] : read failed: end of file
 ```
 
-Another common problem in slow connections is the child sending a partial message to the parent. In this case, the
-parent will write the following to its `error.log`:
+**What's happening:**
+Slow network connections or high-latency links can cause the streaming buffer to fill up faster than it can be transmitted. When the buffer reaches its maximum size, Netdata closes the connection to flush the pending data, then re-establishes the connection. This can lead to data gaps or inconsistencies if it happens frequently.
 
-```
-ERROR : STREAM_RECEIVER[CHILD HOSTNAME,[CHILD IP]:CHILD PORT] : sent command 'B' which is not known by netdata, for host 'HOSTNAME'. Disabling it.
-```
+**Solutions:**
 
-In this example, `B` was part of a `BEGIN` message that was cut due to connection problems.
+- Increase buffer size in `stream.conf`: `buffer size bytes = 20971520` (20MB)
+- Check network bandwidth and latency between nodes
+- Consider reducing the collection frequency on high-volume metrics
+- If possible, place Parent nodes closer (network-wise) to Child nodes
 
-Slow connections can also cause problems when the parent misses a message and then receives a command related to the
-missed message. For example, a parent might miss a message containing the child's charts, and then doesn't know
-what to do with the `SET` message that follows. When that happens, the parent will show a message like this:
+</details>
 
-```
-ERROR : STREAM_RECEIVER[CHILD HOSTNAME,[CHILD IP]:CHILD PORT] : requested a SET on chart 'CHART NAME' of host 'HOSTNAME', without a dimension. Disabling it.
-```
+<details>
+<summary><strong>Connection Issues</strong></summary>
+<br/>
 
-### Child cannot connect to parent
+**Symptoms:**
 
-When the child can't connect to a parent for any reason (misconfiguration, networking, firewalls, parent
-down), you will see the following in the child's `error.log`.
+- Child can't establish a connection to a Parent
+- Repeated reconnection attempts
+
+**Child logs:**
 
 ```
 ERROR : STREAM_SENDER[HOSTNAME] : Failed to connect to 'PARENT IP', port 'PARENT PORT' (errno 113, No route to host)
 ```
 
-### 'Is this a Netdata?'
+**What's happening:**
+This error indicates network connectivity problems between the Child and Parent nodes. It could be due to firewall rules, incorrect IP addresses, or the Parent node not running.
 
-This question can appear when Netdata starts the stream and receives an unexpected response. This error can appear when
-the parent is using SSL and the child tries to connect using plain text. You will also see this message when
-Netdata connects to another server that isn't Netdata. The complete error message will look like this:
+**Solutions:**
+
+- Verify firewalls allow traffic on port 19999 (or your custom port)
+- Check that the Parent node is running and listening on the correct interface
+- Verify that the IP address/hostname is correct in Child's configuration
+- Test basic connectivity with tools like `ping` or `telnet`
+- Check network routing between the nodes
+
+</details>
+
+<details>
+<summary><strong>Authentication and Permission Issues</strong></summary>
+<br/>
+
+**Symptoms:**
+
+- Connection established but immediately rejected
+- "Forbidding access" errors
+
+**Parent logs:**
+
+```
+STREAM [receive from [child HOSTNAME]:child IP]: `API key 'VALUE' is not allowed`. Forbidding access.
+```
+
+**What's happening:**
+The Parent node is rejecting the connection because the API key doesn't match or the Child's IP address is not allowed by the `allow from` setting.
+
+**Solutions:**
+
+- Verify if the API key matches exactly between Parent and Child
+- Check that the `allow from` setting permits the Child's IP address
+- Ensure GUID formats are valid
+- Check for whitespace or invisible characters in the API key
+- Remember that API keys are case-sensitive
+
+</details>
+
+<details>
+<summary><strong>'Is This a Netdata?' Error</strong></summary>
+<br/>
+
+**Symptoms:**
+
+- Child tries to connect but receives an unexpected response
+
+**Child logs:**
 
 ```
 ERROR : STREAM_SENDER[CHILD HOSTNAME] : STREAM child HOSTNAME [send to PARENT HOSTNAME:PARENT PORT]: server is not replying properly (is it a netdata?).
 ```
 
-### Stream charts wrong
+**What's happening:**
+The Child node is connecting to the destination, but the server is not responding with the expected Netdata streaming protocol. This commonly occurs when there's a mismatch in SSL/TLS settings or when the destination is not a Netdata server.
 
-Chart data needs to be consistent between child and parent nodes. If there are differences between chart data on
-a parent and a child, such as gaps in metrics collection, it most often means your child's `[db].db` setting
-does not match the parent's. To learn more about the different ways Netdata can store metrics, and thus keep chart
-data consistent, read our [db documentation](/src/database/README.md).
+**Solutions:**
 
-### Forbidding access
+- Check SSL settings in the destination URL (add or remove `:SSL` as needed)
+- Verify that you're connecting to a Netdata server and not another service
+- Ensure both nodes are running compatible Netdata versions
+- Check if a proxy or firewall is altering the connection
 
-You may see errors about "forbidding access" for a number of reasons. It could be because of a slow connection between
-the parent and child nodes, but it could also be due to other failures. Look in your parent's `error.log` for errors
-that look like this: 
+</details>
 
+<details>
+<summary><strong>Stream Charts Wrong</strong></summary>
+<br/>
+
+**Symptoms:**
+
+- Data inconsistencies between Parent and Child
+- Gaps in metrics collection
+
+**What's happening:**
+When the database settings between Parent and Child nodes don't match, it can cause inconsistencies in how data is stored and displayed. The most common cause is different memory modes or retention settings.
+
+**Solutions:**
+
+- Check for mismatch in the `[db].db` settings between the Parent and Child
+- Ensure database retention settings are compatible
+- Verify replication is enabled and properly configured
+- Make sure both nodes are using the same (or compatible) database engine
+- Check that clocks are synchronized between nodes
+
+</details>
+
+## FAQ
+
+<details>
+<summary><strong>Can I stream to multiple Parents simultaneously?</strong></summary>
+<br/>
+
+No, you can't stream to multiple Parents at the same time. However, you can configure multiple destinations for failover. Your Child node will connect to the first available Parent in the list.
+</details>
+
+<details>
+<summary><strong>How does replication work with interrupted connections?</strong></summary>
+<br/>
+
+When you re-establish a connection, your Child node will replicate historical data based on the `replication period` setting. This ensures your Parent has a complete history even after interruptions.
+</details>
+
+<details>
+<summary><strong>How much bandwidth does streaming use?</strong></summary>
+<br/>
+
+Your streaming setup will be very efficient, especially with compression enabled. Typically, it uses about 10–20 KB/s for a moderately active node. The actual bandwidth depends on the number of metrics and collection frequency you've configured.
+</details>
+
+<details>
+<summary><strong>Can I filter which metrics are sent to the Parent?</strong></summary>
+<br/>
+
+Yes, you can use the `send charts matching` setting to include or exclude specific metrics from streaming. This works with wildcard patterns, giving you precise control over what metrics are transferred.
+</details>
+
+<details>
+<summary><strong>How do I secure the streaming connection?</strong></summary>
+<br/>
+
+You can enable SSL in the destination setting by adding `:SSL` at the end. Configure proper certificates using the `CAfile` and `CApath` settings for production environments to ensure your metric data is protected in transit.
+</details>
+
+<details>
+<summary><strong>Do I need to configure streaming on every Child node?</strong></summary>
+<br/>
+
+Yes, you need to configure each Child node with its own streaming configuration. However, you can use configuration management tools to deploy a standard configuration across your infrastructure, making this process more efficient.
+</details>
+
+## Step-by-Step Setup Guide
+
+This guide will walk you through setting up Netdata streaming between nodes. **By following these sequential steps, you'll create a basic streaming configuration** that you can later customize based on your needs.
+
+<details>
+<summary><strong>Step 1: Prepare Your Environment</strong></summary>
+<br/>
+
+Before configuring streaming, ensure you have:
+
+1. At least two Netdata instances are installed (one to act as Parent, one as Child)
+2. Network connectivity between the instances
+3. Administrative access to edit configuration files on both systems
+
+</details>
+
+<details>
+<summary><strong>Step 2: Generate an API Key</strong></summary>
+<br/>
+
+The API key is used to authenticate the connection between Parent and Child nodes.
+
+1. On the Parent node, generate a UUID to use as your API key:
+
+   ```bash
+   uuidgen
+   ```
+
+2. If the command isn't available, you can use an online UUID generator or create one with:
+
+   ```bash
+   cat /proc/sys/kernel/random/uuid
+   ```
+
+3. Copy the generated UUID (it should look like `11111111-2222-3333-4444-555555555555`)
+
+</details>
+
+<details>
+<summary><strong>Step 3: Configure the Parent Node</strong></summary>
+<br/>
+
+The Parent node receives and stores metrics from Child nodes.
+
+1. Open the stream configuration file for editing:
+
+   ```bash
+   cd /etc/netdata
+   sudo ./edit-config stream.conf
+   ```
+
+2. Add a section for your API key (replace with your actual UUID):
+
+   ```ini
+   [11111111-2222-3333-4444-555555555555]
+       enabled = yes
+       allow from = *
+   ```
+
+3. Save and close the file
+
+4. Restart Netdata to apply changes:
+
+   ```bash
+   sudo systemctl restart netdata
+   ```
+
+:::tip
+
+**Deployment Strategy**
+For critical environments, consider setting up at least two Parent nodes for redundancy. Each Parent should have enough disk space for your required retention period.
+
+:::
+
+</details>
+
+<details>
+<summary><strong>Step 4: Configure the Child Node</strong></summary>
+<br/>
+
+The Child node streams its metrics to the Parent node.
+
+1. Open the stream configuration file on the Child node:
+
+   ```bash
+   cd /etc/netdata
+   sudo ./edit-config stream.conf
+   ```
+
+2. Find the `[stream]` section and update it (replace PARENT_IP with your Parent's actual IP address):
+
+   ```ini
+   [stream]
+       enabled = yes
+       destination = PARENT_IP:19999
+       api key = 11111111-2222-3333-4444-555555555555
+   ```
+
+3. Save and close the file
+
+4. Restart Netdata on the Child node:
+
+   ```bash
+   sudo systemctl restart netdata
+   ```
+
+:::tip
+
+**Security**
+
+For production environments, enable SSL by adding `:SSL` to your destination. This encrypts the metric data in transit.
+
+:::
+
+</details>
+
+<details>
+<summary><strong>Step 5: Verify the Connection</strong></summary>
+<br/>
+
+Check that streaming is working properly between your nodes.
+
+1. Check the Netdata logs on the Parent node:
+
+   ```bash
+   tail -f /var/log/netdata/error.log | grep STREAM
+   ```
+
+2. You should see connection messages similar to:
+
+   ```
+   STREAM [receive from [CHILD_IP]]: new client connection.
+   STREAM xxx [CHILD_IP]: receive thread created (task id xxxxx)
+   ```
+
+3. On the Child node, you should see:
+
+   ```
+   STREAM xxx [send to PARENT_IP:19999]: connecting...
+   STREAM xxx [send to PARENT_IP:19999]: established communication - sending metrics...
+   ```
+
+4. Open the Netdata dashboard on the Parent node (http://PARENT_IP:19999) and look for the Child node's hostname in the menu
+
+:::tip
+
+**Performance**
+Monitor the connection logs for the first few hours to ensure there are no buffer overflow issues or frequent disconnections.
+
+:::
+
+</details>
+
+<details>
+<summary><strong>Step 6: Customize Your Setup (Optional)</strong></summary>
+<br/>
+
+Now that you have a working basic setup, you can customize it based on your deployment strategy:
+
+### To Filter Which Metrics Are Streamed (Optimize Performance)
+
+Add the following to the Child's `[stream]` section:
+
+```ini
+[stream]
+    # Only send system and disk metrics, but not uptime
+    send charts matching = system.* disk.* !system.uptime
 ```
-STREAM [receive from [child HOSTNAME]:child IP]: `MESSAGE`. Forbidding access."
-```
 
-`MESSAGE` will have one of the following patterns:
+### To Enable SSL Encryption (Security Enhancement)
 
-- `request without KEY` : The message received is incomplete and the KEY value can be API, hostname, machine GUID.
-- `API key 'VALUE' is not valid GUID`: The UUID received from child does not have the format defined in [RFC
-  4122](https://tools.ietf.org/html/rfc4122)
-- `machine GUID 'VALUE' is not GUID.`: This error with machine GUID is like the previous one.
-- `API key 'VALUE' is not allowed`: This stream has a wrong API key.
-- `API key 'VALUE' is not permitted from this IP`: The IP is not allowed to use STREAM with this parent.
-- `machine GUID 'VALUE' is not allowed.`: The GUID that is trying to send stream is not allowed.
-- `Machine GUID 'VALUE' is not permitted from this IP. `: The IP does not match the pattern or IP allowed to connect to
-  use stream.
+1. On the Child node, update the destination to include SSL:
 
-### Netdata could not create a stream
+   ```ini
+   [stream]
+       destination = PARENT_IP:19999:SSL
+   ```
 
-The connection between parent and child is a stream. When the parent can't convert the initial connection into
-a stream, it will write the following message inside `error.log`:
+2. If using self-signed certificates, you may need to add:
 
-```
-file descriptor given is not a valid stream
-```
+   ```ini
+   [stream]
+       ssl skip certificate verification = yes
+   ```
 
-After logging this error, Netdata will close the stream.
+### To Set Up Multiple Parents for High Availability (Redundancy Strategy)
+
+1. Configure multiple destinations on the Child:
+
+   ```ini
+   [stream]
+       destination = PARENT1_IP:19999 PARENT2_IP:19999
+   ```
+
+2. The Child will connect to the first available Parent and automatically switch if that connection fails
+
+### Optimizing Data Retention (Storage Strategy)
+
+On the Parent node, you can [configure retention settings](/src/database/CONFIGURATION.md#retention-settings) to control how long metrics are stored.
+
+:::tip
+
+**Advanced**
+For large-scale deployments, consider setting up Parent-to-Parent streaming to create a hierarchical architecture that balances local responsiveness with centralized monitoring.
+
+:::
+
+</details>
+
+## Quick Troubleshooting Tips
+
+<details>
+<summary><strong>Connection Problems</strong></summary>
+<br/>
+
+Verify that:
+
+- Firewalls allow traffic on port 19999
+- Both Netdata instances are running
+- The API key matches exactly on both systems
+- The Parent IP address is correct
+
+</details>
+
+<details>
+<summary><strong>Metrics Not Appearing</strong></summary>
+<br/>
+
+Verify that:
+
+- The connection is established (check logs)
+- The Child node hasn't been excluded with `allow from` settings
+- The metrics aren't being filtered out with `send charts matching`
+
+</details>
+
+<details>
+<summary><strong>SSL/TLS Issues</strong></summary>
+<br/>
+
+If you're using SSL encryption:
+
+- Make sure `:SSL` is added to the destination on the Child node
+- Set `ssl skip certificate verification = yes` if using self-signed certificates
+- Check that certificate paths are correct if using custom certificates
+
+</details>
+
+<details>
+<summary><strong>Performance Problems</strong></summary>
+<br/>
+
+If streaming is slow or unstable:
+
+- Increase the buffer size: `buffer size bytes = 20971520` (20MB)
+- Check network quality between nodes
+- Consider streaming fewer metrics with `send charts matching`
+
+</details>

@@ -23,17 +23,15 @@ typedef enum __attribute__ ((__packed__)) {
     JOURNALFILE_FLAG_METRIC_CRC_CHECK      = (1 << 3),
 } JOURNALFILE_FLAGS;
 
-/* only one event loop is supported for now */
 struct rrdengine_journalfile {
+    SPINLOCK data_spinlock;
     struct {
-        SPINLOCK spinlock;
         void *data;                    // MMAPed file of journal v2
         uint32_t size;                 // Total file size mapped
         int fd;
     } mmap;
 
     struct {
-        SPINLOCK spinlock;
         JOURNALFILE_FLAGS flags;
         int32_t refcount;
         time_t first_time_s;
@@ -255,7 +253,7 @@ struct wal;
 void journalfile_v1_generate_path(struct rrdengine_datafile *datafile, char *str, size_t maxlen);
 void journalfile_v2_generate_path(struct rrdengine_datafile *datafile, char *str, size_t maxlen);
 struct rrdengine_journalfile *journalfile_alloc_and_init(struct rrdengine_datafile *datafile);
-void journalfile_v1_extent_write(struct rrdengine_instance *ctx, struct rrdengine_datafile *datafile, struct wal *wal);
+int journalfile_v1_extent_write(struct rrdengine_instance *ctx, struct rrdengine_datafile *datafile, struct wal *wal);
 int journalfile_close(struct rrdengine_journalfile *journalfile, struct rrdengine_datafile *datafile);
 int journalfile_unlink(struct rrdengine_journalfile *journalfile);
 int journalfile_destroy_unsafe(struct rrdengine_journalfile *journalfile, struct rrdengine_datafile *datafile);
@@ -264,7 +262,7 @@ int journalfile_load(struct rrdengine_instance *ctx, struct rrdengine_journalfil
                      struct rrdengine_datafile *datafile);
 void journalfile_v2_populate_retention_to_mrg(struct rrdengine_instance *ctx, struct rrdengine_journalfile *journalfile);
 
-void journalfile_migrate_to_v2_callback(Word_t section, unsigned datafile_fileno __maybe_unused, uint8_t type __maybe_unused,
+bool journalfile_migrate_to_v2_callback(Word_t section, unsigned datafile_fileno __maybe_unused, uint8_t type __maybe_unused,
                                         Pvoid_t JudyL_metrics, Pvoid_t JudyL_extents_pos,
                                         size_t number_of_extents, size_t number_of_metrics, size_t number_of_pages, void *user_data);
 

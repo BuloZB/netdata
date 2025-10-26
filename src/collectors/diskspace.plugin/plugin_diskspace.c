@@ -9,7 +9,7 @@
 #define DEFAULT_EXCLUDED_FILESYSTEMS_INODES "msdosfs msdos vfat overlayfs aufs* *unionfs"
 #define CONFIG_SECTION_DISKSPACE "plugin:proc:diskspace"
 
-#define RRDFUNCTIONS_DISKSPACE_HELP "View mount point statistics"
+#define RRDFUNCTIONS_DISKSPACE_HELP "Displays filesystem mount points with space utilization, available capacity, and inode usage statistics."
 
 #define MAX_STAT_USEC 10000LU
 #define SLOW_UPDATE_EVERY 5
@@ -94,6 +94,10 @@ void mountpoint_delete_cb(const DICTIONARY_ITEM *item __maybe_unused, void *entr
 
     string_freez(mp->mountroot);
     mp->mountroot = NULL;
+
+    // Free the labels if they exist
+    rrdlabels_destroy(mp->chart_labels);
+    mp->chart_labels = NULL;
 
     rrdset_obsolete_and_pointer_null(mp->st_space);
     rrdset_obsolete_and_pointer_null(mp->st_inodes);
@@ -512,13 +516,6 @@ cleanup:
     dictionary_acquired_item_release(dict_mountpoints, item);
 }
 
-static void diskspace_slow_worker_cleanup(void *pptr) {
-    struct slow_worker_data *data = CLEANUP_FUNCTION_GET_PTR(pptr);
-    if(data) return;
-
-    worker_unregister();
-}
-
 #define WORKER_JOB_SLOW_MOUNTPOINT 0
 #define WORKER_JOB_SLOW_CLEANUP 1
 
@@ -526,10 +523,9 @@ struct slow_worker_data {
     int update_every;
 };
 
-void *diskspace_slow_worker(void *ptr)
+void diskspace_slow_worker(void *ptr)
 {
     struct slow_worker_data *data = (struct slow_worker_data *)ptr;
-    CLEANUP_FUNCTION_REGISTER(diskspace_slow_worker_cleanup) cleanup_ptr = data;
 
     worker_register("DISKSPACE_SLOW");
     worker_register_job_name(WORKER_JOB_SLOW_MOUNTPOINT, "mountpoint");
@@ -595,19 +591,19 @@ void *diskspace_slow_worker(void *ptr)
         }
     }
 
+    // cleanup
+    netdata_mutex_lock(&slow_mountinfo_mutex);
     free_basic_mountinfo_list(slow_mountinfo_root);
+    netdata_mutex_unlock(&slow_mountinfo_mutex);
 
-    return NULL;
+    worker_unregister();
 }
 
-static void diskspace_main_cleanup(void *pptr) {
-    struct netdata_static_thread *static_thread = CLEANUP_FUNCTION_GET_PTR(pptr);
+static void diskspace_main_cleanup(void *ptr) {
+    struct netdata_static_thread *static_thread = ptr;
     if(!static_thread) return;
 
     static_thread->enabled = NETDATA_MAIN_THREAD_EXITING;
-
-    rrd_collector_finished();
-    worker_unregister();
 
     if (diskspace_slow_thread)
         nd_thread_join(diskspace_slow_thread);
@@ -615,6 +611,13 @@ static void diskspace_main_cleanup(void *pptr) {
     netdata_mutex_lock(&slow_mountinfo_mutex);
     free_basic_mountinfo_list(slow_mountinfo_tmp_root);
     netdata_mutex_unlock(&slow_mountinfo_mutex);
+
+    // Free the mountpoints dictionary
+    dictionary_destroy(dict_mountpoints);
+    dict_mountpoints = NULL;
+
+    rrd_collector_finished();
+    worker_unregister();
 
     static_thread->enabled = NETDATA_MAIN_THREAD_EXITED;
 }
@@ -838,9 +841,7 @@ static int diskspace_function_mount_points(BUFFER *wb, const char *function __ma
     return HTTP_RESP_OK;
 }
 
-void *diskspace_main(void *ptr) {
-    CLEANUP_FUNCTION_REGISTER(diskspace_main_cleanup) cleanup_ptr = ptr;
-
+void diskspace_main(void *ptr) {
     worker_register("DISKSPACE");
     worker_register_job_name(WORKER_JOB_MOUNTINFO, "mountinfo");
     worker_register_job_name(WORKER_JOB_MOUNTPOINT, "mountpoint");
@@ -870,7 +871,7 @@ void *diskspace_main(void *ptr) {
 
     diskspace_slow_thread = nd_thread_create(
         "P[diskspace slow]",
-        NETDATA_THREAD_OPTION_JOINABLE,
+        NETDATA_THREAD_OPTION_DEFAULT,
         diskspace_slow_worker,
         &slow_worker_data);
 
@@ -918,5 +919,7 @@ void *diskspace_main(void *ptr) {
             mount_points_cleanup(false);
         }
     }
-    return NULL;
+
+    // cleanup
+    diskspace_main_cleanup(ptr);
 }

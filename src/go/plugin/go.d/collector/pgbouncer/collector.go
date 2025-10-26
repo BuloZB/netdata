@@ -10,11 +10,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/confopt"
-
 	"github.com/blang/semver/v4"
 	_ "github.com/jackc/pgx/v4/stdlib"
+
+	"github.com/netdata/netdata/go/plugins/pkg/confopt"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
 )
 
 //go:embed "config_schema.json"
@@ -43,10 +43,11 @@ func New() *Collector {
 }
 
 type Config struct {
-	Vnode       string           `yaml:"vnode,omitempty" json:"vnode"`
-	UpdateEvery int              `yaml:"update_every,omitempty" json:"update_every"`
-	DSN         string           `yaml:"dsn" json:"dsn"`
-	Timeout     confopt.Duration `yaml:"timeout,omitempty" json:"timeout"`
+	Vnode              string           `yaml:"vnode,omitempty" json:"vnode"`
+	UpdateEvery        int              `yaml:"update_every,omitempty" json:"update_every"`
+	AutoDetectionRetry int              `yaml:"autodetection_retry,omitempty" json:"autodetection_retry"`
+	DSN                string           `yaml:"dsn" json:"dsn"`
+	Timeout            confopt.Duration `yaml:"timeout,omitempty" json:"timeout"`
 }
 
 type Collector struct {

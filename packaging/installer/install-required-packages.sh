@@ -631,6 +631,11 @@ declare -A pkg_find=(
   ['default']="WARNING|"
 )
 
+declare -A pkg_awk=(
+  ['gentoo']="app-alternatives/awk"
+  ['default']="gawk"
+)
+
 declare -A pkg_distro_sdk=(
   ['alpine']="alpine-sdk"
   ['centos']="kernel-headers"
@@ -654,6 +659,12 @@ declare -A pkg_cmake=(
   ['gentoo']="dev-util/cmake"
   ['clearlinux']="c-basic"
   ['default']="cmake"
+)
+
+# patch is required for vendoring Abseil
+declare -A pkg_patch=(
+  ['default']="patch"
+  ['gentoo']="dev-util/patch"
 )
 
 declare -A pkg_json_c_dev=(
@@ -847,7 +858,7 @@ declare -A pkg_libuuid_dev=(
   ['ol']="libuuid-devel"
   ['suse']="libuuid-devel"
   ['macos']="ossp-uuid"
-  ['freebsd']="e2fsprogs-libuuid"
+  ['freebsd']="libuuid"
   ['default']=""
 )
 
@@ -1220,6 +1231,7 @@ packages() {
 
   require_cmd git || suitable_package git
   require_cmd find || suitable_package find
+  require_cmd awk || suitable_package awk
 
   require_cmd gcc || require_cmd clang ||
     require_cmd gcc-multilib || suitable_package gcc
@@ -1253,6 +1265,7 @@ packages() {
     require_cmd tar || suitable_package tar
     require_cmd curl || suitable_package curl
     require_cmd gzip || suitable_package gzip
+    require_cmd patch || suitable_package patch
   fi
 
   # -------------------------------------------------------------------------
@@ -1287,6 +1300,7 @@ packages() {
     suitable_package libyaml-dev
     suitable_package libsystemd-dev
     suitable_package pcre2
+    suitable_package flex
     suitable_package libcurl-dev
   fi
 
@@ -1481,7 +1495,7 @@ validate_tree_centos() {
 
   echo >&2 " > CentOS Version: ${version} ..."
 
-  if [[ "${version}" =~ ^9(\..*)?$ ]]; then
+  if [[ "${version}" =~ ^(9|10)(\..*)?$ ]]; then
     echo >&2 " > Checking for config-manager ..."
     if ! run ${sudo} dnf config-manager --help; then
       if prompt "config-manager not found, shall I install it?"; then
@@ -1492,7 +1506,7 @@ validate_tree_centos() {
 
     echo >&2 " > Checking for CRB ..."
     # shellcheck disable=2086
-    if ! run dnf ${sudo} repolist | grep CRB; then
+    if ! run ${sudo} dnf repolist | grep CRB; then
       if prompt "CRB not found, shall I install it?"; then
         # shellcheck disable=2086
         run ${sudo} dnf ${opts} config-manager --set-enabled crb
@@ -1509,7 +1523,7 @@ validate_tree_centos() {
 
     echo >&2 " > Checking for PowerTools ..."
     # shellcheck disable=2086
-    if ! run yum ${sudo} repolist | grep PowerTools; then
+    if ! run ${sudo} yum  repolist | grep PowerTools; then
       if prompt "PowerTools not found, shall I install it?"; then
         # shellcheck disable=2086
         run ${sudo} yum ${opts} config-manager --set-enabled powertools

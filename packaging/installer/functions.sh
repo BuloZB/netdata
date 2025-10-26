@@ -299,9 +299,9 @@ prepare_cmake_options() {
 
   if [ -n "${NETDATA_ENABLE_LTO}" ]; then
     if [ "${NETDATA_ENABLE_LTO}" -eq 1 ]; then
-      NETDATA_CMAKE_OPTIONS="${NETDATA_CMAKE_OPTIONS} -DDISABLE_LTO=Off"
+      NETDATA_CMAKE_OPTIONS="${NETDATA_CMAKE_OPTIONS} -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=On -DUSE_LTO=On"
     else
-      NETDATA_CMAKE_OPTIONS="${NETDATA_CMAKE_OPTIONS} -DDISABLE_LTO=On"
+      NETDATA_CMAKE_OPTIONS="${NETDATA_CMAKE_OPTIONS} -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=Off -DUSE_LTO=Off"
     fi
   fi
 
@@ -330,18 +330,30 @@ prepare_cmake_options() {
   fi
 
   if [ -z "${ENABLE_SYSTEMD_JOURNAL}" ]; then
-      if check_for_module libsystemd; then
-          if check_for_module libelogind; then
-              ENABLE_SYSTEMD_JOURNAL=0
-          else
-              ENABLE_SYSTEMD_JOURNAL=1
-          fi
+    if check_for_module libsystemd; then
+      if check_for_module libelogind; then
+        ENABLE_SYSTEMD_JOURNAL=0
       else
-          ENABLE_SYSTEMD_JOURNAL=0
+        ENABLE_SYSTEMD_JOURNAL=1
       fi
+    else
+      ENABLE_SYSTEMD_JOURNAL=0
+    fi
   fi
 
   enable_feature PLUGIN_SYSTEMD_JOURNAL "${ENABLE_SYSTEMD_JOURNAL}"
+
+  if [ "${ENABLE_SYSTEMD_JOURNAL}" -eq 1 ] && [ -n "${USE_RUST_JOURNAL_FILE}" ]; then
+    enable_feature NETDATA_JOURNAL_FILE_READER 1
+  else
+    enable_feature NETDATA_JOURNAL_FILE_READER 0
+  fi
+
+  if check_for_module 'libsystemd >= 221'; then
+    enable_feature PLUGIN_SYSTEMD_UNITS 1
+  else
+    enable_feature PLUGIN_SYSTEMD_UNITS 0
+  fi
 
   if command -v cups-config >/dev/null 2>&1 || check_for_module libcups || check_for_module cups; then
     ENABLE_CUPS=1
@@ -363,9 +375,10 @@ prepare_cmake_options() {
 
   enable_feature BUNDLED_JSONC "${NETDATA_BUILD_JSON_C:-0}"
   enable_feature DBENGINE "${ENABLE_DBENGINE:-1}"
-  enable_feature H2O "${ENABLE_H2O:-0}"
   enable_feature ML "${NETDATA_ENABLE_ML:-1}"
   enable_feature PLUGIN_APPS "${ENABLE_APPS:-1}"
+  enable_feature PLUGIN_OTEL "${ENABLE_OTEL:-0}"
+  enable_feature PLUGIN_IBM "${ENABLE_IBM:-0}"
 
   check_for_feature EXPORTER_PROMETHEUS_REMOTE_WRITE "${EXPORTER_PROMETHEUS}" snappy
   check_for_feature EXPORTER_MONGODB "${EXPORTER_MONGODB}" libmongoc-1.0
@@ -1065,6 +1078,8 @@ portable_add_user() {
       run dscl . create /Users/"${username}" IsHidden 1
       return 0
     fi
+  elif command -v synouser 1> /dev/null 2>&1; then
+    run synouser -add "${username}" "" "netdata agent" 0 "" 0 && return 0
   fi
 
   warning "Failed to add ${username} user account!"
@@ -1092,6 +1107,8 @@ portable_add_group() {
     run addgroup "${groupname}" && return 0
   elif command -v dseditgroup 1> /dev/null 2>&1; then
     dseditgroup -o create "${groupname}" && return 0
+  elif command -v synogroup 1> /dev/null 2>&1; then
+    run synogroup --add "${groupname}" && return 0
   fi
 
   warning >&2 "Failed to add ${groupname} user group !"
@@ -1127,6 +1144,21 @@ portable_add_user_to_group() {
       run addgroup "${username}" "${groupname}" && return 0
     elif command -v dseditgroup 1> /dev/null 2>&1; then
       dseditgroup -u "${username}" "${groupname}" && return 0
+    elif command -v synogroup 1> /dev/null 2>&1; then
+      # Get current members of the group
+      current_members_list=$(synogroup --get "${groupname}" | grep '^[0-9]')
+      current_members=$(echo "${current_members_list}" | grep -oP '\[\K[^\]]+' | tr '\n' ' ' | sed 's/ $//')
+
+      # Append username to the list
+      if [ -n "$current_members" ]; then
+        new_members="${current_members} ${username}"
+      else
+        new_members="${username}"
+      fi
+
+      # Set the member list
+      # shellcheck disable=SC2086
+      run synogroup --member "${groupname}" ${new_members} && return 0
     fi
 
     warning >&2 "Failed to add user ${username} to group ${groupname}!"

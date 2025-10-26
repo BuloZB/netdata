@@ -14,18 +14,16 @@ struct ml_dimension_t {
     enum ml_metric_type mt;
     enum ml_training_status ts;
     enum ml_machine_learning_status mls;
-
-    time_t last_training_time;
+    SPINLOCK slock;
+    uint32_t suppression_window_counter;
+    uint32_t suppression_anomaly_counter;
+    bool training_in_progress;
 
     std::vector<calculated_number_t> cns;
 
     std::vector<ml_kmeans_inlined_t> km_contexts;
-    SPINLOCK slock;
     ml_kmeans_t kmeans;
     std::vector<DSample> feature;
-
-    uint32_t suppression_window_counter;
-    uint32_t suppression_anomaly_counter;
 };
 
 bool
@@ -83,11 +81,11 @@ public:
         if (AcqRH) {
             RRDHOST *RH = rrdhost_acquired_to_rrdhost(AcqRH);
             if (RH && !rrdhost_flag_check(RH, RRDHOST_FLAG_ORPHAN | RRDHOST_FLAG_ARCHIVED)) {
-                AcqRS = rrdset_find_and_acquire(RH, DLI.chartId());
+                AcqRS = rrdset_find_and_acquire(RH, DLI.chartId(), false);
                 if (AcqRS) {
                     RRDSET *RS = rrdset_acquired_to_rrdset(AcqRS);
                     if (RS && !rrdset_flag_check(RS, RRDSET_FLAG_OBSOLETE)) {
-                        AcqRD = rrddim_find_and_acquire(RS, DLI.dimensionId());
+                        AcqRD = rrddim_find_and_acquire(RS, DLI.dimensionId(), false);
                         if (AcqRD) {
                             RRDDIM *RD = rrddim_acquired_to_rrddim(AcqRD);
                             if (RD) {

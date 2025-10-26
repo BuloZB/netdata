@@ -6,6 +6,7 @@
 #include "status-file.h"
 #include "static_threads.h"
 #include "web/api/queries/backfill.h"
+#include "web/mcp/mcp.h"
 
 #include "database/engine/page_test.h"
 #include <curl/curl.h>
@@ -216,6 +217,8 @@ int unittest_stream_compressions(void);
 int uuid_unittest(void);
 int progress_unittest(void);
 int dyncfg_unittest(void);
+int eval_unittest(void);
+int duration_unittest(void);
 bool netdata_random_session_id_generate(void);
 
 #ifdef OS_WINDOWS
@@ -256,8 +259,7 @@ int netdata_main(int argc, char **argv) {
 
     int i;
     int config_loaded = 0;
-    bool close_open_fds = true;
-    size_t default_stacksize;
+    bool close_open_fds = true; (void)close_open_fds;
     const char *user = NULL;
 
 #ifdef OS_WINDOWS
@@ -380,6 +382,7 @@ int netdata_main(int argc, char **argv) {
 
                             if (sqlite_library_init())
                                 return 1;
+                            rrdlabels_aral_init(false);
 
                             if (pluginsd_parser_unittest()) return 1;
                             if (unit_test_static_threads()) return 1;
@@ -402,9 +405,19 @@ int netdata_main(int argc, char **argv) {
                             if (ctx_unittest()) return 1;
                             if (uuid_unittest()) return 1;
                             if (dyncfg_unittest()) return 1;
+                            if (eval_unittest()) return 1;
+                            if (duration_unittest()) return 1;
                             if (unittest_waiting_queue()) return 1;
                             if (uuidmap_unittest()) return 1;
+#ifdef HAVE_LIBBACKTRACE
+                            if (stacktrace_unittest()) return 1;
+#endif
+                            if (test_cmd_pool_fifo()) return 1;
+#ifdef OS_WINDOWS
+                            if (perflibnamestest_main()) return 1;
+#endif
                             sqlite_library_shutdown();
+                            rrdlabels_aral_destroy(false);
                             fprintf(stderr, "\n\nALL TESTS PASSED\n\n");
                             return 0;
                         }
@@ -441,19 +454,36 @@ int netdata_main(int argc, char **argv) {
                         }
                         else if(strcmp(optarg, "rrdlabelstest") == 0) {
                             unittest_running = true;
-                            return rrdlabels_unittest();
+                            rrdlabels_aral_init(true);
+                            int rc = rrdlabels_unittest();
+                            rrdlabels_aral_destroy(true);
+                            return rc;
                         }
                         else if(strcmp(optarg, "buffertest") == 0) {
                             unittest_running = true;
                             return buffer_unittest();
                         }
+                        else if(strcmp(optarg, "test_cmd_pool_fifo") == 0) {
+                            unittest_running = true;
+                            return test_cmd_pool_fifo();
+                        }
                         else if(strcmp(optarg, "uuidtest") == 0) {
                             unittest_running = true;
                             return uuid_unittest();
                         }
+#ifdef HAVE_LIBBACKTRACE
+                        else if(strcmp(optarg, "stacktracetest") == 0) {
+                            unittest_running = true;
+                            return stacktrace_unittest();
+                        }
+#endif
 #ifdef OS_WINDOWS
                         else if(strcmp(optarg, "perflibdump") == 0) {
                             return windows_perflib_dump(optind + 1 > argc ? NULL : argv[optind]);
+                        }
+                        else if(strcmp(optarg, "perflibnamestest") == 0) {
+                            unittest_running = true;
+                            return perflibnamestest_main();
                         }
 #endif
 #ifdef ENABLE_DBENGINE
@@ -488,6 +518,14 @@ int netdata_main(int argc, char **argv) {
                         else if(strcmp(optarg, "progresstest") == 0) {
                             unittest_running = true;
                             return progress_unittest();
+                        }
+                        else if(strcmp(optarg, "evaltest") == 0) {
+                            unittest_running = true;
+                            return eval_unittest();
+                        }
+                        else if(strcmp(optarg, "durationtest") == 0) {
+                            unittest_running = true;
+                            return duration_unittest();
                         }
                         else if(strcmp(optarg, "dyncfgtest") == 0) {
                             unittest_running = true;
@@ -815,25 +853,12 @@ int netdata_main(int argc, char **argv) {
     nd_profile_setup();
 
     // ----------------------------------------------------------------------------------------------------------------
-    delta_startup_time("stack size");
-
-    // initialize thread - this is required before the first nd_thread_create()
-    default_stacksize = netdata_threads_init();
-
-    // musl default thread stack size is 128k, let's set it to a higher value to avoid random crashes
-    if (default_stacksize < 1 * 1024 * 1024)
-        default_stacksize = 1 * 1024 * 1024;
-
-    netdata_threads_set_stack_size(default_stacksize);
-
-    // ----------------------------------------------------------------------------------------------------------------
     delta_startup_time("crash reports");
 
     daemon_status_file_check_crash();
 
     // ----------------------------------------------------------------------------------------------------------------
     delta_startup_time("temp spawn server");
-
     netdata_main_spawn_server_init("init", argc, (const char **)argv);
 
     // ----------------------------------------------------------------------------------------------------------------
@@ -859,6 +884,7 @@ int netdata_main(int argc, char **argv) {
 
     analytics_reset();
     get_system_timezone();
+    rrdlabels_aral_init(true);
 
     // ----------------------------------------------------------------------------------------------------------------
     delta_startup_time("pulse");
@@ -919,6 +945,7 @@ int netdata_main(int argc, char **argv) {
     // get the certificate and start security
     netdata_conf_web_security_init();
     nd_web_api_init();
+    mcp_initialize_subsystem();
     web_server_threading_selection();
 
     delta_startup_time("web server sockets");
@@ -954,7 +981,6 @@ int netdata_main(int argc, char **argv) {
 
     // ----------------------------------------------------------------------------------------------------------------
     delta_startup_time("stop temporary spawn server");
-
     // stop the old server and later start a new one under the new permissions
     netdata_main_spawn_server_cleanup();
 
@@ -1003,8 +1029,7 @@ int netdata_main(int argc, char **argv) {
     // ----------------------------------------------------------------------------------------------------------------
     delta_startup_time("threads after fork");
 
-    netdata_threads_set_stack_size(
-        (size_t)inicfg_get_size_bytes(&netdata_config, CONFIG_SECTION_GLOBAL, "pthread stack size", default_stacksize));
+    netdata_conf_reset_stack_size();
 
     // ----------------------------------------------------------------------------------------------------------------
     delta_startup_time("registry");
@@ -1029,6 +1054,10 @@ int netdata_main(int argc, char **argv) {
 
     // ----------------------------------------------------------------------------------------------------------------
     delta_startup_time("RRD structures");
+
+    delta_startup_time("commands liveness support");
+
+    commands_init();
 
     abort_on_fatal_disable();
     if (rrd_init(netdata_configured_hostname, system_info, false))
@@ -1073,7 +1102,7 @@ int netdata_main(int argc, char **argv) {
     ml_start_threads();
 
     // ----------------------------------------------------------------------------------------------------------------
-    delta_startup_time("commands API");
+    delta_startup_time("commands full API");
 
     commands_init();
 
@@ -1093,19 +1122,11 @@ int netdata_main(int argc, char **argv) {
 
     // ----------------------------------------------------------------------------------------------------------------
 
-    if(analytics_check_enabled()) {
-        delta_startup_time("anonymous analytics");
-
-        analytics_statistic_t start_statistic = {"START", "-", "-"};
-        analytics_statistic_send(&start_statistic);
-        if (daemon_status_file_has_last_crashed(NULL)) {
-            analytics_statistic_t crash_statistic = {"CRASH", "-", "-"};
-            analytics_statistic_send(&crash_statistic);
-        }
-        if (daemon_status_file_was_incomplete_shutdown()) {
-            analytics_statistic_t incomplete_shutdown_statistic = {"INCOMPLETE_SHUTDOWN", "-", "-"};
-            analytics_statistic_send(&incomplete_shutdown_statistic);
-        }
+    {
+        if(analytics_check_enabled())
+            delta_startup_time("anonymous analytics");
+        else // collect data but do not send it (needed in /api/v1/info)
+            delta_startup_time("anonymous analytics (disabled)");
 
         // check if ANALYTICS needs to start
         for (i = 0; static_threads[i].name != NULL; i++) {
@@ -1128,7 +1149,9 @@ int netdata_main(int argc, char **argv) {
     // ----------------------------------------------------------------------------------------------------------------
     delta_startup_time("mrg cleanup");
 
+#ifdef ENABLE_DBENGINE
     mrg_metric_prepopulate_cleanup(main_mrg);
+#endif
 
     // ----------------------------------------------------------------------------------------------------------------
     delta_startup_time("done");

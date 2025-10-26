@@ -85,7 +85,7 @@ static void pluginsd_worker_thread_handle_success(struct plugind *cd) {
 
 static void pluginsd_worker_thread_handle_error(struct plugind *cd, int worker_ret_code) {
     if (worker_ret_code == -1) {
-        netdata_log_info("PLUGINSD: 'host:%s', '%s' (pid %d) was killed with SIGTERM. Disabling it.",
+        netdata_log_info("PLUGINSD: 'host:%s', '%s' (pid %d) exited abnormally. Disabling it.",
              rrdhost_hostname(cd->host), string2str(cd->fullfilename), cd->unsafe.pid);
         plugin_set_disabled(cd);
         return;
@@ -119,7 +119,8 @@ static void pluginsd_worker_thread_handle_error(struct plugind *cd, int worker_r
 
 #undef SERIAL_FAILURES_THRESHOLD
 
-static void *pluginsd_worker_thread(void *arg) {
+
+static void pluginsd_worker_thread(void *arg) {
     struct plugind *cd = (struct plugind *) arg;
 
     worker_register("PLUGINSD");
@@ -184,7 +185,6 @@ static void *pluginsd_worker_thread(void *arg) {
     spinlock_lock(&cd->unsafe.spinlock);
 
     cd->unsafe.running = false;
-    cd->unsafe.thread = 0;
     cd->unsafe.pid = 0;
 
     POPEN_INSTANCE *pi = cd->unsafe.pi;
@@ -196,7 +196,6 @@ static void *pluginsd_worker_thread(void *arg) {
         spawn_popen_kill(pi, 3 * MSEC_PER_SEC);
 
     worker_unregister();
-    return NULL;
 }
 
 static void pluginsd_main_cleanup(void *pptr) {
@@ -206,8 +205,10 @@ static void pluginsd_main_cleanup(void *pptr) {
     static_thread->enabled = NETDATA_MAIN_THREAD_EXITING;
     netdata_log_info("PLUGINSD: cleaning up...");
 
-    struct plugind *cd;
-    for (cd = pluginsd_root; cd; cd = cd->next) {
+    struct plugind *cd = pluginsd_root;
+    while(cd) {
+        struct plugind *next = cd->next;
+
         spinlock_lock(&cd->unsafe.spinlock);
         if (cd->unsafe.enabled && cd->unsafe.running && cd->unsafe.thread != 0) {
             netdata_log_info("PLUGINSD: 'host:%s', stopping plugin thread: %s",
@@ -215,7 +216,23 @@ static void pluginsd_main_cleanup(void *pptr) {
 
             nd_thread_signal_cancel(cd->unsafe.thread);
         }
+
+        DOUBLE_LINKED_LIST_REMOVE_ITEM_UNSAFE(pluginsd_root, cd, prev, next);
         spinlock_unlock(&cd->unsafe.spinlock);
+
+        if(cd->unsafe.thread) {
+            nd_thread_signal_cancel(cd->unsafe.thread);
+            nd_thread_join(cd->unsafe.thread);
+            cd->unsafe.thread = NULL;
+        }
+
+        string_freez(cd->fullfilename);
+        string_freez(cd->filename);
+        string_freez(cd->id);
+        string_freez(cd->cmd);
+        freez(cd);
+
+        cd = next;
     }
 
     netdata_log_info("PLUGINSD: cleanup completed.");
@@ -225,28 +242,34 @@ static void pluginsd_main_cleanup(void *pptr) {
 }
 
 static bool is_plugin(char *dst, size_t dst_size, const char *filename) {
-    size_t len = strlen(filename);
-
-    const char *suffix;
-    size_t suffix_len;
-
-    suffix = ".plugin";
-    suffix_len = strlen(suffix);
-    if (len > suffix_len &&
-        strcmp(suffix, &filename[len - suffix_len]) == 0) {
-        snprintfz(dst, dst_size, "%.*s", (int)(len - suffix_len), filename);
-        return true;
-    }
-
 #if defined(OS_WINDOWS)
-    suffix = ".plugin.exe";
-    suffix_len = strlen(suffix);
-    if (len > suffix_len &&
-        strcmp(suffix, &filename[len - suffix_len]) == 0) {
-        snprintfz(dst, dst_size, "%.*s", (int)(len - suffix_len), filename);
-        return true;
-    }
+    const char *suffixes[] = {
+        ".plugin.exe",
+        "_plugin.exe",
+        "-plugin.exe",
+        ".plugin",
+        NULL
+    };
+#else
+    const char *suffixes[] = {
+        ".plugin",
+        "_plugin",
+        "-plugin",
+        NULL
+    };
 #endif
+
+    size_t filename_len = strlen(filename);
+
+    for (int i = 0; suffixes[i] != NULL; i++) {
+        size_t suffix_len = strlen(suffixes[i]);
+
+        if (filename_len > suffix_len &&
+            strcmp(suffixes[i], &filename[filename_len - suffix_len]) == 0) {
+            snprintfz(dst, dst_size, "%.*s", (int)(filename_len - suffix_len), filename);
+            return true;
+        }
+    }
 
     return false;
 }
@@ -313,13 +336,23 @@ void *pluginsd_main(void *ptr) {
 
                 // check if it runs already
                 struct plugind *cd;
-                for (cd = pluginsd_root; cd; cd = cd->next)
-                    if (unlikely(strcmp(string2str(cd->filename), file->d_name) == 0))
+                for (cd = pluginsd_root; cd; cd = cd->next) {
+                    if (unlikely(strcmp(string2str(cd->filename), file->d_name) == 0)) {
                         break;
+                    }
+                }
 
-                if (likely(cd && plugin_is_running(cd))) {
-                    netdata_log_debug(D_PLUGINSD, "plugin '%s' is already running", string2str(cd->filename));
-                    continue;
+                if(cd) {
+                    if (likely(plugin_is_running(cd))) {
+                        netdata_log_debug(D_PLUGINSD, "plugin '%s' is already running", string2str(cd->filename));
+                        continue;
+                    }
+                    else if(cd->unsafe.thread) {
+                        netdata_log_debug(D_PLUGINSD, "plugin '%s' gave up", string2str(cd->filename));
+                        nd_thread_signal_cancel(cd->unsafe.thread);
+                        nd_thread_join(cd->unsafe.thread);
+                        cd->unsafe.thread = NULL;
+                    }
                 }
 
                 // it is not running
@@ -384,5 +417,6 @@ void *pluginsd_main(void *ptr) {
         pluginsd_sleep(scan_frequency);
     }
 
+    service_exits();
     return NULL;
 }

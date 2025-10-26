@@ -253,10 +253,6 @@ struct cgroup {
     unsigned long long memory_limit;
     const RRDVAR_ACQUIRED *chart_var_memory_limit;
 
-    char *filename_memoryswap_limit;
-    unsigned long long memoryswap_limit;
-    const RRDVAR_ACQUIRED *chart_var_memoryswap_limit;
-
     const DICTIONARY_ITEM *cgroup_netdev_link;
 
     struct cgroup *next;
@@ -265,9 +261,9 @@ struct cgroup {
 };
 
 struct discovery_thread {
-    uv_thread_t thread;
-    uv_mutex_t mutex;
-    uv_cond_t cond_var;
+    ND_THREAD *thread;
+    netdata_mutex_t mutex;
+    netdata_cond_t cond_var;
     int exited;
 };
 
@@ -276,7 +272,7 @@ extern struct discovery_thread discovery_thread;
 extern const char *cgroups_rename_script;
 extern char cgroup_chart_id_prefix[];
 extern char services_chart_id_prefix[];
-extern uv_mutex_t cgroup_root_mutex;
+extern netdata_mutex_t cgroup_root_mutex;
 
 void cgroup_discovery_worker(void *ptr);
 
@@ -382,7 +378,7 @@ static inline char *cgroup_chart_type(char *buffer, struct cgroup *cg) {
     buffer[0] = '\0';
 
     if (cg->chart_id[0] == '\0' || (cg->chart_id[0] == '/' && cg->chart_id[1] == '\0'))
-        strncpy(buffer, "cgroup_root", RRD_ID_LENGTH_MAX);
+        strncpyz(buffer, "cgroup_root", RRD_ID_LENGTH_MAX - 1);
     else if (is_cgroup_systemd_service(cg))
         snprintfz(buffer, RRD_ID_LENGTH_MAX, "%s%s", services_chart_id_prefix, cg->chart_id);
     else
@@ -391,13 +387,15 @@ static inline char *cgroup_chart_type(char *buffer, struct cgroup *cg) {
     return buffer;
 }
 
-#define RRDFUNCTIONS_CGTOP_HELP "View running containers"
-#define RRDFUNCTIONS_SYSTEMD_SERVICES_HELP "View systemd services"
+#define RRDFUNCTIONS_CGTOP_HELP "Lists active containers and cgroups with resource usage including CPU, memory, disk I/O, and network traffic."
+#define RRDFUNCTIONS_SYSTEMD_SERVICES_HELP "Shows systemd service cgroups with their process counts and resource consumption (CPU, memory, I/O)."
 
 int cgroup_function_cgroup_top(BUFFER *wb, const char *function, BUFFER *payload, const char *source);
 int cgroup_function_systemd_top(BUFFER *wb, const char *function, BUFFER *payload, const char *source);
 
 void cgroup_netdev_link_init(void);
+void cgroup_netdev_link_destroy(void);
+
 const DICTIONARY_ITEM *cgroup_netdev_get(struct cgroup *cg);
 void cgroup_netdev_delete(struct cgroup *cg);
 

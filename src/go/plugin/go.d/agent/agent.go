@@ -30,15 +30,24 @@ var isTerminal = isatty.IsTerminal(os.Stdout.Fd())
 
 // Config is an Agent configuration.
 type Config struct {
-	Name                      string
-	PluginConfigDir           []string
+	Name            string
+	PluginConfigDir []string
+
 	CollectorsConfigDir       []string
 	CollectorsConfigWatchPath []string
 	ServiceDiscoveryConfigDir []string
 	VarLibDir                 string
-	ModuleRegistry            module.Registry
-	RunModule                 string
-	MinUpdateEvery            int
+
+	ModuleRegistry module.Registry
+	RunModule      string
+	RunJob         []string
+	MinUpdateEvery int
+
+	DisableServiceDiscovery bool
+
+	DumpMode    time.Duration
+	DumpSummary bool
+	DumpDataDir string
 }
 
 // Agent represents orchestrator.
@@ -55,7 +64,10 @@ type Agent struct {
 	VarLibDir string
 
 	RunModule      string
+	RunJob         []string
 	MinUpdateEvery int
+
+	DisableServiceDiscovery bool
 
 	ModuleRegistry module.Registry
 	Out            io.Writer
@@ -63,11 +75,20 @@ type Agent struct {
 	api *netdataapi.API
 
 	quitCh chan struct{}
+
+	// Dump mode
+	dumpMode     time.Duration
+	dumpSummary  bool
+	dumpAnalyzer *DumpAnalyzer
+	mgr          *jobmgr.Manager
+
+	dumpDataDir string
+	dumpOnce    sync.Once
 }
 
 // New creates a new Agent.
 func New(cfg Config) *Agent {
-	return &Agent{
+	a := &Agent{
 		Logger: logger.New().With(
 			slog.String("component", "agent"),
 		),
@@ -78,12 +99,35 @@ func New(cfg Config) *Agent {
 		CollectorsConfigWatchPath: cfg.CollectorsConfigWatchPath,
 		VarLibDir:                 cfg.VarLibDir,
 		RunModule:                 cfg.RunModule,
+		RunJob:                    cfg.RunJob,
 		MinUpdateEvery:            cfg.MinUpdateEvery,
 		ModuleRegistry:            module.DefaultRegistry,
 		Out:                       safewriter.Stdout,
 		api:                       netdataapi.New(safewriter.Stdout),
 		quitCh:                    make(chan struct{}, 1),
+		dumpMode:                  cfg.DumpMode,
+		dumpSummary:               cfg.DumpSummary,
+		DisableServiceDiscovery:   cfg.DisableServiceDiscovery,
 	}
+
+	if a.dumpMode > 0 {
+		a.dumpAnalyzer = NewDumpAnalyzer()
+		a.Infof("dump mode enabled: will run for %v and analyze metric structure", a.dumpMode)
+		if a.dumpSummary {
+			a.Infof("dump summary enabled: will show consolidated summary across all jobs")
+		}
+	}
+
+	if cfg.DumpDataDir != "" {
+		a.dumpDataDir = cfg.DumpDataDir
+		if a.dumpAnalyzer == nil {
+			a.dumpAnalyzer = NewDumpAnalyzer()
+		}
+		a.dumpAnalyzer.EnableDataCapture(cfg.DumpDataDir, a.signalDumpComplete)
+		a.Infof("dump data directory: %s", cfg.DumpDataDir)
+	}
+
+	return a
 }
 
 // Run starts the Agent.
@@ -100,6 +144,14 @@ func serve(a *Agent) {
 	var wg sync.WaitGroup
 
 	var exit bool
+
+	// Set up dump mode timer if enabled
+	var dumpTimer *time.Timer
+	var dumpTimerCh <-chan time.Time
+	if a.dumpMode > 0 {
+		dumpTimer = time.NewTimer(a.dumpMode)
+		dumpTimerCh = dumpTimer.C
+	}
 
 	for {
 		module.ObsoleteCharts(true)
@@ -120,6 +172,10 @@ func serve(a *Agent) {
 			}
 		case <-a.quitCh:
 			a.Infof("received QUIT command. Terminating...")
+			exit = true
+		case <-dumpTimerCh:
+			a.Infof("dump mode duration expired, collecting analysis...")
+			a.collectDumpAnalysis()
 			exit = true
 		}
 
@@ -197,8 +253,19 @@ func (a *Agent) run(ctx context.Context) {
 	jobMgr.Out = a.Out
 	jobMgr.VarLibDir = a.VarLibDir
 	jobMgr.Modules = enabledModules
+	if a.RunModule != "" && a.RunModule != "all" {
+		jobMgr.RunJob = a.RunJob
+	}
 	jobMgr.ConfigDefaults = discCfg.Registry
 	jobMgr.FnReg = fnMgr
+
+	// Store reference for dump mode and enable dump mode if configured
+	a.mgr = jobMgr
+	if a.dumpMode > 0 {
+		jobMgr.DumpMode = true
+		jobMgr.DumpAnalyzer = a.dumpAnalyzer
+	}
+	jobMgr.DumpDataDir = a.dumpDataDir
 
 	if reg := a.setupVnodeRegistry(); len(reg) > 0 {
 		jobMgr.Vnodes = reg
@@ -240,4 +307,28 @@ func (a *Agent) keepAlive() {
 			os.Exit(0)
 		}
 	}
+}
+
+func (a *Agent) collectDumpAnalysis() {
+	if a.dumpAnalyzer == nil || a.mgr == nil {
+		a.Error("dump analyzer or job manager not initialized")
+		return
+	}
+
+	// Print the analysis report
+	if a.dumpSummary {
+		a.dumpAnalyzer.PrintSummary()
+	} else {
+		a.dumpAnalyzer.PrintReport()
+	}
+}
+
+func (a *Agent) signalDumpComplete() {
+	a.dumpOnce.Do(func() {
+		a.Infof("dump data collection complete, shutting down")
+		select {
+		case a.quitCh <- struct{}{}:
+		default:
+		}
+	})
 }

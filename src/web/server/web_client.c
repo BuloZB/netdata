@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "web_client.h"
+#include "web/websocket/websocket.h"
+#include "web/mcp/adapters/mcp-http.h"
+#include "web/mcp/adapters/mcp-sse.h"
 
 // this is an async I/O implementation of the web server request parser
 // it is used by all netdata web servers
@@ -31,16 +34,17 @@ void web_client_set_conn_webrtc(struct web_client *w) {
 }
 
 void web_client_reset_permissions(struct web_client *w) {
-    web_client_flags_clear_auth(w);
-    w->access = HTTP_ACCESS_NONE;
-    w->user_role = HTTP_USER_ROLE_NONE;
+    w->user_auth.method = USER_AUTH_METHOD_NONE;
+    w->user_auth.access = HTTP_ACCESS_NONE;
+    w->user_auth.user_role = HTTP_USER_ROLE_NONE;
+    web_client_clear_mcp_preview_key(w);
 }
 
-void web_client_set_permissions(struct web_client *w, HTTP_ACCESS access, HTTP_USER_ROLE role, WEB_CLIENT_FLAGS auth) {
+void web_client_set_permissions(struct web_client *w, HTTP_ACCESS access, HTTP_USER_ROLE role, USER_AUTH_METHOD type) {
     web_client_reset_permissions(w);
-    web_client_flag_set(w, auth & WEB_CLIENT_FLAG_ALL_AUTHS);
-    w->access = access;
-    w->user_role = role;
+    w->user_auth.method = type;
+    w->user_auth.access = access;
+    w->user_auth.user_role = role;
 }
 
 inline int web_client_permission_denied_acl(struct web_client *w) {
@@ -55,14 +59,14 @@ inline int web_client_permission_denied(struct web_client *w) {
     w->response.data->content_type = CT_TEXT_PLAIN;
     buffer_flush(w->response.data);
 
-    if(w->access & HTTP_ACCESS_SIGNED_ID)
+    if(w->user_auth.access & HTTP_ACCESS_SIGNED_ID)
         buffer_strcat(w->response.data,
                       "You don't have enough permissions to access this resource");
     else
         buffer_strcat(w->response.data,
                       "You need to be authorized to access this resource");
 
-    w->response.code = HTTP_ACCESS_PERMISSION_DENIED_HTTP_CODE(w->access);
+    w->response.code = HTTP_ACCESS_PERMISSION_DENIED_HTTP_CODE(w->user_auth.access);
     return w->response.code;
 }
 
@@ -152,9 +156,6 @@ static void web_client_reset_allocations(struct web_client *w, bool free_all) {
     freez(w->forwarded_host);
     w->forwarded_host = NULL;
 
-    freez(w->forwarded_for);
-    w->forwarded_for = NULL;
-
     freez(w->origin);
     w->origin = NULL;
 
@@ -163,6 +164,15 @@ static void web_client_reset_allocations(struct web_client *w, bool free_all) {
 
     freez(w->auth_bearer_token);
     w->auth_bearer_token = NULL;
+    
+    // Free WebSocket resources
+    freez(w->websocket.key);
+    w->websocket.key = NULL;
+    
+    w->websocket.ext_flags = WS_EXTENSION_NONE;
+    w->websocket.protocol = WS_PROTOCOL_DEFAULT;
+    w->websocket.client_max_window_bits = 0;
+    w->websocket.server_max_window_bits = 0;
 
     // if we had enabled compression, release it
     if(w->response.zinitialized) {
@@ -179,9 +189,13 @@ static void web_client_reset_allocations(struct web_client *w, bool free_all) {
 
     memset(w->transaction, 0, sizeof(w->transaction));
     memset(&w->auth, 0, sizeof(w->auth));
+    memset(&w->user_auth, 0, sizeof(w->user_auth));
 
     web_client_reset_permissions(w);
     web_client_flag_clear(w, WEB_CLIENT_ENCODING_GZIP|WEB_CLIENT_ENCODING_DEFLATE);
+    web_client_flag_clear(w, WEB_CLIENT_FLAG_ACCEPT_JSON |
+                             WEB_CLIENT_FLAG_ACCEPT_SSE |
+                             WEB_CLIENT_FLAG_ACCEPT_TEXT);
     web_client_reset_path_flags(w);
 }
 
@@ -209,13 +223,13 @@ void web_client_log_completed_request(struct web_client *w, bool update_web_stat
             ND_LOG_FIELD_U64(NDF_RESPONSE_PREPARATION_TIME_USEC, prep_ut),
             ND_LOG_FIELD_U64(NDF_RESPONSE_SENT_TIME_USEC, sent_ut),
             ND_LOG_FIELD_U64(NDF_RESPONSE_TOTAL_TIME_USEC, total_ut),
-            ND_LOG_FIELD_TXT(NDF_SRC_IP, w->client_ip),
+            ND_LOG_FIELD_TXT(NDF_SRC_IP, w->user_auth.client_ip),
             ND_LOG_FIELD_TXT(NDF_SRC_PORT, w->client_port),
-            ND_LOG_FIELD_TXT(NDF_SRC_FORWARDED_FOR, w->forwarded_for),
-            ND_LOG_FIELD_UUID(NDF_ACCOUNT_ID, &w->auth.cloud_account_id),
-            ND_LOG_FIELD_TXT(NDF_USER_NAME, w->auth.client_name),
-            ND_LOG_FIELD_TXT(NDF_USER_ROLE, http_id2user_role(w->user_role)),
-            ND_LOG_FIELD_CB(NDF_USER_ACCESS, log_cb_http_access_to_hex, &w->access),
+            ND_LOG_FIELD_TXT(NDF_SRC_FORWARDED_FOR, w->user_auth.forwarded_for),
+            ND_LOG_FIELD_UUID(NDF_ACCOUNT_ID, &w->user_auth.cloud_account_id.uuid),
+            ND_LOG_FIELD_TXT(NDF_USER_NAME, w->user_auth.client_name),
+            ND_LOG_FIELD_TXT(NDF_USER_ROLE, http_id2user_role(w->user_auth.user_role)),
+            ND_LOG_FIELD_CB(NDF_USER_ACCESS, log_cb_http_access_to_hex, &w->user_auth.access),
             ND_LOG_FIELD_END(),
     };
     ND_LOG_STACK_PUSH(lgs);
@@ -528,19 +542,19 @@ static inline int check_host_and_call(RRDHOST *host, struct web_client *w, char 
 
 int web_client_api_request(RRDHOST *host, struct web_client *w, char *url_path_fragment) {
     ND_LOG_STACK lgs[] = {
-            ND_LOG_FIELD_TXT(NDF_SRC_IP, w->client_ip),
+            ND_LOG_FIELD_TXT(NDF_SRC_IP, w->user_auth.client_ip),
             ND_LOG_FIELD_TXT(NDF_SRC_PORT, w->client_port),
             ND_LOG_FIELD_TXT(NDF_SRC_FORWARDED_HOST, w->forwarded_host),
-            ND_LOG_FIELD_TXT(NDF_SRC_FORWARDED_FOR, w->forwarded_for),
+            ND_LOG_FIELD_TXT(NDF_SRC_FORWARDED_FOR, w->user_auth.forwarded_for),
             ND_LOG_FIELD_TXT(NDF_NIDL_NODE, w->client_host),
             ND_LOG_FIELD_TXT(NDF_REQUEST_METHOD, HTTP_REQUEST_MODE_2str(w->mode)),
             ND_LOG_FIELD_BFR(NDF_REQUEST, w->url_as_received),
             ND_LOG_FIELD_U64(NDF_CONNECTION_ID, w->id),
             ND_LOG_FIELD_UUID(NDF_TRANSACTION_ID, &w->transaction),
-            ND_LOG_FIELD_UUID(NDF_ACCOUNT_ID, &w->auth.cloud_account_id),
-            ND_LOG_FIELD_TXT(NDF_USER_NAME, w->auth.client_name),
-            ND_LOG_FIELD_TXT(NDF_USER_ROLE, http_id2user_role(w->user_role)),
-            ND_LOG_FIELD_CB(NDF_USER_ACCESS, log_cb_http_access_to_hex, &w->access),
+            ND_LOG_FIELD_UUID(NDF_ACCOUNT_ID, &w->user_auth.cloud_account_id.uuid),
+            ND_LOG_FIELD_TXT(NDF_USER_NAME, w->user_auth.client_name),
+            ND_LOG_FIELD_TXT(NDF_USER_ROLE, http_id2user_role(w->user_auth.user_role)),
+            ND_LOG_FIELD_CB(NDF_USER_ACCESS, log_cb_http_access_to_hex, &w->user_auth.access),
             ND_LOG_FIELD_END(),
     };
     ND_LOG_STACK_PUSH(lgs);
@@ -550,7 +564,7 @@ int web_client_api_request(RRDHOST *host, struct web_client *w, char *url_path_f
         query_progress_start_or_update(&w->transaction, 0, w->mode, w->acl,
                                        buffer_tostring(w->url_as_received),
                                        w->payload,
-                                       w->forwarded_for ? w->forwarded_for : w->client_ip);
+                                       w->user_auth.forwarded_for[0] ? w->user_auth.forwarded_for : w->user_auth.client_ip);
     }
 
     // get the api version
@@ -909,7 +923,11 @@ void web_client_build_http_header(struct web_client *w) {
 }
 
 static inline void web_client_send_http_header(struct web_client *w) {
-    web_client_build_http_header(w);
+    // For WebSocket handshake, the header is already fully prepared in websocket_handle_handshake
+    // For standard HTTP responses, we need to build the header
+    if (w->response.code != HTTP_RESP_WEBSOCKET_HANDSHAKE) {
+        web_client_build_http_header(w);
+    }
 
     // sent the HTTP header
     netdata_log_debug(D_WEB_DATA, "%llu: Sending response HTTP header of size %zu: '%s'"
@@ -1046,10 +1064,10 @@ int web_client_api_request_with_node_selection(RRDHOST *host, struct web_client 
             ND_LOG_FIELD_BFR(NDF_REQUEST, w->url_as_received),
             ND_LOG_FIELD_U64(NDF_CONNECTION_ID, w->id),
             ND_LOG_FIELD_UUID(NDF_TRANSACTION_ID, &w->transaction),
-            ND_LOG_FIELD_UUID(NDF_ACCOUNT_ID, &w->auth.cloud_account_id),
-            ND_LOG_FIELD_TXT(NDF_USER_NAME, w->auth.client_name),
-            ND_LOG_FIELD_TXT(NDF_USER_ROLE, http_id2user_role(w->user_role)),
-            ND_LOG_FIELD_CB(NDF_USER_ACCESS, log_cb_http_access_to_hex, &w->access),
+            ND_LOG_FIELD_UUID(NDF_ACCOUNT_ID, &w->user_auth.cloud_account_id.uuid),
+            ND_LOG_FIELD_TXT(NDF_USER_NAME, w->user_auth.client_name),
+            ND_LOG_FIELD_TXT(NDF_USER_ROLE, http_id2user_role(w->user_auth.user_role)),
+            ND_LOG_FIELD_CB(NDF_USER_ACCESS, log_cb_http_access_to_hex, &w->user_auth.access),
             ND_LOG_FIELD_END(),
     };
     ND_LOG_STACK_PUSH(lgs);
@@ -1103,7 +1121,9 @@ static inline int web_client_process_url(RRDHOST *host, struct web_client *w, ch
             hash_v0 = 0,
             hash_v1 = 0,
             hash_v2 = 0,
-            hash_v3 = 0;
+            hash_v3 = 0,
+            hash_mcp = 0,
+            hash_sse = 0;
 
 #ifdef NETDATA_INTERNAL_CHECKS
     static uint32_t hash_exit = 0, hash_debug = 0, hash_mirror = 0;
@@ -1118,6 +1138,8 @@ static inline int web_client_process_url(RRDHOST *host, struct web_client *w, ch
         hash_v1 = simple_hash("v1");
         hash_v2 = simple_hash("v2");
         hash_v3 = simple_hash("v3");
+        hash_mcp = simple_hash("mcp");
+        hash_sse = simple_hash("sse");
 #ifdef NETDATA_INTERNAL_CHECKS
         hash_exit = simple_hash("exit");
         hash_debug = simple_hash("debug");
@@ -1137,6 +1159,16 @@ static inline int web_client_process_url(RRDHOST *host, struct web_client *w, ch
         if(likely(hash == hash_api && strcmp(tok, "api") == 0)) {                           // current API
             netdata_log_debug(D_WEB_CLIENT_ACCESS, "%llu: API request ...", w->id);
             return check_host_and_call(host, w, decoded_url_path, web_client_api_request);
+        }
+        else if(likely(hash == hash_mcp && strcmp(tok, "mcp") == 0)) {
+            if(unlikely(!http_can_access_dashboard(w)))
+                return web_client_permission_denied_acl(w);
+            return mcp_http_handle_request(host, w);
+        }
+        else if(likely(hash == hash_sse && strcmp(tok, "sse") == 0)) {
+            if(unlikely(!http_can_access_dashboard(w)))
+                return web_client_permission_denied_acl(w);
+            return mcp_sse_handle_request(host, w);
         }
         else if(unlikely((hash == hash_host && strcmp(tok, "host") == 0) || (hash == hash_node && strcmp(tok, "node") == 0))) { // host switching
             netdata_log_debug(D_WEB_CLIENT_ACCESS, "%llu: host switch request ...", w->id);
@@ -1207,7 +1239,7 @@ static inline int web_client_process_url(RRDHOST *host, struct web_client *w, ch
 
                 // do we have such a data set?
                 RRDSET *st = rrdset_find_byname(host, tok);
-                if(!st) st = rrdset_find(host, tok);
+                if(!st) st = rrdset_find(host, tok, false);
                 if(!st) {
                     w->response.data->content_type = CT_TEXT_HTML;
                     buffer_strcat(w->response.data, "Chart is not found: ");
@@ -1215,8 +1247,6 @@ static inline int web_client_process_url(RRDHOST *host, struct web_client *w, ch
                     netdata_log_debug(D_WEB_CLIENT_ACCESS, "%llu: %s is not found.", w->id, tok);
                     return HTTP_RESP_NOT_FOUND;
                 }
-
-                debug_flags |= D_RRD_STATS;
 
                 if(rrdset_flag_check(st, RRDSET_FLAG_DEBUG))
                     rrdset_flag_clear(st, RRDSET_FLAG_DEBUG);
@@ -1269,19 +1299,19 @@ void web_client_process_request_from_web_server(struct web_client *w) {
 
     ND_LOG_STACK lgs[] = {
             ND_LOG_FIELD_CB(NDF_SRC_TRANSPORT, web_server_log_transport, w),
-            ND_LOG_FIELD_TXT(NDF_SRC_IP, w->client_ip),
+            ND_LOG_FIELD_TXT(NDF_SRC_IP, w->user_auth.client_ip),
             ND_LOG_FIELD_TXT(NDF_SRC_PORT, w->client_port),
             ND_LOG_FIELD_TXT(NDF_SRC_FORWARDED_HOST, w->forwarded_host),
-            ND_LOG_FIELD_TXT(NDF_SRC_FORWARDED_FOR, w->forwarded_for),
+            ND_LOG_FIELD_TXT(NDF_SRC_FORWARDED_FOR, w->user_auth.forwarded_for),
             ND_LOG_FIELD_TXT(NDF_NIDL_NODE, w->client_host),
             ND_LOG_FIELD_TXT(NDF_REQUEST_METHOD, HTTP_REQUEST_MODE_2str(w->mode)),
             ND_LOG_FIELD_BFR(NDF_REQUEST, w->url_as_received),
             ND_LOG_FIELD_U64(NDF_CONNECTION_ID, w->id),
             ND_LOG_FIELD_UUID(NDF_TRANSACTION_ID, &w->transaction),
-            ND_LOG_FIELD_UUID(NDF_ACCOUNT_ID, &w->auth.cloud_account_id),
-            ND_LOG_FIELD_TXT(NDF_USER_NAME, w->auth.client_name),
-            ND_LOG_FIELD_TXT(NDF_USER_ROLE, http_id2user_role(w->user_role)),
-            ND_LOG_FIELD_CB(NDF_USER_ACCESS, log_cb_http_access_to_hex, &w->access),
+            ND_LOG_FIELD_UUID(NDF_ACCOUNT_ID, &w->user_auth.cloud_account_id.uuid),
+            ND_LOG_FIELD_TXT(NDF_USER_NAME, w->user_auth.client_name),
+            ND_LOG_FIELD_TXT(NDF_USER_ROLE, http_id2user_role(w->user_auth.user_role)),
+            ND_LOG_FIELD_CB(NDF_USER_ACCESS, log_cb_http_access_to_hex, &w->user_auth.access),
             ND_LOG_FIELD_END(),
     };
     ND_LOG_STACK_PUSH(lgs);
@@ -1300,7 +1330,15 @@ void web_client_process_request_from_web_server(struct web_client *w) {
                 query_progress_start_or_update(&w->transaction, 0, w->mode, w->acl,
                                                buffer_tostring(w->url_as_received),
                                                w->payload,
-                                               w->forwarded_for ? w->forwarded_for : w->client_ip);
+                                               w->user_auth.forwarded_for[0] ? w->user_auth.forwarded_for : w->user_auth.client_ip);
+            }
+
+            // Check if this is a WebSocket upgrade request
+            // The full WebSocket handshake detection will happen in the header parsing,
+            // but we need to set the initial mode to GET for processing to continue
+            if (w->mode == HTTP_REQUEST_MODE_GET && web_client_has_websocket_handshake(w) && web_client_is_websocket(w)) {
+                w->mode = HTTP_REQUEST_MODE_WEBSOCKET;
+                netdata_log_debug(D_WEB_CLIENT, "%llu: Detected WebSocket handshake request", w->id);
             }
 
             switch(w->mode) {
@@ -1311,7 +1349,22 @@ void web_client_process_request_from_web_server(struct web_client *w) {
                     }
 
                     w->response.code = stream_receiver_accept_connection(
-                        w, (char *)buffer_tostring(w->url_query_string_decoded), NULL);
+                        w, (char *)buffer_tostring(w->url_query_string_decoded));
+                    return;
+                
+                case HTTP_REQUEST_MODE_WEBSOCKET:
+                    if(unlikely(!http_can_access_dashboard(w))) {
+                        web_client_permission_denied_acl(w);
+                        return;
+                    }
+                    
+                    // Handle WebSocket handshake - this will take over the socket
+                    // similar to how stream_receiver_accept_connection works
+                    w->response.code = websocket_handle_handshake(w);
+                    
+                    // After this point the socket has been taken over
+                    // No need to send a response as the WebSocket handler
+                    // has already sent the handshake response
                     return;
 
                 case HTTP_REQUEST_MODE_OPTIONS:
@@ -1398,7 +1451,7 @@ void web_client_process_request_from_web_server(struct web_client *w) {
                 // wait for more data
                 // set to normal to prevent web_server_rcv_callback
                 // from going into stream mode
-                if (w->mode == HTTP_REQUEST_MODE_STREAM)
+                if (w->mode == HTTP_REQUEST_MODE_STREAM || w->mode == HTTP_REQUEST_MODE_WEBSOCKET)
                     w->mode = HTTP_REQUEST_MODE_GET;
                 return;
             }
@@ -1457,6 +1510,10 @@ void web_client_process_request_from_web_server(struct web_client *w) {
     switch(w->mode) {
         case HTTP_REQUEST_MODE_STREAM:
             netdata_log_debug(D_WEB_CLIENT, "%llu: STREAM done.", w->id);
+            break;
+
+        case HTTP_REQUEST_MODE_WEBSOCKET:
+            netdata_log_debug(D_WEB_CLIENT, "%llu: Done preparing the WEBSOCKET response..", w->id);
             break;
 
         case HTTP_REQUEST_MODE_OPTIONS:

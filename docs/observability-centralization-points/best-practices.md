@@ -1,44 +1,214 @@
-# Best Practices for Observability Centralization Points
+# Parent Configuration Best Practices
 
-When planning the deployment of Observability Centralization Points, the following factors need consideration:
+A Parent node is a Netdata Agent configured to receive metrics from multiple Child nodes. It acts as the central long-term storage layer, providing a unified view, longer retention, and high availability when used with replication.
 
-1. **Volume of Monitored Systems**: The number of systems being monitored dictates the scaling and number of centralization points required. Larger infrastructures may require multiple centralization points to manage the volume of data effectively and maintain performance.
+## Critical Factors to Consider
 
-2. **Cost of Data Transfer**: Particularly in multi-cloud or hybrid environments, the location of centralization points can significantly impact egress bandwidth costs. Strategically placing centralization points in each data center or cloud region can minimize these costs by reducing the need for cross-network data transfer.
+When setting up Parents, consider the following:
 
-3. **Usability without Netdata Cloud**: When not using Netdata Cloud, observability with Netdata is simpler when there are fewer centralization points, making it easier to remember where observability is and how to access it.
+| Factor                                      | Description                          | Impact                                                                                           |
+|---------------------------------------------|--------------------------------------|--------------------------------------------------------------------------------------------------|
+| **System Volume**                           | The number of monitored systems      | Larger infrastructures may need multiple Parents to maintain performance                         |
+| **Data Transfer Costs**                     | Bandwidth usage between environments | Strategic placement reduces egress bandwidth costs in multi-cloud or hybrid environments         |
+| **Usability Without Netdata Cloud**         | Standalone operation considerations  | Fewer Parents simplifies access and management                                                   |
+| **Optimized Deployment with Netdata Cloud** | Cloud integration benefits           | Provides complete infrastructure view with optimized security, cost, and operational controls    |
+| **Data Retention & Metric Volume**          | Disk planning for Parent nodes       | Estimate disk needs based on total metrics streamed from children and configured retention tiers |
 
-4. Netdata Cloud provides infrastructure-wide views regardless of centralization points, allowing you to optimize your setup based on:
-    - Security requirements (such as internet access controls)
-    - Cost management (including bandwidth and resource allocation)
-    - Operational needs (like regional, service, or team isolation)
+## Deployment Optimization Factors
 
-## Cost Optimization
+```mermaid
+flowchart TB
+    A("Optimized Deployment<br/>with Netdata Cloud")
+    B("Security")
+    C("Cost")
+    D("Operational Needs")
+    B1("Internet access controls")
+    C1("Bandwidth and<br/>resource allocation")
+    D1("Regional, service, or<br/>team-based isolation")
+    A --> B
+    A --> C
+    A --> D
+    B --> B1
+    C --> C1
+    D --> D1
+    classDef alert fill: #ffeb3b, stroke: #000000, stroke-width: 3px, color: #000000
+    classDef neutral fill: #f9f9f9, stroke: #000000, stroke-width: 3px, color: #000000
+    classDef complete fill: #4caf50, stroke: #000000, stroke-width: 3px, color: #000000
+    class A neutral
+    class B complete
+    class C complete
+    class D complete
+    class B1 complete
+    class C1 complete
+    class D1 complete
+```
 
-Netdata has been designed for observability cost optimization. For optimal cost, we recommend using Netdata Cloud and multiple independent observability centralization points:
+## Critical Retention Configuration
 
-- **Scale out**: add more, smaller centralization points to distribute the load. This strategy provides the least resource consumption per unit of workload, maintaining optimal performance and resource efficiency across your observability infrastructure.
+:::warning
 
-- **Use existing infrastructure resources**: use spare capacities before allocating dedicated resources for observability. This approach minimizes additional costs and promotes an economically sustainable observability framework.
+**Default retention settings will not work for production.** Netdata defaults to 1GB space limit per tier with combined time/space retention. You'll hit the 1GB limit within hours or days, causing data loss much sooner than your configured time limits.
 
-- **Unified or separate centralization for logs and metrics**: Netdata allows centralizing metrics and logs together or separately. Consider factors such as access frequency, data retention policies, and compliance requirements to enhance performance and reduce costs.
+**You must configure retention properly before deployment.**
 
-- **Decentralized configuration management**: each Netdata centralization point can have its own unique configuration for retention and alerts. This enables:
-    - Finer control on infrastructure costs
-    - Localized control for separate services or teams
+:::
 
-## Pros and Cons
+### Choosing Your Retention Strategy
 
-Compared to other observability solutions, the design of Netdata offers:
+Netdata supports three retention strategies. Choose the one that best fits your environment:
 
-- **Enhanced Scalability and Flexibility**: Netdata's support for multiple independent observability centralization points allows for a more scalable and flexible architecture. This feature is particularly helpful in distributed and complex environments, enabling tailored observability strategies that can vary by region, service, or team requirements.
+1. **Time-based retention** (recommended for predictable retention periods):
 
-- **Resilience and Fault Tolerance**: The ability to deploy multiple centralization points also contributes to greater system resilience and fault tolerance. Replication is a native feature of Netdata centralization points, so in the event of a failure at one centralization point, others can continue to function, ensuring continuous observability.
+   Guarantees data is kept for a fixed time, regardless of disk usage (assuming you have enough disk space)
+   ```ini
+   [db]
+   dbengine tier 0 retention time = 30d
+   dbengine tier 0 retention size = 0
+   dbengine tier 1 retention time = 6mo
+   dbengine tier 1 retention size = 0
+   dbengine tier 2 retention time = 5y
+   dbengine tier 2 retention size = 0
+   ```
 
-- **Optimized Cost and Performance**: By distributing the load across multiple centralization points, Netdata can optimize both performance and cost. This distribution allows for the efficient use of resources and help mitigate the bottlenecks associated with a single centralization point.
+2. **Space-based retention** (recommended for predictable disk usage):
 
-- **Simplicity**: Netdata Agents (Children and Parents) require minimal configuration and maintenance, usually less than the configuration and maintenance required for the Agents and exporters of other monitoring solutions. This provides an observability pipeline that has less moving parts and is easier to manage and maintain.
+   Guarantees storage usage stays within defined limits, at the cost of variable retention duration.
+   ```ini
+   [db]
+   dbengine tier 0 retention size = 500GB
+   dbengine tier 0 retention time = 0
+   dbengine tier 1 retention size = 200GB
+   dbengine tier 1 retention time = 0
+   dbengine tier 2 retention size = 100GB
+   dbengine tier 2 retention time = 0
+   ```
 
-- **Always On-Prem**: Netdata centralization points are always on-prem. Even when Netdata Cloud is used, Netdata Agents and parents are queried to provide the data required for the dashboards.
+3. **Combined retention** (use with caution):
 
-- **Bottom-Up Observability**: Netdata is designed to monitor systems, containers and applications bottom-up, aiming to provide the maximum resolution, visibility, depth and insights possible. Its ability to segment the infrastructure into multiple independent observability centralization points with customized retention, machine learning and alerts on each of them, while providing unified infrastructure level dashboards at Netdata Cloud, provides a flexible environment that can be tailored per service or team, while still being one unified infrastructure.
+   Uses both time and space limits. Data is dropped as soon as either limit is reached.
+   ```ini
+   [db]
+   dbengine tier 0 retention time = 30d
+   dbengine tier 0 retention size = 500GB  # Must be large enough to hold 30 days of data!
+   dbengine tier 1 retention time = 6mo
+   dbengine tier 1 retention size = 200GB  # Must be large enough to hold 6 months of data!
+   dbengine tier 2 retention time = 5y
+   dbengine tier 2 retention size = 100GB  # Must be large enough to hold 5 years of data!
+   ```
+
+:::tip
+
+- For Parent nodes with millions of metrics, expect to allocate 100GB-1TB+ per tier.
+- Setting `retention size = 0` means unlimited space (not zero space). This works well with time-based retention if you have sufficient disk capacity.
+- Always validate retention sizing in staging before production to avoid premature data loss.
+
+:::
+
+## Estimating Disk Retention by Metric Volume on Parent Nodes
+
+Parent nodes are the central long-term storage layer in a Netdata infrastructure. They receive all metrics streamed from children and store them according to tiered retention settings.
+
+| Tier   | Sample Resolution                  | Typical Compressed Size per Sample |
+|--------|------------------------------------|------------------------------------|
+| Tier 0 | per second (native)                | ~0.6 B / sample                    |
+| Tier 1 | per minute (60× aggregate)         | ~6 B / sample                      |
+| Tier 2 | per hour (60× aggregate of Tier 1) | ~18 B / sample                     |
+
+### Example Calculation
+
+Assume a Parent configured with:
+
+* **Tier 0:** 30 days retention (per-second resolution)
+* **Tier 1:** 6 months retention (per-minute resolution)
+* **Tier 2:** 5 years retention (per-hour resolution)
+
+One metric would consume approximately **3.7 MB** across tiers.
+For **1,000,000 metrics streamed to the Parent**, this equals **≈ 3.7 TB**.
+
+Adding 5–15% overhead for replication buffers, indexes, and metadata, plan for **≈ 4 TB per million metrics** under this retention policy.
+
+### Configuration Example for Production Deployments
+
+```ini
+[db]
+    mode = dbengine
+    update every = 1
+    storage tiers = 3
+
+    # Tier 0: per-second data for 30 days
+    dbengine tier 0 retention time = 30d
+    # No size limit - let time control retention
+
+    # Tier 1: per-minute data for 6 months  
+    dbengine tier 1 update every iterations = 60
+    dbengine tier 1 retention time = 6mo
+
+    # Tier 2: per-hour data for 5 years
+    dbengine tier 2 update every iterations = 60
+    dbengine tier 2 retention time = 5y
+```
+
+## Cost Optimization Strategies
+
+Netdata helps you keep observability efficient and cost-effective:
+
+| Strategy                                   | Description                            | Benefit                                                                                         |
+|--------------------------------------------|----------------------------------------|-------------------------------------------------------------------------------------------------|
+| **Scale Out**                              | Use multiple smaller Parents           | Improves efficiency and performance across distributed systems                                  |
+| **Use Existing Resources**                 | Leverage spare capacity                | Minimize additional hardware costs by using available resources                                 |
+| **Centralized or Separate Logs & Metrics** | Choose storage approach based on needs | Optimize based on access patterns, retention policies, and compliance requirements              |
+| **Flexible Configuration Management**      | Customize each Parent                  | Control costs with unique retention and alert settings tailored for different teams or services |
+| **Right-size Retention Based on Metrics**  | Tune tier retention and sampling       | Directly control disk cost by shortening or lengthening retention tiers where appropriate       |
+
+```mermaid
+flowchart TB
+    A("Cost Optimization<br/>Strategies")
+    B("Scale Out")
+    C("Use Existing<br/>Resources")
+    D("Centralized or<br/>Separate Logs & Metrics")
+    E("Flexible<br/>Configuration Management")
+    B1("Multiple smaller<br/>Parents")
+    C1("Leverage spare capacity")
+    D1("Based on access needs,<br/>retention policies,<br/>and compliance")
+    E1("Unique settings for<br/>different teams or services")
+    A --> B
+    A --> C
+    A --> D
+    A --> E
+    B --> B1
+    C --> C1
+    D --> D1
+    E --> E1
+    classDef alert fill: #ffeb3b, stroke: #000000, stroke-width: 3px, color: #000000
+    classDef neutral fill: #f9f9f9, stroke: #000000, stroke-width: 3px, color: #000000
+    classDef complete fill: #4caf50, stroke: #000000, stroke-width: 3px, color: #000000
+    class A neutral
+    class B complete
+    class C complete
+    class D complete
+    class E complete
+    class B1 complete
+    class C1 complete
+    class D1 complete
+    class E1 complete
+```
+
+## Advantages of Netdata's Approach
+
+Netdata provides several benefits over other observability solutions:
+
+| Advantage                         | Description                                | Value                                                                 |
+|-----------------------------------|--------------------------------------------|-----------------------------------------------------------------------|
+| **Scalability & Flexibility**     | Multiple independent Parents               | Customized observability by region, service, or team                  |
+| **Resilience & Reliability**      | Built-in replication                       | Observability continues even if a Parent fails                        |
+| **Optimized Cost & Performance**  | Distributed workloads                      | Prevents bottlenecks and improves resource efficiency                 |
+| **Ease of Use**                   | Minimal setup and maintenance              | Reduces complexity and operational overhead                           |
+| **On-Prem Control**               | Data remains within your infrastructure    | Enhanced security and compliance, even when using Netdata Cloud       |
+| **Comprehensive Observability**   | Segmented infrastructure with unified view | Deep visibility with tailored retention, alerts, and machine learning |
+| **Predictable Capacity Planning** | Published per-metric storage cost          | Allows accurate disk and hardware sizing for Parents                  |
+
+:::tip
+
+Following these best practices helps you maintain a **cost-effective**, **high-performance** observability setup with Netdata.
+
+:::

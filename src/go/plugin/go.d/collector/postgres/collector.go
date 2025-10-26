@@ -11,13 +11,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/netdata/netdata/go/plugins/pkg/confopt"
 	"github.com/netdata/netdata/go/plugins/pkg/matcher"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/confopt"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/metrix"
 
 	"github.com/jackc/pgx/v5/stdlib"
-	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 //go:embed "config_schema.json"
@@ -62,6 +61,7 @@ func New() *Collector {
 type Config struct {
 	Vnode              string           `yaml:"vnode,omitempty" json:"vnode"`
 	UpdateEvery        int              `yaml:"update_every,omitempty" json:"update_every"`
+	AutoDetectionRetry int              `yaml:"autodetection_retry,omitempty" json:"autodetection_retry"`
 	DSN                string           `yaml:"dsn" json:"dsn"`
 	Timeout            confopt.Duration `yaml:"timeout,omitempty" json:"timeout"`
 	DBSelector         string           `yaml:"collect_databases_matching,omitempty" json:"collect_databases_matching"`

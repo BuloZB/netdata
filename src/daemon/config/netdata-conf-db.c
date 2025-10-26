@@ -105,10 +105,9 @@ struct dbengine_initialization {
     int ret;
 };
 
-void *dbengine_tier_init(void *ptr) {
+void dbengine_tier_init(void *ptr) {
     struct dbengine_initialization *dbi = ptr;
     dbi->ret = rrdeng_init(NULL, dbi->path, dbi->disk_space_mb, dbi->tier, dbi->retention_seconds);
-    return ptr;
 }
 
 RRD_BACKFILL get_dbengine_backfill(RRD_BACKFILL backfill)
@@ -290,7 +289,7 @@ void netdata_conf_dbengine_init(const char *hostname) {
         if(parallel_initialization) {
             char tag[NETDATA_THREAD_TAG_MAX + 1];
             snprintfz(tag, NETDATA_THREAD_TAG_MAX, "DBENGINIT[%zu]", tier);
-            tiers_init[tier].thread = nd_thread_create(tag, NETDATA_THREAD_OPTION_JOINABLE, dbengine_tier_init, &tiers_init[tier]);
+            tiers_init[tier].thread = nd_thread_create(tag, NETDATA_THREAD_OPTION_DEFAULT, dbengine_tier_init, &tiers_init[tier]);
         }
         else
             dbengine_tier_init(&tiers_init[tier]);

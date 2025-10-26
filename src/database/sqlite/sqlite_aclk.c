@@ -11,7 +11,6 @@ void sanity_check(void) {
 #include "sqlite_aclk_node.h"
 #include "aclk/aclk_query_queue.h"
 #include "aclk/aclk_query.h"
-#include "aclk/aclk_capas.h"
 
 static void create_node_instance_result_job(const char *machine_guid, const char *node_id)
 {
@@ -37,57 +36,40 @@ static void create_node_instance_result_job(const char *machine_guid, const char
 }
 
 struct aclk_sync_config_s {
-    uv_thread_t thread;
+    ND_THREAD *thread;
     uv_loop_t loop;
     uv_timer_t timer_req;
     uv_async_t async;
     bool initialized;
+    bool shutdown_requested;
     mqtt_wss_client client;
     int aclk_queries_running;
+    bool run_query_batch;
     bool alert_push_running;
     bool aclk_batch_job_is_running;
-    SPINLOCK cmd_queue_lock;
     uint32_t aclk_jobs_pending;
     struct completion start_stop_complete;
-    struct aclk_database_cmd *cmd_base;
-    ARAL *ar;
+    CmdPool cmd_pool;
+    WorkerPool worker_pool;
 } aclk_sync_config = { 0 };
 
-static struct aclk_database_cmd aclk_database_deq_cmd(void)
+static cmd_data_t aclk_database_deq_cmd(void)
 {
-    struct aclk_database_cmd ret = { 0 };
-    struct aclk_database_cmd *to_free = NULL;
-
-    spinlock_lock(&aclk_sync_config.cmd_queue_lock);
-    if(aclk_sync_config.cmd_base) {
-        struct aclk_database_cmd *t = aclk_sync_config.cmd_base;
-        DOUBLE_LINKED_LIST_REMOVE_ITEM_UNSAFE(aclk_sync_config.cmd_base, t, prev, next);
-        ret = *t;
-        to_free = t;
-    }
-    else {
-        ret.opcode = ACLK_DATABASE_NOOP;
-    }
-    spinlock_unlock(&aclk_sync_config.cmd_queue_lock);
-    aral_freez(aclk_sync_config.ar, to_free);
-
+    cmd_data_t ret = { 0 };
+    ret.opcode = ACLK_DATABASE_NOOP;
+    (void) pop_cmd(&aclk_sync_config.cmd_pool, (cmd_data_t *) &ret);
     return ret;
 }
 
-static void aclk_database_enq_cmd(struct aclk_database_cmd *cmd)
+static bool aclk_database_enq_cmd(cmd_data_t *cmd, bool wait_on_full)
 {
-    if(unlikely(!aclk_sync_config.initialized))
-        return;
+    if(unlikely(!__atomic_load_n(&aclk_sync_config.initialized, __ATOMIC_RELAXED)))
+        return false;
 
-    struct aclk_database_cmd *t = aral_mallocz(aclk_sync_config.ar);
-    *t = *cmd;
-    t->prev = t->next = NULL;
-
-    spinlock_lock(&aclk_sync_config.cmd_queue_lock);
-    DOUBLE_LINKED_LIST_APPEND_ITEM_UNSAFE(aclk_sync_config.cmd_base, t, prev, next);
-    spinlock_unlock(&aclk_sync_config.cmd_queue_lock);
-
-    (void) uv_async_send(&aclk_sync_config.async);
+    bool added = push_cmd(&aclk_sync_config.cmd_pool, (void *)cmd, wait_on_full);
+    if (added)
+        (void) uv_async_send(&aclk_sync_config.async);
+    return added;
 }
 
 enum {
@@ -110,9 +92,14 @@ enum {
     IDX_IS_REGISTERED,
 };
 
+struct children {
+    int vnodes;
+    int normal;
+};
+
 static int create_host_callback(void *data, int argc, char **argv, char **column)
 {
-    int *number_of_chidren = data;
+    struct children *node_data = data;
     UNUSED(argc);
     UNUSED(column);
 
@@ -193,7 +180,10 @@ static int create_host_callback(void *data, int argc, char **argv, char **column
         pulse_host_status(host, 0, 0); // this will detect the receiver status
     }
 
-    (*number_of_chidren)++;
+    if (IS_VIRTUAL_HOST_OS(host))
+        node_data->vnodes++;
+    else
+        node_data->normal++;
 
 #ifdef NETDATA_INTERNAL_CHECKS
     char node_str[UUID_STR_LEN] = "<none>";
@@ -225,7 +215,7 @@ static void sql_delete_aclk_table_list(void)
 
     SQLITE_FINALIZE(res);
 
-    int rc = db_execute(db_meta, buffer_tostring(sql));
+    int rc = db_execute(db_meta, buffer_tostring(sql), NULL);
     if (unlikely(rc))
         netdata_log_error("Failed to drop unused ACLK tables");
 
@@ -318,39 +308,15 @@ static void async_cb(uv_async_t *handle)
 
 #define TIMER_PERIOD_MS (1000)
 
-static void timer_cb(uv_timer_t *handle)
-{
-    uv_stop(handle->loop);
-    uv_update_time(handle->loop);
-    struct aclk_sync_config_s *config = handle->data;
-
-    struct aclk_database_cmd cmd = { 0 };
-    if (aclk_online_for_alerts()) {
-        cmd.opcode = ACLK_DATABASE_PUSH_ALERT;
-        aclk_database_enq_cmd(&cmd);
-    }
-
-    if (config->aclk_jobs_pending > 0) {
-        cmd.opcode = ACLK_QUERY_BATCH_EXECUTE;
-        aclk_database_enq_cmd(&cmd);
-    }
-}
-
-struct aclk_query_payload {
-    uv_work_t request;
-    void *data;
-    struct aclk_sync_config_s *config;
-};
-
 static void after_aclk_run_query_job(uv_work_t *req, int status __maybe_unused)
 {
-    struct aclk_query_payload *payload = req->data;
-    struct aclk_sync_config_s *config = payload->config;
+    worker_data_t *worker = req->data;
+    struct aclk_sync_config_s *config = worker->config;
     config->aclk_queries_running--;
-    freez(payload);
+    return_worker(&config->worker_pool, worker);
 }
 
-static void aclk_run_query(struct aclk_sync_config_s *config, aclk_query_t query)
+static void aclk_run_query(struct aclk_sync_config_s *config, aclk_query_t *query)
 {
     if (query->type == UNKNOWN || query->type >= ACLK_QUERY_TYPE_COUNT) {
         error_report("Unknown query in query queue. %u", query->type);
@@ -358,16 +324,18 @@ static void aclk_run_query(struct aclk_sync_config_s *config, aclk_query_t query
     }
 
     bool ok_to_send = true;
+    mqtt_wss_client client = __atomic_load_n(&config->client, __ATOMIC_RELAXED);
 
     switch (query->type) {
 
 // Incoming : cloud -> agent
         case HTTP_API_V2:
             worker_is_busy(UV_EVENT_ACLK_QUERY_EXECUTE);
-            http_api_v2(config->client, query);
+            if (client)
+                http_api_v2(client, query);
             ok_to_send = false;
             break;
-        case CTX_CHECKPOINT:;
+        case CTX_CHECKPOINT:
             worker_is_busy(UV_EVENT_CTX_CHECKPOINT);
             rrdcontext_hub_checkpoint_command(query->data.payload);
             ok_to_send = false;
@@ -429,8 +397,14 @@ static void aclk_run_query(struct aclk_sync_config_s *config, aclk_query_t query
             break;
     }
 
-    if (ok_to_send)
-        send_bin_msg(config->client, query);
+    if (ok_to_send) {
+        if (client)
+            send_bin_msg(client, query);
+        else {
+            freez(query->data.bin_payload.payload);
+            nd_log_daemon(NDLP_ERR, "No client to send message %u", query->type);
+        }
+    }
 
     aclk_query_free(query);
 }
@@ -439,9 +413,9 @@ static void aclk_run_query_job(uv_work_t *req)
 {
     register_libuv_worker_jobs();
 
-    struct aclk_query_payload *payload =  req->data;
-    struct aclk_sync_config_s *config = payload->config;
-    aclk_query_t query = (aclk_query_t) payload->data;
+    worker_data_t *worker = req->data;
+    struct aclk_sync_config_s *config = worker->config;
+    aclk_query_t *query = (aclk_query_t *)worker->payload;
 
     aclk_run_query(config, query);
     worker_is_idle();
@@ -449,19 +423,19 @@ static void aclk_run_query_job(uv_work_t *req)
 
 static void after_aclk_execute_batch(uv_work_t *req, int status __maybe_unused)
 {
-    struct aclk_query_payload *payload = req->data;
-    struct aclk_sync_config_s *config = payload->config;
+    worker_data_t *worker = req->data;
+    struct aclk_sync_config_s *config = worker->config;
     config->aclk_batch_job_is_running = false;
-    freez(payload);
+    return_worker(&config->worker_pool, worker);
 }
 
 static void aclk_execute_batch(uv_work_t *req)
 {
     register_libuv_worker_jobs();
 
-    struct aclk_query_payload *payload =  req->data;
-    struct aclk_sync_config_s *config = payload->config;
-    struct judy_list_t *aclk_query_batch = payload->data;
+    worker_data_t *worker = req->data;
+    struct aclk_sync_config_s *config = worker->config;
+    struct judy_list_t *aclk_query_batch = worker->payload;
 
     if (!aclk_query_batch)
         return;
@@ -476,7 +450,7 @@ static void aclk_execute_batch(uv_work_t *req)
         if (!*Pvalue)
             continue;
 
-        aclk_query_t query = *Pvalue;
+        aclk_query_t *query = *Pvalue;
         aclk_run_query(config, query);
     }
 
@@ -491,56 +465,59 @@ static void aclk_execute_batch(uv_work_t *req)
     worker_is_idle();
 }
 
-struct worker_data {
-    uv_work_t request;
+struct notify_timer_cb_data {
     void *payload;
-    struct aclk_sync_config_s *config;
+    struct completion *completion;
 };
 
 static void after_do_unregister_node(uv_work_t *req, int status __maybe_unused)
 {
-    struct worker_data *data = req->data;
-    freez(data);
+    worker_data_t *worker = req->data;
+    struct aclk_sync_config_s *config = worker->config;
+    return_worker(&config->worker_pool, worker);
 }
 
 static void do_unregister_node(uv_work_t *req)
 {
     register_libuv_worker_jobs();
 
-    struct worker_data *data =  req->data;
+    worker_data_t *worker =  req->data;
 
     worker_is_busy(UV_EVENT_UNREGISTER_NODE);
 
-    sql_unregister_node(data->payload);
+    sql_unregister_node(worker->payload);
 
     worker_is_idle();
 }
 
-static void node_update_timer_cb(uv_timer_t *handle)
+static void notify_timer_close_callback(uv_handle_t *handle)
 {
-    struct aclk_sync_cfg_t *ahc = handle->data;
-    RRDHOST *host = ahc->host;
-
-    if(!host || aclk_host_state_update_auto(host))
-        uv_timer_stop(&ahc->timer);
+    struct notify_timer_cb_data *data = handle->data;
+    if (data->completion) {
+        completion_mark_complete(data->completion);
+    }
+    freez(data);
 }
 
-static void close_callback(uv_handle_t *handle, void *data __maybe_unused)
+static void node_update_timer_cb(uv_timer_t *handle)
 {
-    if (handle->type == UV_TIMER) {
-        uv_timer_stop((uv_timer_t *)handle);
-    }
+    struct aclk_sync_cfg_t *aclk_host_config = handle->data;
+    if (unlikely(!aclk_host_config))
+        return;
 
-    uv_close(handle, NULL);  // Automatically close and free the handle
+    RRDHOST *host = aclk_host_config->host;
+
+    if(!host || aclk_host_state_update_auto(host))
+        uv_timer_stop(&aclk_host_config->timer);
 }
 
 static void after_start_alert_push(uv_work_t *req, int status __maybe_unused)
 {
-    struct worker_data *data = req->data;
-    struct aclk_sync_config_s *config = data->config;
+    struct worker_data *worker = req->data;
+    struct aclk_sync_config_s *config = worker->config;
 
     config->alert_push_running = false;
-    freez(data);
+    return_worker(&config->worker_pool, worker);
 }
 
 // Worker thread to scan hosts for pending metadata to store
@@ -566,16 +543,17 @@ static void start_alert_push(uv_work_t *req __maybe_unused)
 // config->aclk_queries_running is only accessed from the vent loop
 // On failure: free the payload
 
-int schedule_query_in_worker(uv_loop_t *loop, struct aclk_sync_config_s *config, aclk_query_t query) {
-    struct aclk_query_payload *payload = mallocz(sizeof(*payload));
-    payload->request.data = payload;
-    payload->config = config;
-    payload->data = query;
+int schedule_query_in_worker(uv_loop_t *loop, struct aclk_sync_config_s *config, aclk_query_t *query) {
+
+    worker_data_t *worker = get_worker(&config->worker_pool);
+    worker->payload = query;
+    worker->config = config;
+
     config->aclk_queries_running++;
-    int rc = uv_queue_work(loop, &payload->request, aclk_run_query_job, after_aclk_run_query_job);
+    int rc = uv_queue_work(loop, &worker->request, aclk_run_query_job, after_aclk_run_query_job);
     if (rc) {
         config->aclk_queries_running--;
-        freez(payload);
+        return_worker(&config->worker_pool, worker);
     }
     return rc;
 }
@@ -585,7 +563,7 @@ static void free_query_list(Pvoid_t JudyL)
     bool first = true;
     Pvoid_t *Pvalue;
     Word_t Index = 0;
-    aclk_query_t query;
+    aclk_query_t *query;
     while ((Pvalue = JudyLFirstThenNext(JudyL, &Index, &first))) {
         if (!*Pvalue)
             continue;
@@ -594,30 +572,56 @@ static void free_query_list(Pvoid_t JudyL)
     }
 }
 
-#define MAX_SHUTDOWN_TIMEOUT_SECONDS (5)
+static void timer_cb(uv_timer_t *handle)
+{
+    uv_stop(handle->loop);
+    uv_update_time(handle->loop);
+    struct aclk_sync_config_s *config = handle->data;
 
-#define ACLK_SYNC_SHOULD_BE_RUNNING                                                                                    \
-    (!shutdown_requested || config->aclk_queries_running || config->alert_push_running ||                              \
-     config->aclk_batch_job_is_running)
+    if (aclk_online_for_alerts()) {
+        worker_data_t *worker;
+        if (!config->alert_push_running) {
+            worker = get_worker(&config->worker_pool);
+            worker->config = config;
+            config->alert_push_running = true;
+            if (uv_queue_work(handle->loop, &worker->request, start_alert_push, after_start_alert_push)) {
+                config->alert_push_running = false;
+                return_worker(&config->worker_pool, worker);
+            }
+        }
+    }
+
+    if (config->aclk_jobs_pending > 0)
+        config->run_query_batch = true;
+}
+
+#define MAX_SHUTDOWN_TIMEOUT_SECONDS (5)
+#define SHUTDOWN_SLEEP_INTERVAL_MS (100)
+#define CMD_POOL_SIZE (2048)
+
+#define ACLK_JOBS_ARE_RUNNING                                                                                          \
+    (config->aclk_queries_running || config->alert_push_running || config->aclk_batch_job_is_running)
 
 static void aclk_synchronization_event_loop(void *arg)
 {
     struct aclk_sync_config_s *config = arg;
     uv_thread_set_name_np("ACLKSYNC");
-    config->ar = aral_by_size_acquire(sizeof(struct aclk_database_cmd));
+    init_cmd_pool(&config->cmd_pool, CMD_POOL_SIZE);
+
     worker_register("ACLKSYNC");
 
-    service_register(SERVICE_THREAD_TYPE_EVENT_LOOP, NULL, NULL, NULL, true);
+    service_register(NULL, NULL, NULL);
 
     worker_register_job_name(ACLK_DATABASE_NOOP,                "noop");
     worker_register_job_name(ACLK_DATABASE_NODE_STATE,          "node state");
-    worker_register_job_name(ACLK_DATABASE_PUSH_ALERT,          "alert push");
     worker_register_job_name(ACLK_DATABASE_PUSH_ALERT_CONFIG,   "alert conf push");
-    worker_register_job_name(ACLK_QUERY_EXECUTE_SYNC,           "aclk query execute sync");
     worker_register_job_name(ACLK_QUERY_BATCH_EXECUTE,          "aclk batch execute");
     worker_register_job_name(ACLK_QUERY_BATCH_ADD,              "aclk batch add");
-    worker_register_job_name(ACLK_MQTT_WSS_CLIENT,              "config mqtt client");
+    worker_register_job_name(ACLK_MQTT_WSS_CLIENT_SET,          "config mqtt client");
+    worker_register_job_name(ACLK_MQTT_WSS_CLIENT_RESET,        "reset mqtt client");
     worker_register_job_name(ACLK_DATABASE_NODE_UNREGISTER,     "unregister node");
+    worker_register_job_name(ACLK_CANCEL_NODE_UPDATE_TIMER,     "cancel node update timer");
+    worker_register_job_name(ACLK_QUEUE_NODE_INFO,              "queue node info");
 
     uv_loop_t *loop = &config->loop;
     fatal_assert(0 == uv_loop_init(loop));
@@ -629,54 +633,47 @@ static void aclk_synchronization_event_loop(void *arg)
 
     netdata_log_info("Starting ACLK synchronization thread");
 
-    config->initialized = true;
-
     sql_delete_aclk_table_list();
 
-    int query_thread_count = netdata_conf_cloud_query_threads();
+    int query_thread_count = (int) netdata_conf_cloud_query_threads();
     netdata_log_info("Starting ACLK synchronization thread with %d parallel query threads", query_thread_count);
 
-    struct worker_data *data;
-    aclk_query_t query;
+    struct notify_timer_cb_data *timer_cb_data;
 
     // This holds queries that need to be executed one by one
     struct judy_list_t *aclk_query_batch = NULL;
+
     // This holds queries that can be dispatched in parallel in ACLK QUERY worker threads
     struct judy_list_t *aclk_query_execute = callocz(1, sizeof(*aclk_query_execute));
     size_t pending_queries = 0;
 
     Pvoid_t *Pvalue;
-    struct aclk_query_payload *payload;
+    worker_data_t  *worker;
 
-    unsigned cmd_batch_size;
-
+    config->shutdown_requested = false;
+    config->initialized = true;
     completion_mark_complete(&config->start_stop_complete);
-    int shutdown_requested = 0;
-    time_t shutdown_initiated = 0;
 
-    while (likely(ACLK_SYNC_SHOULD_BE_RUNNING)) {
+    while (likely(config->shutdown_requested == false))  {
         enum aclk_database_opcode opcode;
+        RRDHOST *host;
+        struct aclk_sync_cfg_t *aclk_host_config;
+        aclk_query_t *query;
         worker_is_idle();
-        uv_run(loop, UV_RUN_DEFAULT);
+        uv_run(loop, UV_RUN_ONCE);
 
-        if (unlikely(shutdown_requested)) {
-            nd_log_limit_static_thread_var(erl, 1, 0);
-            nd_log_limit(&erl, NDLS_DAEMON, NDLP_INFO, "ACLKSYNC: Waiting for pending queries to finish before shutdown");
-            if (now_realtime_sec() - shutdown_initiated > MAX_SHUTDOWN_TIMEOUT_SECONDS) {
-                nd_log_daemon(NDLP_INFO, "ACLKSYNC: Shutdown timeout, forcing exit");
-                break;
-            }
-            continue;
-        }
-
-        /* wait for commands */
-        cmd_batch_size = 0;
         do {
-            if (unlikely(++cmd_batch_size >= MAX_BATCH_SIZE))
-                break;
+            cmd_data_t cmd;
 
-            struct aclk_database_cmd cmd = aclk_database_deq_cmd();
-            opcode = cmd.opcode;
+            if (config->run_query_batch) {
+                opcode = ACLK_QUERY_BATCH_EXECUTE;
+                config->run_query_batch = false;
+            }
+            else
+            {
+                cmd = aclk_database_deq_cmd();
+                opcode = cmd.opcode;
+            }
 
             if(likely(opcode != ACLK_DATABASE_NOOP && opcode != ACLK_QUERY_EXECUTE))
                 worker_is_busy(opcode);
@@ -692,30 +689,30 @@ static void aclk_synchronization_event_loop(void *arg)
                     /* the command queue was empty, do nothing */
                     break;
                     // NODE STATE
-                case ACLK_DATABASE_NODE_STATE:;
-                    RRDHOST *host = cmd.param[0];
-                    struct aclk_sync_cfg_t *ahc = host->aclk_config;
-                    if (unlikely(!ahc)) {
+                case ACLK_DATABASE_NODE_STATE:
+                    host = cmd.param[0];
+                    aclk_host_config = host->aclk_host_config;
+                    if (unlikely(!aclk_host_config)) {
                         create_aclk_config(host, &host->host_id.uuid, &host->node_id.uuid);
-                        ahc = host->aclk_config;
+                        aclk_host_config = host->aclk_host_config;
                     }
 
-                    if (ahc) {
+                    if (aclk_host_config) {
                         uint64_t schedule_time = (uint64_t)(uintptr_t)cmd.param[1];
-                        if (!ahc->timer_initialized) {
-                            int rc = uv_timer_init(loop, &ahc->timer);
+                        if (!aclk_host_config->timer_initialized) {
+                            int rc = uv_timer_init(loop, &aclk_host_config->timer);
                             if (!rc) {
-                                ahc->timer_initialized = true;
-                                ahc->timer.data = ahc;
+                                aclk_host_config->timer_initialized = true;
+                                aclk_host_config->timer.data = aclk_host_config;
                             }
                         }
 
-                        if (ahc->timer_initialized) {
-                            if (uv_is_active((uv_handle_t *)&ahc->timer))
-                                uv_timer_stop(&ahc->timer);
+                        if (aclk_host_config->timer_initialized) {
+                            if (uv_is_active((uv_handle_t *)&aclk_host_config->timer))
+                                uv_timer_stop(&aclk_host_config->timer);
 
-                            ahc->timer.data = ahc;
-                            int rc = uv_timer_start(&ahc->timer, node_update_timer_cb, schedule_time, 5000);
+                            aclk_host_config->timer.data = aclk_host_config;
+                            int rc = uv_timer_start(&aclk_host_config->timer, node_update_timer_cb, schedule_time, 5000);
                             if (!rc)
                                 break; // Timer started, exit
                         }
@@ -724,44 +721,58 @@ static void aclk_synchronization_event_loop(void *arg)
                     // This is fallback if timer fails
                     aclk_host_state_update_auto(host);
                     break;
+                case ACLK_QUEUE_NODE_INFO:
+                    host = cmd.param[0];
+                    bool immediate = (bool)(uintptr_t)cmd.param[1];
+                    aclk_host_config = host->aclk_host_config;
+                    if (unlikely(!aclk_host_config)) {
+                        create_aclk_config(host, &host->host_id.uuid, &host->node_id.uuid);
+                        aclk_host_config = host->aclk_host_config;
+                    }
+                    aclk_host_config->node_info_send_time = (host == localhost ||(void *)(uintptr_t) immediate) ? 1 : now_realtime_sec();
+                    break;
+                case ACLK_CANCEL_NODE_UPDATE_TIMER:
+                    host = cmd.param[0];
+                    struct completion *compl = cmd.param[1];
+                    aclk_host_config = host->aclk_host_config;
+                    if (!aclk_host_config || !aclk_host_config->timer_initialized) {
+                        completion_mark_complete(compl);
+                        break;
+                    }
+                    if (uv_is_active((uv_handle_t *)&aclk_host_config->timer))
+                        uv_timer_stop(&aclk_host_config->timer);
+
+                    aclk_host_config->timer_initialized = false;
+                    timer_cb_data = mallocz(sizeof(*timer_cb_data));
+                    timer_cb_data->payload = host;
+                    timer_cb_data->completion = compl;
+                    aclk_host_config->timer.data = timer_cb_data;
+                    uv_close((uv_handle_t *)&aclk_host_config->timer, notify_timer_close_callback);
+                    break;
 
                 case ACLK_DATABASE_NODE_UNREGISTER:
-                    data = mallocz(sizeof(*data));
-                    data->request.data = data;
-                    data->config = config;
-                    data->payload = cmd.param[0];
+                    worker = get_worker(&config->worker_pool);
+                    worker->config = config;
+                    worker->payload = cmd.param[0];
 
-                    if (uv_queue_work(loop, &data->request, do_unregister_node, after_do_unregister_node)) {
-                        freez(data->payload);
-                        freez(data);
+                    if (uv_queue_work(loop, &worker->request, do_unregister_node, after_do_unregister_node)) {
+                        freez(cmd.param[0]);
+                        return_worker(&config->worker_pool, worker);
                     }
                     break;
-                    // ALERTS
                 case ACLK_DATABASE_PUSH_ALERT_CONFIG:
                     aclk_push_alert_config_event(cmd.param[0], cmd.param[1]);
                     break;
-                case ACLK_DATABASE_PUSH_ALERT:
-
-                    if (config->alert_push_running)
-                        break;
-
-                    config->alert_push_running = true;
-
-                    data = mallocz(sizeof(*data));
-                    data->request.data = data;
-                    data->config = config;
-
-                    if (uv_queue_work(loop, &data->request, start_alert_push, after_start_alert_push)) {
-                        freez(data);
-                        config->alert_push_running = false;
-                    }
-                    break;
-                case ACLK_MQTT_WSS_CLIENT:
+                case ACLK_MQTT_WSS_CLIENT_SET:
                     config->client = (mqtt_wss_client)cmd.param[0];
                     break;
-
+                case ACLK_MQTT_WSS_CLIENT_RESET:
+                    __atomic_store_n(&config->client, NULL, __ATOMIC_RELEASE);
+                    struct completion *comp = cmd.param[0];
+                    completion_mark_complete(comp);
+                    break;
                 case ACLK_QUERY_EXECUTE:
-                    query = (aclk_query_t)cmd.param[0];
+                    query = (aclk_query_t *) cmd.param[0];
 
                     bool too_busy = (config->aclk_queries_running >= query_thread_count);
 
@@ -793,7 +804,7 @@ static void aclk_synchronization_event_loop(void *arg)
                         // We have nothing, leave
                         if (Pvalue == NULL)
                             break;
-                        aclk_query_t query_in_queue = *Pvalue;
+                        aclk_query_t *query_in_queue = *Pvalue;
 
                         // Schedule it and increase running
                         too_busy = schedule_query_in_worker(loop, config, query_in_queue);
@@ -827,7 +838,7 @@ static void aclk_synchronization_event_loop(void *arg)
 
 // Note: The following two opcodes must be in this order
                 case ACLK_QUERY_BATCH_ADD:
-                    query = (aclk_query_t)cmd.param[0];
+                    query = (aclk_query_t *)cmd.param[0];
                     if (!query)
                         break;
 
@@ -846,30 +857,32 @@ static void aclk_synchronization_event_loop(void *arg)
                     if (!aclk_query_batch || config->aclk_batch_job_is_running)
                         break;
 
-                    payload = mallocz(sizeof(*payload));
-                    payload->request.data = payload;
-                    payload->config = config;
-                    payload->data = aclk_query_batch;
+                    worker = get_worker(&config->worker_pool);
+                    worker->config = config;
+                    worker->payload = aclk_query_batch;
 
                     config->aclk_batch_job_is_running = true;
                     config->aclk_jobs_pending -= aclk_query_batch->count;
                     aclk_query_batch = NULL;
 
-                    if (uv_queue_work(loop, &payload->request, aclk_execute_batch, after_aclk_execute_batch)) {
-                        aclk_query_batch = payload->data;
+                    if (uv_queue_work(loop, &worker->request, aclk_execute_batch, after_aclk_execute_batch)) {
+                        aclk_query_batch = worker->payload;
                         config->aclk_jobs_pending += aclk_query_batch->count;
-                        freez(payload);
+                        return_worker(&config->worker_pool, worker);
                         config->aclk_batch_job_is_running = false;
                     }
                     break;
                 case ACLK_SYNC_SHUTDOWN:
-                    shutdown_requested = 1;
-                    shutdown_initiated = now_realtime_sec();
+                    config->shutdown_requested = true;
                     mark_pending_req_cancel_all();
                     break;
                 default:
                     break;
             }
+
+            if (opcode != ACLK_DATABASE_NOOP)
+                uv_run(loop, UV_RUN_NOWAIT);
+
         } while (opcode != ACLK_DATABASE_NOOP);
     }
     config->initialized = false;
@@ -878,10 +891,16 @@ static void aclk_synchronization_event_loop(void *arg)
         uv_close((uv_handle_t *)&config->timer_req, NULL);
 
     uv_close((uv_handle_t *)&config->async, NULL);
-    uv_run(loop, UV_RUN_NOWAIT);
+    uv_walk(loop, libuv_close_callback, notify_timer_close_callback);
 
-    uv_walk(loop, (uv_walk_cb) close_callback, NULL);
-    uv_run(loop, UV_RUN_NOWAIT);
+    size_t loop_count = (MAX_SHUTDOWN_TIMEOUT_SECONDS * MSEC_PER_SEC) / SHUTDOWN_SLEEP_INTERVAL_MS;
+
+    while (ACLK_JOBS_ARE_RUNNING && loop_count > 0) {
+        if (!uv_run(loop, UV_RUN_NOWAIT))
+            break;  // No pending callbacks
+        sleep_usec(SHUTDOWN_SLEEP_INTERVAL_MS * USEC_PER_MS);
+        loop_count--;
+    }
 
     (void) uv_loop_close(loop);
 
@@ -897,12 +916,10 @@ static void aclk_synchronization_event_loop(void *arg)
         freez(aclk_query_batch);
     }
 
-    aral_by_size_release(config->ar);
-    completion_mark_complete(&config->start_stop_complete);
-
+    release_cmd_pool(&config->cmd_pool);
     worker_unregister();
     service_exits();
-    netdata_log_info("ACLK SYNC: Shutting down ACLK synchronization event loop");
+    completion_mark_complete(&config->start_stop_complete);
 }
 
 static void aclk_initialize_event_loop(void)
@@ -910,51 +927,42 @@ static void aclk_initialize_event_loop(void)
     memset(&aclk_sync_config, 0, sizeof(aclk_sync_config));
     completion_init(&aclk_sync_config.start_stop_complete);
 
-    int retries = 0;
-    int create_uv_thread_rc = create_uv_thread(&aclk_sync_config.thread, aclk_synchronization_event_loop, &aclk_sync_config, &retries);
-    if (create_uv_thread_rc)
-        nd_log_daemon(NDLP_ERR, "Failed to create ACLK synchronization thread, error %s, after %d retries", uv_err_name(create_uv_thread_rc), retries);
+    init_worker_pool(&aclk_sync_config.worker_pool);
 
-    fatal_assert(0 == create_uv_thread_rc);
+    aclk_sync_config.thread = nd_thread_create("ACLKSYNC", NETDATA_THREAD_OPTION_DEFAULT, aclk_synchronization_event_loop, &aclk_sync_config);
+    fatal_assert(NULL != aclk_sync_config.thread);
 
-    if (retries)
-        nd_log_daemon(NDLP_WARNING, "ACLK synchronization thread was created after %d attempts", retries);
     completion_wait_for(&aclk_sync_config.start_stop_complete);
-
     // Keep completion, just reset it for next use during shutdown
     completion_reset(&aclk_sync_config.start_stop_complete);
 }
 
 // -------------------------------------------------------------
 
-void create_aclk_config(RRDHOST *host __maybe_unused, nd_uuid_t *host_uuid __maybe_unused, nd_uuid_t *node_id __maybe_unused)
+void create_aclk_config(RRDHOST *host, nd_uuid_t *host_uuid __maybe_unused, nd_uuid_t *node_id __maybe_unused)
 {
 
-    if (!host || host->aclk_config)
+    if (!host || host->aclk_host_config)
         return;
 
-    struct aclk_sync_cfg_t *wc = callocz(1, sizeof(struct aclk_sync_cfg_t));
+    struct aclk_sync_cfg_t *aclk_host_config = callocz(1, sizeof(struct aclk_sync_cfg_t));
     if (node_id && !uuid_is_null(*node_id))
-        uuid_unparse_lower(*node_id, wc->node_id);
+        uuid_unparse_lower(*node_id, aclk_host_config->node_id);
 
-    host->aclk_config = wc;
-    if (node_id && UUIDiszero(host->node_id)) {
-        uuid_copy(host->node_id.uuid, *node_id);
+    struct aclk_sync_cfg_t *expected = NULL;
+    if (__atomic_compare_exchange_n(&host->aclk_host_config, &expected, aclk_host_config, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        if (node_id && UUIDiszero(host->node_id))
+            uuid_copy(host->node_id.uuid, *node_id);
+    }
+    else {
+        freez(aclk_host_config);
+        return;
     }
 
-    wc->host = host;
-    wc->stream_alerts = false;
+    aclk_host_config->host = host;
+    aclk_host_config->stream_alerts = false;
     time_t now = now_realtime_sec();
-    wc->node_info_send_time = (host == localhost || NULL == localhost) ? now - 25 : now;
-}
-
-void destroy_aclk_config(RRDHOST *host)
-{
-    if (!host || !host->aclk_config)
-        return;
-
-    freez(host->aclk_config);
-    host->aclk_config = NULL;
+    aclk_host_config->node_info_send_time = (host == localhost || NULL == localhost) ? now - 25 : now;
 }
 
 #define SQL_FETCH_ALL_HOSTS                                                                                            \
@@ -970,23 +978,42 @@ void destroy_aclk_config(RRDHOST *host)
     "SELECT ni.host_id, ni.node_id FROM host h, node_instance ni "                                                     \
     "WHERE h.host_id = ni.host_id AND ni.node_id IS NOT NULL"
 
+
+uv_sem_t ctx_sem;
+
 void aclk_synchronization_init(void)
 {
     char *err_msg = NULL;
     int rc;
 
     nd_log_daemon(NDLP_INFO, "Creating archived hosts");
-    int number_of_children = 0;
-    rc = sqlite3_exec_monitored(db_meta, SQL_FETCH_ALL_HOSTS, create_host_callback, &number_of_children, &err_msg);
+    struct children node_data = { 0, 0};
+
+    rc = sqlite3_exec_monitored(db_meta, SQL_FETCH_ALL_HOSTS, create_host_callback, &node_data, &err_msg);
 
     if (rc != SQLITE_OK) {
         nd_log_daemon(NDLP_ERR, "SQLite error when loading archived hosts, rc = %d (%s)", rc, err_msg);
         sqlite3_free(err_msg);
     }
 
-    nd_log_daemon(NDLP_INFO, "Created %d archived hosts", number_of_children);
+    nd_log_daemon(
+        NDLP_INFO,
+        "Created %d archived hosts (%d children and %d vnodes)",
+        node_data.normal + node_data.vnodes,
+        node_data.normal,
+        node_data.vnodes);
+
+    bool sem_init = true;
+    uv_sem_init(&ctx_sem, 0);
+
     // Trigger host context load for hosts that have been created
-    metadata_queue_load_host_context();
+    if (unlikely(!metadata_queue_load_host_context())) {
+        nd_log_daemon(NDLP_WARNING, "Failed to queue command to load contexts for archived hosts");
+        // Reset context load flag so that contexts will be loaded on demand
+        reset_host_context_load_flag();
+        uv_sem_destroy(&ctx_sem);
+        sem_init = false;
+    }
 
     rc = sqlite3_exec_monitored(db_meta, SQL_FETCH_ALL_INSTANCES, aclk_config_parameters, NULL, &err_msg);
 
@@ -997,32 +1024,56 @@ void aclk_synchronization_init(void)
 
     aclk_initialize_event_loop();
 
-    if (!number_of_children)
+    if (!(node_data.normal + node_data.vnodes))
         aclk_queue_node_info(localhost, true);
 
+    if (sem_init) {
+        int finished_vnodes = 0;
+        time_t deadline = now_realtime_sec() + 60;  // hard timeput to avoid infinite block
+        while (finished_vnodes < node_data.vnodes) {
+            if (uv_sem_trywait(&ctx_sem) == 0) {
+                finished_vnodes++;
+                continue;
+            }
+
+            if (now_realtime_sec() >= deadline) {
+                nd_log_daemon(NDLP_WARNING, "Vnodes context load still in progress, continue with agent start");
+                break;
+            }
+            sleep_usec(100 * USEC_PER_MS);
+        }
+        if (finished_vnodes == node_data.vnodes) {
+            uv_sem_destroy(&ctx_sem);
+        }
+    }
     nd_log_daemon(NDLP_INFO, "ACLK sync initialization completed");
 }
 
-static inline void queue_aclk_sync_cmd(enum aclk_database_opcode opcode, const void *param0, const void *param1)
+static inline bool queue_aclk_sync_cmd(enum aclk_database_opcode opcode, const void *param0, const void *param1)
 {
-    struct aclk_database_cmd cmd;
+    cmd_data_t cmd;
     cmd.opcode = opcode;
     cmd.param[0] = (void *) param0;
     cmd.param[1] = (void *) param1;
-    aclk_database_enq_cmd(&cmd);
+    return aclk_database_enq_cmd(&cmd, true);
 }
 
 void aclk_synchronization_shutdown(void)
 {
-    // Send shutdown command, not that the completion is initialized
-    // on init and still valid
-    queue_aclk_sync_cmd(ACLK_SYNC_SHUTDOWN, NULL, NULL);
+    if (!aclk_sync_config.thread)
+        return;
 
-    completion_wait_for(&aclk_sync_config.start_stop_complete);
+    // Send shutdown command, note that the completion is initialized
+    // on init and still valid
+    aclk_mqtt_client_reset();
+
+    if (queue_aclk_sync_cmd(ACLK_SYNC_SHUTDOWN, NULL, NULL))
+        completion_wait_for(&aclk_sync_config.start_stop_complete);
+
     completion_destroy(&aclk_sync_config.start_stop_complete);
-    int rc = uv_thread_join(&aclk_sync_config.thread);
+    int rc = nd_thread_join(aclk_sync_config.thread);
     if (rc)
-        nd_log_daemon(NDLP_ERR, "ACLK: Failed to join synchronization thread, error %s", uv_err_name(rc));
+        nd_log_daemon(NDLP_ERR, "ACLK: Failed to join synchronization thread");
     else
         nd_log_daemon(NDLP_INFO, "ACLK: synchronization thread shutdown completed");
 }
@@ -1036,25 +1087,37 @@ void aclk_push_alert_config(const char *node_id, const char *config_hash)
     queue_aclk_sync_cmd(ACLK_DATABASE_PUSH_ALERT_CONFIG, strdupz(node_id), strdupz(config_hash));
 }
 
-void aclk_execute_query(aclk_query_t query)
+void aclk_execute_query(aclk_query_t *query)
 {
     if (unlikely(!query))
         return;
 
-    queue_aclk_sync_cmd(ACLK_QUERY_EXECUTE, query, NULL);
+    (void) queue_aclk_sync_cmd(ACLK_QUERY_EXECUTE, query, NULL);
 }
 
-void aclk_add_job(aclk_query_t query)
+void aclk_add_job(aclk_query_t *query)
 {
     if (unlikely(!query))
         return;
 
-    queue_aclk_sync_cmd(ACLK_QUERY_BATCH_ADD, query, NULL);
+    (void) queue_aclk_sync_cmd(ACLK_QUERY_BATCH_ADD, query, NULL);
 }
 
-void aclk_query_init(mqtt_wss_client client)
+void aclk_mqtt_client_set(mqtt_wss_client client)
 {
-    queue_aclk_sync_cmd(ACLK_MQTT_WSS_CLIENT, client, NULL);
+    (void) queue_aclk_sync_cmd(ACLK_MQTT_WSS_CLIENT_SET, client, NULL);
+}
+
+void aclk_mqtt_client_reset()
+{
+    if (!__atomic_load_n(&aclk_sync_config.client, __ATOMIC_RELAXED))
+        return;
+
+    struct completion compl;
+    completion_init(&compl);
+    if (queue_aclk_sync_cmd(ACLK_MQTT_WSS_CLIENT_RESET, &compl, NULL))
+        completion_wait_for(&compl);
+    completion_destroy(&compl);
 }
 
 void schedule_node_state_update(RRDHOST *host, uint64_t delay)
@@ -1062,12 +1125,40 @@ void schedule_node_state_update(RRDHOST *host, uint64_t delay)
     if (unlikely(!host))
         return;
 
-    queue_aclk_sync_cmd(ACLK_DATABASE_NODE_STATE, host, (void *)(uintptr_t)delay);
+    (void) queue_aclk_sync_cmd(ACLK_DATABASE_NODE_STATE, host, (void *)(uintptr_t)delay);
 }
 
 void unregister_node(const char *machine_guid)
 {
     if (unlikely(!machine_guid))
         return;
-    queue_aclk_sync_cmd(ACLK_DATABASE_NODE_UNREGISTER, strdupz(machine_guid), NULL);
+
+    (void) queue_aclk_sync_cmd(ACLK_DATABASE_NODE_UNREGISTER, strdupz(machine_guid), NULL);
+}
+
+void destroy_aclk_config(RRDHOST *host)
+{
+    if (!host)
+        return;
+
+    struct aclk_sync_cfg_t *aclk_host_config = __atomic_load_n(&host->aclk_host_config, __ATOMIC_RELAXED);
+    if (!aclk_host_config)
+        return;
+
+    if(likely(__atomic_load_n(&aclk_sync_config.initialized, __ATOMIC_RELAXED))) {
+        struct completion compl;
+        completion_init(&compl);
+
+        if (queue_aclk_sync_cmd(ACLK_CANCEL_NODE_UPDATE_TIMER, (void *)host, (void *)&compl))
+            completion_wait_for(&compl);
+        completion_destroy(&compl);
+    }
+
+    struct aclk_sync_cfg_t *old_aclk_host_config = __atomic_exchange_n(&host->aclk_host_config, NULL, __ATOMIC_RELAXED);
+    freez(old_aclk_host_config);
+}
+
+void aclk_queue_node_info(RRDHOST *host, bool immediate)
+{
+    (void) queue_aclk_sync_cmd(ACLK_QUEUE_NODE_INFO, (void *)host, (void *)(uintptr_t)immediate);
 }

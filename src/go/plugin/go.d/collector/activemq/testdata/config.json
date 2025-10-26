@@ -1,6 +1,7 @@
 {
   "vnode": "ok",
   "update_every": 123,
+  "autodetection_retry": 123,
   "webadmin": "ok",
   "max_queues": 123,
   "max_topics": 123,
@@ -14,6 +15,7 @@
   },
   "username": "ok",
   "password": "ok",
+  "bearer_token_file": "ok",
   "proxy_url": "ok",
   "proxy_username": "ok",
   "proxy_password": "ok",

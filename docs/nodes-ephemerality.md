@@ -1,90 +1,186 @@
-# Nodes Ephemerality in Netdata
+# Node Types and Lifecycle Strategies
 
-## Overview
-
-Netdata v2.3.0 changes how ephemeral nodes are defined and managed in distributed monitoring environments. This update enhances monitoring reliability while providing flexibility for dynamic infrastructure management.
-
-**Key Changes**:
-
-Netdata now defines ephemeral nodes as "nodes that are expected to disconnect without raising alerts," replacing the previous definition of forgotten nodes after one day of disconnection. This change provides three major benefits:
-
-1. **Improved Permanent Node Monitoring**: Disconnection alerts are triggered only for permanent nodes, reducing alert noise and helping teams focus on genuine operational issues.
-2. **Better Support for Dynamic Infrastructure**: Organizations using auto-scaling cloud instances, containers, and other dynamic resources can now designate nodes as ephemeral, preventing unnecessary alerts.
-3. **Automated Node Management**: The system automatically removes ephemeral nodes based on configurable retention periods, maintaining clean and relevant monitoring dashboards.
+Netdata categorizes nodes as **ephemeral** or **permanent** to help you tailor alerting, cleanup, and monitoring strategies for dynamic or static infrastructures.
 
 ## Node Types
 
-Netdata supports two types of nodes:
+| Type          | Description                                    | Common Use Cases                                                                                                                            |
+|---------------|------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| **Ephemeral** | Expected to disconnect or reconnect frequently | • Auto-scaling cloud instances<br />• Dynamic containers and VMs<br />• IoT devices with intermittent connectivity<br />• Test environments |
+| **Permanent** | Expected to maintain continuous connectivity   | • Production servers<br />• Core infrastructure nodes<br />• Critical monitoring systems<br />• Stable database servers                     |
 
-| Type      | Description                                          | Common Examples                                                                                                                                                             |
-|-----------|------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Ephemeral | Nodes expected to disconnect or reconnect frequently | • Auto-scaling cloud instances<br/>• Dynamic containers and VMs<br/>• IoT devices with intermittent connectivity<br/>• Development/test environments with frequent restarts |
-| Permanent | Nodes expected to maintain continuous connectivity   | • Production servers<br/>• Core infrastructure nodes<br/>• Critical monitoring systems<br/>• Stable database servers                                                        |
+:::note
 
-> **Note**: Disconnections in permanent nodes indicate potential system failures requiring immediate attention.
+Disconnections in **permanent nodes** may indicate system failures and require immediate attention.
 
-## Setting Up Ephemeral Nodes
+:::
+
+### Key Benefits of Ephemeral Nodes
+
+1. **Reduced Alert Noise**: Disconnection alerts apply only to permanent nodes.
+2. **Support for Dynamic Infrastructure**: Designate temporary resources as ephemeral to avoid false alarms.
+3. **Automated Cleanup**: Configure retention policies for ephemeral nodes to keep dashboards uncluttered.
+
+## Configuring Ephemeral Nodes
 
 By default, Netdata treats all nodes as permanent. To mark a node as ephemeral:
 
-1. Open `netdata.conf` on the target node
+1. Open the `netdata.conf` file on the target node.
 2. Add the following configuration:
+
    ```ini
    [global]
-     is ephemeral node = yes
+   is ephemeral node = yes
    ```
-3. Restart the node
 
-This configuration sets the `_is_ephemeral` host label which propagates to Netdata Parents and Netdata Cloud.
+3. Restart the Netdata Agent.
 
-## Alerts: Parent Node Alerts
+This applies the `_is_ephemeral` host label, which propagates to your Parents and Netdata Cloud.
 
-Netdata v2.3.0 adds [two alerts](https://github.com/netdata/netdata/blob/master/src/health/health.d/streaming.conf) specifically for permanent nodes:
+<details>
+<summary><strong>Click to see visual representation of configuration flow</strong></summary><br/>
 
-| Alert                     | Triggers                                                      |
-|---------------------------|---------------------------------------------------------------|
-| streaming_never_connected | When permanent nodes have never connected to a Netdata Parent |
-| streaming_disconnected    | When previously connected permanent nodes disconnect          |
+```mermaid
+flowchart TD
+    A[Node is Permanent by Default] -->|Step 1| B[Open netdata.conf on Target Node]
+    B -->|Step 2| C[Add Configuration]
+    C -->|Step 3| D[Restart the Node]
+    D --> E[Node Now Marked as Ephemeral]
+    E --> F[_is_ephemeral Label Applied]
+    F --> G[Label Propagates to Parents and Cloud]
+    classDef step fill: #e8f5e8, stroke: #27ae60, stroke-width: 2px, color: #2c3e50, rx: 10, ry: 10
+    classDef label fill: #f3e8ff, stroke: #9b59b6, stroke-width: 2px, color: #2c3e50, rx: 10, ry: 10
+    classDef subgraphStyle fill: #f8f9fa, stroke: #6c757d, stroke-width: 2px, color: #2c3e50, rx: 15, ry: 15
+    class A step
+    class B step
+    class C step
+    class D step
+    class E label
+    class F label
+    class G subgraphStyle
+```
 
-## Monitoring Child Node Status
+</details>
 
-To investigate alert:
+## Alerts for Parent Nodes
 
-1. Navigate to the `Top` tab in your dashboard
-2. Select the `Netdata-streaming` function
-3. Review the detailed node status table:
-    - Red lines: Node connection problems (when nodes attempt to connect to this Parent)
-    - Yellow lines: Restreaming issues (when this Parent attempts to stream data to other Parent nodes)
-    - Color highlighting applies only to permanent nodes
-    - Filter by `Ephemerality` to focus on permanent nodes
-    - Use `InStatus`, `InReason`, and `InAge` columns to analyze node connections to the parent node
-    - Use `OutStatus`, `OutReason`, and `OutAge` columns to analyze this Parent's restreaming to other Parent nodes
+Netdata v2.3.0 introduces two alerts specific to permanent nodes:
 
-## Managing Archived Nodes
+| Alert                       | Trigger Condition                                       |
+|-----------------------------|---------------------------------------------------------|
+| `streaming_never_connected` | A permanent node has never connected to a Parent.       |
+| `streaming_disconnected`    | A previously connected permanent node has disconnected. |
 
-To clear alerts for permanently offline nodes:
+## Monitoring and Managing Node Status
+
+### Mark Permanently Offline Nodes as Ephemeral
+
+To mark nodes (including virtual ones) as ephemeral:
 
 ```bash
 netdatacli mark-stale-nodes-ephemeral <node_id | machine_guid | hostname | ALL_NODES>
 ```
 
-> **Note**: Nodes will revert to permanent status if they reconnect unless configured as ephemeral in their `netdata.conf`.
+This keeps historical data queryable and clears active alerts.
 
-## Cloud Integration
+<details>
+<summary><strong>Click to see visual representation of CLI workflow</strong></summary><br/>
 
-Starting with v2.3.0, Netdata Cloud sends node-unreachable notifications **exclusively for permanent nodes**, improving alert relevance.
+```mermaid
+flowchart TD
+    A[Offline Node Detected] -->|Run CLI Command| B[Use netdatacli mark-stale-nodes-ephemeral]
+    B --> C[Node Marked as Ephemeral]
+    C --> D[Metrics Remain Available]
+    C --> E[Active Alerts Cleared]
+    C --> F{Node Reconnects?}
+    F -->|Yes - no config| G[Reverts to Permanent]
+    F -->|No| H[Remains Ephemeral]
+    classDef step fill: #e8f5e8, stroke: #27ae60, stroke-width: 2px, color: #2c3e50, rx: 10, ry: 10
+    classDef alert fill: #ffe8e8, stroke: #e74c3c, stroke-width: 2px, color: #2c3e50, rx: 10, ry: 10
+    class A step
+    class B step
+    class C step
+    class D step
+    class E step
+    class F alert
+    class G alert
+    class H alert
+```
 
-## Automatic Ephemeral Nodes Cleanup
+</details>
 
-The automatic removal of disconnected ephemeral nodes is disabled by default in v2.3.0+. To enable this feature:
+### Removing Offline Nodes
 
-1. Edit the `netdata.conf` file on Netdata Parent nodes
+To fully remove permanently offline nodes:
+
+```bash
+netdatacli remove-stale-node <node_id | machine_guid | hostname | ALL_NODES>
+```
+
+:::note
+
+For detailed instructions on removing nodes from Netdata Cloud (including **offline** and **stale** nodes, bulk operations, and UI-based removal), see the [Remove Node Guide](https://github.com/netdata/netdata/edit/master/docs/learn/remove-node.md). This covers scenarios where UI removal is disabled due to parent-child configured relationships.
+
+:::
+
+<details>
+<summary><strong>Click to see visual representation of node removal flow</strong></summary><br/>
+
+```mermaid
+flowchart TD
+    A[Offline Node Detected] -->|Run CLI Tool| B[Execute remove-stale-node Command]
+    B --> C[Node Removed from System]
+    C --> D[Node No Longer Queryable]
+    C --> E[Alerts for Node Cleared]
+    classDef step fill: #e8f5e8, stroke: #27ae60, stroke-width: 2px, color: #2c3e50, rx: 10, ry: 10
+    classDef alert fill: #ffe8e8, stroke: #e74c3c, stroke-width: 2px, color: #2c3e50, rx: 10, ry: 10
+    class A step
+    class B step
+    class C step
+    class D step
+    class E step
+```
+
+</details>
+
+## Automatically Removing Ephemeral Nodes
+
+To enable automatic cleanup of ephemeral nodes:
+
+1. Open the `netdata.conf` file on Netdata Parent nodes.
 2. Add the following configuration:
 
    ```ini
    [db]
-     cleanup ephemeral hosts after = 1d
+   cleanup ephemeral hosts after = 1d
    ```
-3. Restart the node
 
-This setting removes ephemeral nodes from queries 24 hours after disconnection. When all parent nodes remove a node, Netdata Cloud automatically deletes it too.
+3. Restart the Netdata Agent.
+
+This removes ephemeral nodes after 24 hours of disconnection. Once all Parents purge the node, it is automatically removed from Netdata Cloud.
+
+<details>
+<summary><strong>Click to see visual representation of auto-removal process</strong></summary><br/>
+
+```mermaid
+flowchart TD
+    A[Configure Auto-Removal in netdata.conf] --> B[Restart Parent Nodes]
+    B --> C[Ephemeral Node Disconnects]
+    C --> D{Wait Period Elapsed?}
+    D -->|Yes| E[Node Automatically Removed]
+    D -->|No| F[Node Remains in System]
+    E --> G{All Parents Removed Node?}
+    G -->|Yes| H[Node Removed from Cloud]
+    classDef step fill: #e8f5e8, stroke: #27ae60, stroke-width: 2px, color: #2c3e50, rx: 10, ry: 10
+    classDef alert fill: #ffe8e8, stroke: #e74c3c, stroke-width: 2px, color: #2c3e50, rx: 10, ry: 10
+    class A step
+    class B step
+    class C step
+    class D step
+    class E step
+    class F step
+    class G step
+    class H step
+```
+
+</details>

@@ -2,7 +2,7 @@
 
 # This image contains preinstalled dependencies
 # hadolint ignore=DL3007
-FROM netdata/builder:v2 AS builder
+FROM netdata/builder:v3 AS builder
 
 # One of 'nightly' or 'stable'
 ARG RELEASE_CHANNEL=nightly
@@ -27,8 +27,14 @@ WORKDIR /opt/netdata.git
 RUN chmod +x netdata-installer.sh && \
    cp -rp /deps/* /usr/local/ && \
    /bin/echo -e "INSTALL_TYPE='oci'\nPREBUILT_ARCH='$(uname -m)'" > ./system/.install-type && \
-   CFLAGS="$(packaging/docker/gen-cflags.sh)" LDFLAGS="-Wl,--gc-sections" ./netdata-installer.sh --dont-wait --dont-start-it --use-system-protobuf \
-   ${EXTRA_INSTALL_OPTS} --disable-ebpf --install-no-prefix / "$([ "$RELEASE_CHANNEL" = stable ] && echo --stable-channel)"
+   CFLAGS="$(packaging/docker/gen-cflags.sh)" LDFLAGS="-Wl,--gc-sections" ./netdata-installer.sh --dont-wait --dont-start-it \
+   --use-system-protobuf \
+   --disable-ebpf \
+   --enable-plugin-otel \
+   --internal-systemd-journal \
+   ${EXTRA_INSTALL_OPTS} \
+   --install-no-prefix / \
+   "$([ "$RELEASE_CHANNEL" = stable ] && echo --stable-channel)"
 
 # files to one directory
 RUN mkdir -p /app/usr/sbin/ \
@@ -47,6 +53,7 @@ RUN mkdir -p /app/usr/sbin/ \
     mv /etc/netdata         /app/etc/ && \
     mv /usr/sbin/netdata    /app/usr/sbin/ && \
     mv /usr/sbin/netdatacli    /app/usr/sbin/ && \
+    mv /usr/sbin/nd-run    /app/usr/sbin/ && \
     mv /usr/sbin/systemd-cat-native /app/usr/sbin/ && \
     mv packaging/docker/run.sh        /app/usr/sbin/ && \
     mv packaging/docker/health.sh     /app/usr/sbin/ && \
@@ -58,7 +65,7 @@ RUN mkdir -p /app/usr/sbin/ \
 #####################################################################
 # This image contains preinstalled dependencies
 # hadolint ignore=DL3007
-FROM netdata/base:v2 AS base
+FROM netdata/base:v3 AS base
 
 ARG BUILD_DATE
 ARG BUILD_VERSION
@@ -126,6 +133,7 @@ RUN addgroup --gid ${NETDATA_GID} --system "${DOCKER_GRP}" && \
                 ndsudo \
                 slabinfo.plugin \
                 network-viewer.plugin \
+                otel-plugin \
                 systemd-journal.plugin; do \
         [ -f "/usr/libexec/netdata/plugins.d/$name" ] && chmod 4755 "/usr/libexec/netdata/plugins.d/$name"; \
     done && \

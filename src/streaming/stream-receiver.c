@@ -3,7 +3,6 @@
 #include "stream.h"
 #include "stream-thread.h"
 #include "stream-receiver-internals.h"
-#include "web/server/h2o/http_server.h"
 
 #ifdef NETDATA_LOG_STREAM_RECEIVER
 void stream_receiver_log_payload(struct receiver_state *rpt, const char *payload, STREAM_TRAFFIC_TYPE type __maybe_unused, bool inbound) {
@@ -124,17 +123,6 @@ static ssize_t write_stream(struct receiver_state *r, char* buffer, size_t size)
         return -2;
     }
 
-#ifdef ENABLE_H2O
-    if (is_h2o_rrdpush(r)) {
-        if(nd_thread_signaled_to_cancel()) {
-            errno_clear();
-            return -3;
-        }
-
-        return (ssize_t)h2o_stream_write(r->h2o_ctx, buffer, size);
-    }
-#endif
-
     ssize_t bytes_written = nd_sock_send_nowait(&r->sock, buffer, size);
     return bytes_written;
 }
@@ -146,17 +134,6 @@ static ssize_t read_stream(struct receiver_state *r, char* buffer, size_t size) 
         errno_clear();
         return -2;
     }
-
-#ifdef ENABLE_H2O
-    if (is_h2o_rrdpush(r)) {
-        if(nd_thread_signaled_to_cancel()) {
-            errno_clear();
-            return -3;
-        }
-
-        return (ssize_t)h2o_stream_read(r->h2o_ctx, buffer, size);
-    }
-#endif
 
     ssize_t bytes_read = nd_sock_revc_nowait(&r->sock, buffer, size);
     return bytes_read;
@@ -495,10 +472,6 @@ void stream_receiver_move_to_running_unsafe(struct stream_thread *sth, struct re
 
         __atomic_store_n(&rpt->thread.parser, parser, __ATOMIC_RELAXED);
     }
-
-#ifdef ENABLE_H2O
-    parser->h2o_ctx = rpt->h2o_ctx;
-#endif
 
     if(stream_receive.replication.enabled)
         pulse_host_status(rpt->host, PULSE_HOST_STATUS_RCV_REPLICATION_WAIT, 0);
@@ -1125,8 +1098,6 @@ bool rrdhost_set_receiver(RRDHOST *host, struct receiver_state *rpt) {
         __atomic_store_n(&rpt->exit.shutdown, false, __ATOMIC_RELEASE);
         host->stream.rcv.status.last_connected = now_realtime_sec();
         host->stream.rcv.status.last_disconnected = 0;
-        host->stream.rcv.status.last_chart = 0;
-        host->stream.rcv.status.check_obsolete = true;
 
         if (rpt->config.health.enabled != CONFIG_BOOLEAN_NO) {
             if (rpt->config.health.delay > 0) {
@@ -1206,7 +1177,6 @@ void rrdhost_clear_receiver(struct receiver_state *rpt, STREAM_HANDSHAKE reason)
             host->stream.rcv.status.reason = rpt->exit.reason;
             rpt->exit.reason = 0;
             __atomic_store_n(&rpt->exit.shutdown, false, __ATOMIC_RELEASE);
-            host->stream.rcv.status.check_obsolete = false;
             host->stream.rcv.status.last_connected = 0;
             host->stream.rcv.status.last_disconnected = now_realtime_sec();
             host->health.enabled = false;

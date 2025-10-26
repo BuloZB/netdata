@@ -332,7 +332,7 @@ const char *aclk_topic_cache_iterate(size_t *iter)
  *
  */
 
-unsigned long int aclk_tbeb_delay(int reset, int base, unsigned long int min, unsigned long int max) {
+unsigned long int aclk_tbeb_delay(int reset, int base, unsigned long int mins_ms, unsigned long int min_ms) {
     static int attempt = -1;
 
     if (reset) {
@@ -350,11 +350,14 @@ unsigned long int aclk_tbeb_delay(int reset, int base, unsigned long int min, un
 
     delay += (os_random32() % (MAX(1000, delay/2)));
 
-    if (delay <= min * MSEC_PER_SEC)
-        return min;
+    // Note: this is a bug, the value expected from the env backoff payload should be in seconds
+    // but the code here is in milliseconds. To avoid confusion the cloud will be sending the value
+    // in milliseconds so that the code will work as expected.
+    if (delay <= mins_ms * MSEC_PER_SEC)
+        return mins_ms;
 
-    if (delay >= max * MSEC_PER_SEC)
-        return max;
+    if (delay >= min_ms * MSEC_PER_SEC)
+        return min_ms;
 
     return delay;
 }
@@ -383,10 +386,12 @@ static inline int aclk_parse_userpass_pair(const char *src, const char c, char *
 }
 
 #define HTTP_PROXY_PREFIX "http://"
-void aclk_set_proxy(char **ohost, int *port, char **uname, char **pwd, enum mqtt_wss_proxy_type *type)
+void aclk_set_proxy(char **ohost, int *port, char **uname, char **pwd,
+    char **log_proxy, enum mqtt_wss_proxy_type *type)
 {
     ACLK_PROXY_TYPE pt;
-    const char *ptr = aclk_get_proxy(&pt);
+    const char *ptr = aclk_get_proxy(&pt, false);
+    *log_proxy = (char *) aclk_get_proxy(&pt, true);
     char *tmp;
 
     if (pt != PROXY_TYPE_HTTP)

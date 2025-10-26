@@ -135,6 +135,18 @@ int rrdhost_system_info_set_by_name(struct rrdhost_system_info *system_info, cha
         freez(system_info->is_k8s_node);
         system_info->is_k8s_node = strdupz(value);
     }
+    else if(!strcmp(name, "NETDATA_SYSTEM_DEFAULT_INTERFACE_NAME")){
+        freez(system_info->network_default_iface);
+        system_info->network_default_iface = strdupz(value);
+    }
+    else if(!strcmp(name, "NETDATA_SYSTEM_DEFAULT_INTERFACE_IP")){
+        freez(system_info->network_default_iface_ip);
+        system_info->network_default_iface_ip = strdupz(value);
+    }
+    else if(!strcmp(name, "NETDATA_SYSTEM_DEFAULT_INTERFACE_DETECTION")){
+        freez(system_info->network_default_iface_detection);
+        system_info->network_default_iface_detection = strdupz(value);
+    }
     else if (!strcmp(name, "NETDATA_SYSTEM_CPU_VENDOR"))
         return res;
     else if (!strcmp(name, "NETDATA_SYSTEM_CPU_DETECTION"))
@@ -176,7 +188,9 @@ struct rrdhost_system_info *rrdhost_system_info_from_host_labels(RRDLABELS *labe
     rrdlabels_get_value_strdup_or_null(labels, &info->install_type, "_install_type");
     rrdlabels_get_value_strdup_or_null(labels, &info->prebuilt_arch, "_prebuilt_arch");
     rrdlabels_get_value_strdup_or_null(labels, &info->prebuilt_dist, "_prebuilt_dist");
-
+    rrdlabels_get_value_strdup_or_null(labels, &info->network_default_iface, "_net_default_iface");
+    rrdlabels_get_value_strdup_or_null(labels, &info->network_default_iface_ip, "_net_default_iface_ip");
+    rrdlabels_get_value_strdup_or_null(labels, &info->network_default_iface_detection, "_net_default_iface_detection");
     return info;
 }
 
@@ -240,6 +254,15 @@ void rrdhost_system_info_to_rrdlabels(struct rrdhost_system_info *system_info, R
 
     if (system_info->prebuilt_dist)
         rrdlabels_add(labels, "_prebuilt_dist", system_info->prebuilt_dist, RRDLABEL_SRC_AUTO);
+
+    if (system_info->network_default_iface)
+        rrdlabels_add(labels, "_net_default_iface", system_info->network_default_iface, RRDLABEL_SRC_AUTO);
+
+    if (system_info->network_default_iface_ip)
+        rrdlabels_add(labels, "_net_default_iface_ip", system_info->network_default_iface_ip, RRDLABEL_SRC_AUTO);
+
+    if (system_info->network_default_iface_detection)
+        rrdlabels_add(labels, "_net_default_iface_detection", system_info->network_default_iface_detection, RRDLABEL_SRC_AUTO);
 }
 
 int rrdhost_system_info_detect(struct rrdhost_system_info *system_info) {
@@ -376,6 +399,9 @@ void rrdhost_system_info_free(struct rrdhost_system_info *system_info) {
         freez(system_info->install_type);
         freez(system_info->prebuilt_arch);
         freez(system_info->prebuilt_dist);
+        freez(system_info->network_default_iface);
+        freez(system_info->network_default_iface_ip);
+        freez(system_info->network_default_iface_detection);
         freez(system_info);
     }
 }
@@ -505,7 +531,9 @@ int rrdhost_system_info_foreach(struct rrdhost_system_info *system_info, add_hos
     ret += cb("NETDATA_SYSTEM_CONTAINER", system_info->container, uuid);
     ret += cb("NETDATA_SYSTEM_CONTAINER_DETECTION", system_info->container_detection, uuid);
     ret += cb("NETDATA_HOST_IS_K8S_NODE", system_info->is_k8s_node, uuid);
-
+    ret += cb("NETDATA_SYSTEM_DEFAULT_INTERFACE_NAME", system_info->network_default_iface, uuid);
+    ret += cb("NETDATA_SYSTEM_DEFAULT_INTERFACE_IP", system_info->network_default_iface_ip, uuid);
+    ret += cb("NETDATA_SYSTEM_DEFAULT_INTERFACE_DETECTION", system_info->network_default_iface_detection, uuid);
     return ret;
 }
 
@@ -619,13 +647,14 @@ void rrdhost_system_info_to_streaming_function_array(BUFFER *wb, struct rrdhost_
     }
 }
 
-void get_daemon_status_fields_from_system_info(DAEMON_STATUS_FILE *ds) {
-    if(ds->read_system_info) return;
+bool get_daemon_status_fields_from_system_info(DAEMON_STATUS_FILE *ds) {
+    if(ds->read_system_info)
+        return false;
 
     struct rrdhost_system_info *ri = (localhost && localhost->system_info) ? localhost->system_info : NULL;
     if(!ri) {
         // nothing we can do, let it be
-        return;
+        return false;
     }
 
     if(ri->architecture)
@@ -659,14 +688,23 @@ void get_daemon_status_fields_from_system_info(DAEMON_STATUS_FILE *ds) {
             ds->kubernetes = false;
     }
 
-    if(ri->cloud_provider_type && strcmp(ri->cloud_provider_type, "unknown") != 0)
+    if(ri->cloud_provider_type && strcasecmp(ri->cloud_provider_type, "unknown") != 0)
         strncpyz(ds->cloud_provider_type, ri->cloud_provider_type, sizeof(ds->cloud_provider_type) - 1);
 
-    if(ri->cloud_instance_type && strcmp(ri->cloud_instance_type, "unknown") != 0)
+    if(ri->cloud_instance_type && strcasecmp(ri->cloud_instance_type, "unknown") != 0)
         strncpyz(ds->cloud_instance_type, ri->cloud_instance_type, sizeof(ds->cloud_instance_type) - 1);
 
-    if(ri->cloud_instance_region && strcmp(ri->cloud_instance_region, "unknown") != 0)
+    if(ri->cloud_instance_region && strcasecmp(ri->cloud_instance_region, "unknown") != 0)
         strncpyz(ds->cloud_instance_region, ri->cloud_instance_region, sizeof(ds->cloud_instance_region) - 1);
 
     ds->read_system_info = true;
+
+    return true;
 }
+
+bool localhost_is_docker() {
+    if (localhost && localhost->system_info) {
+        return (localhost->system_info->container && strcmp(localhost->system_info->container, "docker") == 0);
+    }
+    return false;
+};

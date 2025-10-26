@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//go:build linux || freebsd || openbsd || netbsd || dragonfly
-
 package smartctl
 
 import (
@@ -11,9 +9,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/netdata/netdata/go/plugins/pkg/confopt"
 	"github.com/netdata/netdata/go/plugins/pkg/matcher"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/confopt"
 )
 
 //go:embed "config_schema.json"
@@ -38,6 +36,7 @@ func New() *Collector {
 			PollDevicesEvery: confopt.Duration(time.Minute * 5),
 			NoCheckPowerMode: "standby",
 			DeviceSelector:   "*",
+			ConcurrentScans:  0, // Default to sequential
 		},
 		charts:      &module.Charts{},
 		forceScan:   true,
@@ -55,6 +54,7 @@ type (
 		NoCheckPowerMode string              `yaml:"no_check_power_mode,omitempty" json:"no_check_power_mode"`
 		DeviceSelector   string              `yaml:"device_selector,omitempty" json:"device_selector"`
 		ExtraDevices     []ConfigExtraDevice `yaml:"extra_devices,omitempty" json:"extra_devices"`
+		ConcurrentScans  int                 `yaml:"concurrent_scans,omitempty" json:"concurrent_scans"`
 	}
 	ConfigExtraDevice struct {
 		Name string `yaml:"name" json:"name"`

@@ -70,7 +70,8 @@ extern const char *netdata_configured_host_prefix;
 #include "uuid/uuid.h"
 #include "uuid/uuidmap.h"
 #include "http/content_type.h"
-#include "http/http_access.h"
+#include "user-auth/http-access.h"
+#include "user-auth/user-auth.h"
 
 #include "inlined.h"
 #include "parsers/parsers.h"
@@ -134,6 +135,7 @@ extern const char *netdata_configured_host_prefix;
 #include "facets/facets.h"
 #include "functions_evloop/functions_evloop.h"
 #include "query_progress/progress.h"
+#include "stacktrace/stacktrace.h"
 
 static ALWAYS_INLINE PPvoid_t JudyLFirstThenNext(Pcvoid_t PArray, Word_t * PIndex, bool *first) {
     if(unlikely(*first)) {

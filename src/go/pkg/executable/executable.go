@@ -20,10 +20,14 @@ func init() {
 	}
 
 	_, Name = filepath.Split(path)
+	Name = strings.TrimSuffix(Name, ".exe")
 	Name = strings.TrimSuffix(Name, ".plugin")
 
 	if strings.HasSuffix(Name, ".test") {
 		Name = "test"
+	}
+	if Name == "godplugin" {
+		Name = "go.d"
 	}
 
 	fi, err := os.Lstat(path)

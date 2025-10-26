@@ -44,7 +44,6 @@ The default configuration for this integration does not impose any limits on dat
 
 The default configuration for this integration is not expected to impose a significant performance impact on the system.
 
-
 ## Metrics
 
 Metrics grouped by *scope*.
@@ -79,6 +78,7 @@ There are no alerts configured by default for this integration.
 
 
 ## Setup
+
 
 ### Prerequisites
 
@@ -166,18 +166,6 @@ number of currently running Goroutines and updates these stats every second.
 
 ### Configuration
 
-#### File
-
-The configuration file name for this integration is `python.d/go_expvar.conf`.
-
-
-You can edit the configuration file using the [`edit-config`](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#edit-a-configuration-file-using-edit-config) script from the
-Netdata [config directory](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#the-netdata-config-directory).
-
-```bash
-cd /etc/netdata 2>/dev/null || cd /opt/netdata/etc/netdata
-sudo ./edit-config python.d/go_expvar.conf
-```
 #### Options
 
 There are 2 sections:
@@ -194,8 +182,10 @@ Every configuration JOB starts with a `job_name` value which will appear in the 
 
 <details open><summary>Config options</summary>
 
-| Name | Description | Default | Required |
-|:----|:-----------|:-------|:--------:|
+
+
+| Option | Description | Default | Required |
+|:-----|:------------|:--------|:---------:|
 | update_every | Sets the default data collection frequency. | 5 | no |
 | priority | Controls the order of charts at the netdata dashboard. | 60000 | no |
 | autodetection_retry | Sets the job re-check interval in seconds. | 0 | no |
@@ -207,11 +197,36 @@ Every configuration JOB starts with a `job_name` value which will appear in the 
 | collect_memstats | Enables charts for Go runtime's memory statistics. |  | no |
 | extra_charts | Defines extra data/charts to monitor, please see the example below. |  | no |
 
+
 </details>
 
-#### Examples
 
-##### Monitor a Go app1 application
+
+#### via File
+
+The configuration file name for this integration is `python.d/go_expvar.conf`.
+
+The file format is YAML. Generally, the structure is:
+
+```yaml
+update_every: 1
+autodetection_retry: 0
+
+job_name:
+  job_option1: some_value
+  job_option2: some_other_vlaue
+```
+You can edit the configuration file using the [`edit-config`](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#edit-a-configuration-file-using-edit-config) script from the
+Netdata [config directory](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#the-netdata-config-directory).
+
+```bash
+cd /etc/netdata 2>/dev/null || cd /opt/netdata/etc/netdata
+sudo ./edit-config python.d/go_expvar.conf
+```
+
+##### Examples
+
+###### Monitor a Go app1 application
 
 The example below sets a configuration for a Go application, called `app1`. Besides the `memstats`, the application also exposes two counters and the number of currently running Goroutines and updates these stats every second.
 

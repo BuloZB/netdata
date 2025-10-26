@@ -19,9 +19,12 @@ NEVER_INLINE
 static void shutdown_timed_out(void) {
     // keep this as a separate function, to have it logged like this in sentry
     daemon_status_file_shutdown_timeout(steps_timings);
-#ifdef ENABLE_SENTRY
-    nd_sentry_add_shutdown_timeout_as_breadcrumb();
-#endif
+
+    // NOTE: We intentionally skip adding a Sentry breadcrumb here because:
+    // 1. During shutdown timeout, the status file has already been saved with timeout info
+    // 2. Sentry may crash trying to access potentially freed/corrupted strings from session_status
+    // 3. The abort() below will trigger a signal that Sentry will catch anyway
+
     abort();
 }
 
@@ -41,7 +44,7 @@ static void watcher_wait_for_step(const watcher_step_id_t step_id, usec_t shutdo
 {
     if(!steps_timings) {
         steps_timings = buffer_create(0, NULL);
-        buffer_strcat(steps_timings, "# shutdown steps timings");
+        buffer_strcat(steps_timings, STACK_TRACE_INFO_PREFIX " shutdown steps timings");
     }
 
     usec_t step_start_time = now_monotonic_usec();
@@ -61,7 +64,7 @@ static void watcher_wait_for_step(const watcher_step_id_t step_id, usec_t shutdo
             watcher_steps[step_id].msg);
 #endif
 
-    daemon_status_file_shutdown_step(watcher_steps[step_id].msg);
+    daemon_status_file_shutdown_step(watcher_steps[step_id].msg, buffer_tostring(steps_timings));
 
     // Wait with a timeout
     time_t timeout = 135; // systemd gives us 150, we timeout at 135
@@ -70,7 +73,12 @@ static void watcher_wait_for_step(const watcher_step_id_t step_id, usec_t shutdo
     if(remaining_seconds < 0)
         remaining_seconds = 0;
 
+#if defined(FSANITIZE_ADDRESS)
+    completion_wait_for(&watcher_steps[step_id].p);
+    bool ok = true;
+#else
     bool ok = completion_timedwait_for(&watcher_steps[step_id].p, remaining_seconds);
+#endif
 
     usec_t step_duration = now_monotonic_usec() - step_start_time;
 
@@ -107,7 +115,7 @@ static void watcher_wait_for_step(const watcher_step_id_t step_id, usec_t shutdo
     }
 }
 
-void *watcher_main(void *arg)
+void watcher_main(void *arg)
 {
     UNUSED(arg);
 
@@ -115,7 +123,7 @@ void *watcher_main(void *arg)
 
     // wait until the agent starts the shutdown process
     completion_wait_for(&shutdown_begin_completion);
-    netdata_log_error("Shutdown process started");
+    netdata_log_info("Shutdown process started");
 
     usec_t shutdown_start_time = now_monotonic_usec();
 
@@ -133,11 +141,12 @@ void *watcher_main(void *arg)
     watcher_wait_for_step(WATCHER_STEP_ID_STOP_ACLK_MQTT_THREAD, shutdown_start_time);
     watcher_wait_for_step(WATCHER_STEP_ID_STOP_ALL_REMAINING_WORKER_THREADS, shutdown_start_time);
     watcher_wait_for_step(WATCHER_STEP_ID_CANCEL_MAIN_THREADS, shutdown_start_time);
-    watcher_wait_for_step(WATCHER_STEP_ID_PREPARE_METASYNC_SHUTDOWN, shutdown_start_time);
     watcher_wait_for_step(WATCHER_STEP_ID_STOP_COLLECTION_FOR_ALL_HOSTS, shutdown_start_time);
     watcher_wait_for_step(WATCHER_STEP_ID_WAIT_FOR_DBENGINE_COLLECTORS_TO_FINISH, shutdown_start_time);
     watcher_wait_for_step(WATCHER_STEP_ID_STOP_DBENGINE_TIERS, shutdown_start_time);
     watcher_wait_for_step(WATCHER_STEP_ID_STOP_METASYNC_THREADS, shutdown_start_time);
+    watcher_wait_for_step(WATCHER_STEP_ID_STOP_WEBSOCKET_THREADS, shutdown_start_time);
+    watcher_wait_for_step(WATCHER_STEP_ID_JOIN_STATIC_THREADS, shutdown_start_time);
     watcher_wait_for_step(WATCHER_STEP_ID_CLOSE_SQL_DATABASES, shutdown_start_time);
     watcher_wait_for_step(WATCHER_STEP_ID_REMOVE_PID_FILE, shutdown_start_time);
     watcher_wait_for_step(WATCHER_STEP_ID_FREE_OPENSSL_STRUCTURES, shutdown_start_time);
@@ -146,10 +155,13 @@ void *watcher_main(void *arg)
     usec_t shutdown_end_time = now_monotonic_usec();
 
     usec_t shutdown_duration = shutdown_end_time - shutdown_start_time;
-    netdata_log_error("Shutdown process ended in %llu milliseconds",
-                      shutdown_duration / USEC_PER_MS);
 
-    return NULL;
+    char shutdown_timing[64];
+    duration_snprintf(shutdown_timing, sizeof(shutdown_timing), (int64_t)shutdown_duration, "us", 1);
+    netdata_log_info("Shutdown process ended in %s", shutdown_timing);
+
+    daemon_status_file_shutdown_step(NULL, buffer_tostring(steps_timings));
+    daemon_status_file_update_status(DAEMON_STATUS_EXITED);
 }
 
 void watcher_thread_start() {
@@ -163,7 +175,6 @@ void watcher_thread_start() {
         "stop exporters, health and web servers threads";
     watcher_steps[WATCHER_STEP_ID_STOP_COLLECTORS_AND_STREAMING_THREADS].msg = "stop collectors and streaming threads";
     watcher_steps[WATCHER_STEP_ID_STOP_REPLICATION_THREADS].msg = "stop replication threads";
-    watcher_steps[WATCHER_STEP_ID_PREPARE_METASYNC_SHUTDOWN].msg = "prepare metasync shutdown";
     watcher_steps[WATCHER_STEP_ID_DISABLE_ML_DETEC_AND_TRAIN_THREADS].msg = "disable ML detection and training threads";
     watcher_steps[WATCHER_STEP_ID_STOP_CONTEXT_THREAD].msg = "stop context thread";
     watcher_steps[WATCHER_STEP_ID_CLEAR_WEB_CLIENT_CACHE].msg = "clear web client cache";
@@ -176,6 +187,8 @@ void watcher_thread_start() {
         "wait for dbengine collectors to finish";
     watcher_steps[WATCHER_STEP_ID_STOP_DBENGINE_TIERS].msg = "stop dbengine tiers";
     watcher_steps[WATCHER_STEP_ID_STOP_METASYNC_THREADS].msg = "stop metasync threads";
+    watcher_steps[WATCHER_STEP_ID_STOP_WEBSOCKET_THREADS].msg = "stop websocket threads";
+    watcher_steps[WATCHER_STEP_ID_JOIN_STATIC_THREADS].msg = "join static threads";
     watcher_steps[WATCHER_STEP_ID_CLOSE_SQL_DATABASES].msg = "close SQL databases";
     watcher_steps[WATCHER_STEP_ID_REMOVE_PID_FILE].msg = "remove pid file";
     watcher_steps[WATCHER_STEP_ID_FREE_OPENSSL_STRUCTURES].msg = "free openssl structures";
@@ -187,7 +200,7 @@ void watcher_thread_start() {
     completion_init(&shutdown_begin_completion);
     completion_init(&shutdown_end_completion);
 
-    watcher_thread = nd_thread_create("EXIT_WATCHER", NETDATA_THREAD_OPTION_JOINABLE, watcher_main, NULL);
+    watcher_thread = nd_thread_create("EXIT_WATCHER", NETDATA_THREAD_OPTION_DEFAULT, watcher_main, NULL);
 }
 
 void watcher_thread_stop() {

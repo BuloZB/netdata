@@ -7,9 +7,17 @@
 #endif
 
 RRDHOST *localhost = NULL;
-netdata_rwlock_t rrd_rwlock = NETDATA_RWLOCK_INITIALIZER;
+netdata_rwlock_t rrd_rwlock;
 
-RRDHOST *rrdhost_find_by_node_id(char *node_id) {
+static void __attribute__((constructor)) init_lock(void) {
+    netdata_rwlock_init(&rrd_rwlock);
+}
+
+static void __attribute__((destructor)) destroy_lock(void) {
+    netdata_rwlock_destroy(&rrd_rwlock);
+}
+
+RRDHOST *rrdhost_find_by_node_id(const char *node_id) {
 
     ND_UUID node_uuid;
     if (unlikely(!node_id || uuid_parse(node_id, node_uuid.uuid)))
@@ -781,11 +789,7 @@ void rrdhost_free___while_having_rrd_wrlock(RRDHOST *host) {
     pulse_host_status(host, PULSE_HOST_STATUS_DELETED, 0);
     __atomic_sub_fetch(&netdata_buffers_statistics.rrdhost_allocations_size, sizeof(RRDHOST), __ATOMIC_RELAXED);
 
-    if (host == localhost)
-        health_plugin_destroy();
-
     freez(host->cache_dir);
-    rrdhost_stream_parents_free(host, false);
     simple_pattern_free(host->stream.snd.charts_matching);
     rrdhost_system_info_free(host->system_info);
 

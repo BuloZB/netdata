@@ -120,7 +120,10 @@ static void claim_add_user_info_command(BUFFER *wb) {
     os_message = "We need to verify this Windows server is yours. So, open a Command Prompt on this server to run the command. It will give you a UUID. Copy and paste this UUID to this box:";
 #else
     os_filename = filename;
-    os_prefix = "sudo cat";
+    if (localhost_is_docker())
+        os_prefix = "docker exec netdata cat";
+    else
+        os_prefix = "sudo cat";
     os_message = "We need to verify this server is yours. SSH to this server and run this command. It will give you a UUID. Copy and paste this UUID to this box:";
 #endif
 
@@ -155,7 +158,7 @@ static int claim_json_response(BUFFER *wb, CLAIM_RESPONSE response, const char *
         claim_add_user_info_command(wb);
     }
 
-    buffer_json_agents_v2(wb, NULL, now_s, false, false);
+    buffer_json_agents_v2(wb, NULL, now_s, false, false, 0);
     buffer_json_finalize(wb);
 
     return (response == CLAIM_RESP_ERROR) ? HTTP_RESP_BAD_REQUEST : HTTP_RESP_OK;

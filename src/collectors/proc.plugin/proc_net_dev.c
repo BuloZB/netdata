@@ -6,7 +6,7 @@
 #define PLUGIN_PROC_MODULE_NETDEV_NAME "/proc/net/dev"
 #define CONFIG_SECTION_PLUGIN_PROC_NETDEV "plugin:" PLUGIN_PROC_CONFIG_NAME ":" PLUGIN_PROC_MODULE_NETDEV_NAME
 
-#define RRDFUNCTIONS_NETDEV_HELP "View network interface statistics"
+#define RRDFUNCTIONS_NETDEV_HELP "Shows real-time network interface performance including traffic rates, packet counts, drops, and link status."
 
 #define STATE_LENGTH_MAX 32
 
@@ -317,68 +317,81 @@ static void netdev_charts_release(struct netdev *d) {
 }
 
 static void netdev_free_chart_strings(struct netdev *d) {
-    freez((void *)d->chart_type_net_bytes);
-    freez((void *)d->chart_type_net_compressed);
-    freez((void *)d->chart_type_net_drops);
-    freez((void *)d->chart_type_net_errors);
-    freez((void *)d->chart_type_net_events);
-    freez((void *)d->chart_type_net_fifo);
-    freez((void *)d->chart_type_net_packets);
-    freez((void *)d->chart_type_net_speed);
-    freez((void *)d->chart_type_net_duplex);
-    freez((void *)d->chart_type_net_operstate);
-    freez((void *)d->chart_type_net_carrier);
-    freez((void *)d->chart_type_net_mtu);
+    freez_and_set_to_null(d->chart_type_net_bytes);
+    freez_and_set_to_null(d->chart_type_net_compressed);
+    freez_and_set_to_null(d->chart_type_net_drops);
+    freez_and_set_to_null(d->chart_type_net_errors);
+    freez_and_set_to_null(d->chart_type_net_events);
+    freez_and_set_to_null(d->chart_type_net_fifo);
+    freez_and_set_to_null(d->chart_type_net_packets);
+    freez_and_set_to_null(d->chart_type_net_speed);
+    freez_and_set_to_null(d->chart_type_net_duplex);
+    freez_and_set_to_null(d->chart_type_net_operstate);
+    freez_and_set_to_null(d->chart_type_net_carrier);
+    freez_and_set_to_null(d->chart_type_net_mtu);
 
-    freez((void *)d->chart_id_net_bytes);
-    freez((void *)d->chart_id_net_compressed);
-    freez((void *)d->chart_id_net_drops);
-    freez((void *)d->chart_id_net_errors);
-    freez((void *)d->chart_id_net_events);
-    freez((void *)d->chart_id_net_fifo);
-    freez((void *)d->chart_id_net_packets);
-    freez((void *)d->chart_id_net_speed);
-    freez((void *)d->chart_id_net_duplex);
-    freez((void *)d->chart_id_net_operstate);
-    freez((void *)d->chart_id_net_carrier);
-    freez((void *)d->chart_id_net_mtu);
+    freez_and_set_to_null(d->chart_id_net_bytes);
+    freez_and_set_to_null(d->chart_id_net_compressed);
+    freez_and_set_to_null(d->chart_id_net_drops);
+    freez_and_set_to_null(d->chart_id_net_errors);
+    freez_and_set_to_null(d->chart_id_net_events);
+    freez_and_set_to_null(d->chart_id_net_fifo);
+    freez_and_set_to_null(d->chart_id_net_packets);
+    freez_and_set_to_null(d->chart_id_net_speed);
+    freez_and_set_to_null(d->chart_id_net_duplex);
+    freez_and_set_to_null(d->chart_id_net_operstate);
+    freez_and_set_to_null(d->chart_id_net_carrier);
+    freez_and_set_to_null(d->chart_id_net_mtu);
 
-    freez((void *)d->chart_ctx_net_bytes);
-    freez((void *)d->chart_ctx_net_compressed);
-    freez((void *)d->chart_ctx_net_drops);
-    freez((void *)d->chart_ctx_net_errors);
-    freez((void *)d->chart_ctx_net_events);
-    freez((void *)d->chart_ctx_net_fifo);
-    freez((void *)d->chart_ctx_net_packets);
-    freez((void *)d->chart_ctx_net_speed);
-    freez((void *)d->chart_ctx_net_duplex);
-    freez((void *)d->chart_ctx_net_operstate);
-    freez((void *)d->chart_ctx_net_carrier);
-    freez((void *)d->chart_ctx_net_mtu);
+    freez_and_set_to_null(d->chart_ctx_net_bytes);
+    freez_and_set_to_null(d->chart_ctx_net_compressed);
+    freez_and_set_to_null(d->chart_ctx_net_drops);
+    freez_and_set_to_null(d->chart_ctx_net_errors);
+    freez_and_set_to_null(d->chart_ctx_net_events);
+    freez_and_set_to_null(d->chart_ctx_net_fifo);
+    freez_and_set_to_null(d->chart_ctx_net_packets);
+    freez_and_set_to_null(d->chart_ctx_net_speed);
+    freez_and_set_to_null(d->chart_ctx_net_duplex);
+    freez_and_set_to_null(d->chart_ctx_net_operstate);
+    freez_and_set_to_null(d->chart_ctx_net_carrier);
+    freez_and_set_to_null(d->chart_ctx_net_mtu);
 
-    freez((void *)d->chart_family);
+    freez_and_set_to_null(d->chart_family);
 }
 
 static void netdev_free(struct netdev *d) {
     netdev_charts_release(d);
     netdev_free_chart_strings(d);
-    rrdlabels_destroy(d->chart_labels);
-    cgroup_netdev_release(d->cgroup_netdev_link);
 
-    freez((void *)d->name);
-    freez((void *)d->filename_speed);
-    freez((void *)d->filename_duplex);
-    freez((void *)d->filename_operstate);
-    freez((void *)d->filename_carrier);
-    freez((void *)d->filename_mtu);
+    rrdlabels_destroy(d->chart_labels);
+    d->chart_labels = NULL;
+
+    cgroup_netdev_release(d->cgroup_netdev_link);
+    d->cgroup_netdev_link = NULL;
+
+    freez_and_set_to_null(d->name);
+    freez_and_set_to_null(d->filename_speed);
+    freez_and_set_to_null(d->filename_duplex);
+    freez_and_set_to_null(d->filename_operstate);
+    freez_and_set_to_null(d->filename_carrier);
+    freez_and_set_to_null(d->filename_mtu);
+
     freez((void *)d);
 }
 
-static netdata_mutex_t netdev_mutex = NETDATA_MUTEX_INITIALIZER;
+static netdata_mutex_t netdev_mutex;
+
+static void __attribute__((constructor)) init_mutex(void) {
+    netdata_mutex_init(&netdev_mutex);
+}
+
+static void __attribute__((destructor)) destroy_mutex(void) {
+    netdata_mutex_destroy(&netdev_mutex);
+}
 
 // ----------------------------------------------------------------------------
 
-static inline void netdev_rename(struct netdev *d, struct rename_task *r) {
+static inline void netdev_rename_unsafe(struct netdev *d, struct rename_task *r) {
     collector_info("CGROUP: renaming network interface '%s' as '%s' under '%s'", d->name, r->container_device, r->container_name);
 
     netdev_charts_release(d);
@@ -467,7 +480,9 @@ static void netdev_rename_this_device(struct netdev *d) {
     const DICTIONARY_ITEM *item = dictionary_get_and_acquire_item(netdev_renames, d->name);
     if(item) {
         struct rename_task *r = dictionary_acquired_item_value(item);
-        netdev_rename(d, r);
+        spinlock_lock(&r->spinlock);
+        netdev_rename_unsafe(d, r);
+        spinlock_unlock(&r->spinlock);
         dictionary_acquired_item_release(netdev_renames, item);
     }
 }
@@ -1685,10 +1700,18 @@ static void netdev_main_cleanup(void *pptr) {
     if(CLEANUP_FUNCTION_GET_PTR(pptr) != (void *)0x01)
         return;
 
+    netdata_mutex_lock(&netdev_mutex);
+    while(netdev_root) {
+        struct netdev *d = netdev_root;
+        DOUBLE_LINKED_LIST_REMOVE_ITEM_UNSAFE(netdev_root, d, prev, next);
+        netdev_free(d);
+    }
+    netdata_mutex_unlock(&netdev_mutex);
+
     worker_unregister();
 }
 
-void *netdev_main(void *ptr_is_null __maybe_unused)
+void netdev_main(void *ptr_is_null __maybe_unused)
 {
     CLEANUP_FUNCTION_REGISTER(netdev_main_cleanup) cleanup_ptr = (void *)0x01;
 
@@ -1723,6 +1746,4 @@ void *netdev_main(void *ptr_is_null __maybe_unused)
             break;
         netdata_mutex_unlock(&netdev_mutex);
     }
-
-    return NULL;
 }

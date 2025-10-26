@@ -26,6 +26,7 @@ func (c *Collector) collect() (map[string]int64, error) {
 		c.Cleanup(context.Background())
 		return nil, err
 	}
+	c.Debugf("apcupsd response: %s", string(resp))
 
 	mx := make(map[string]int64)
 
@@ -129,7 +130,7 @@ func battdateSecondsAgo(battdate string) (int64, error) {
 		return 0, err
 	}
 
-	secsAgo := int64(time.Now().Sub(date).Seconds())
+	secsAgo := int64(time.Since(date).Seconds())
 
 	return secsAgo, nil
 }

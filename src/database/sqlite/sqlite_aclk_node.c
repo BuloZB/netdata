@@ -25,13 +25,13 @@ DICTIONARY *collectors_from_charts(RRDHOST *host, DICTIONARY *dict) {
 
 static void build_node_collectors(RRDHOST *host)
 {
-    struct aclk_sync_cfg_t *wc = host->aclk_config;
+    struct aclk_sync_cfg_t *aclk_host_config = host->aclk_host_config;
 
     struct update_node_collectors upd_node_collectors;
     DICTIONARY *dict = dictionary_create(DICT_OPTION_SINGLE_THREADED);
 
     CLAIM_ID claim_id = claim_id_get();
-    upd_node_collectors.node_id = wc->node_id;
+    upd_node_collectors.node_id = aclk_host_config->node_id;
     upd_node_collectors.claim_id = claim_id_is_set(claim_id) ? claim_id.str : NULL;
 
     upd_node_collectors.node_collectors = collectors_from_charts(host, dict);
@@ -41,19 +41,19 @@ static void build_node_collectors(RRDHOST *host)
 
     nd_log(NDLS_ACCESS, NDLP_DEBUG,
            "ACLK RES [%s (%s)]: NODE COLLECTORS SENT",
-           wc->node_id, rrdhost_hostname(host));
+        aclk_host_config->node_id, rrdhost_hostname(host));
 }
 
 static void build_node_info(RRDHOST *host)
 {
     struct update_node_info node_info;
 
-    struct aclk_sync_cfg_t *wc = host->aclk_config;
+    struct aclk_sync_cfg_t *aclk_host_config = host->aclk_host_config;
 
     CLAIM_ID claim_id = claim_id_get();
 
     rrd_rdlock();
-    node_info.node_id = wc->node_id;
+    node_info.node_id = aclk_host_config->node_id;
     node_info.claim_id = claim_id_is_set(claim_id) ? claim_id.str : NULL;
     node_info.machine_guid = host->machine_guid;
     node_info.child = (host != localhost);
@@ -65,7 +65,9 @@ static void build_node_info(RRDHOST *host)
     now_realtime_timeval(&node_info.updated_at);
 
     char *host_version = NULL;
-    if (host != localhost)
+    bool is_virtual_host = (rrdhost_option_check(host, RRDHOST_OPTION_VIRTUAL_HOST) || IS_VIRTUAL_HOST_OS(host));
+
+    if (host != localhost && !is_virtual_host)
         host_version = stream_receiver_program_version_strdupz(host);
 
     node_info.data.name = rrdhost_hostname(host);
@@ -85,7 +87,7 @@ static void build_node_info(RRDHOST *host)
         NDLS_ACCESS,
         NDLP_DEBUG,
         "ACLK RES [%s (%s)]: NODE INFO SENT for guid [%s] (%s)",
-        wc->node_id,
+        aclk_host_config->node_id,
         rrdhost_hostname(host),
         host->machine_guid,
         host == localhost ? "parent" : "child");
@@ -94,7 +96,7 @@ static void build_node_info(RRDHOST *host)
     freez(node_info.node_instance_capabilities);
     freez(host_version);
 
-    wc->node_collectors_send = now_realtime_sec();
+    aclk_host_config->node_collectors_send = now_realtime_sec();
 }
 
 void aclk_check_node_info_and_collectors(void)
@@ -121,8 +123,8 @@ void aclk_check_node_info_and_collectors(void)
     time_t now = now_realtime_sec();
     dfe_start_reentrant(rrdhost_root_index, host)
     {
-        struct aclk_sync_cfg_t *wc = host->aclk_config;
-        if (unlikely(!wc))
+        struct aclk_sync_cfg_t *aclk_host_config = host->aclk_host_config;
+        if (unlikely(!aclk_host_config))
             continue;
 
         if (unlikely(rrdhost_flag_check(host, RRDHOST_FLAG_PENDING_CONTEXT_LOAD))) {
@@ -132,7 +134,7 @@ void aclk_check_node_info_and_collectors(void)
             continue;
         }
 
-        if (!wc->node_info_send_time && !wc->node_collectors_send)
+        if (!aclk_host_config->node_info_send_time && !aclk_host_config->node_collectors_send)
             continue;
 
         if (unlikely(rrdhost_receiver_replicating_charts(host))) {
@@ -154,24 +156,26 @@ void aclk_check_node_info_and_collectors(void)
         if(replicating_rcv)
             continue;
 
-        bool pp_queue_empty = !(host->rrdctx.pp_queue && dictionary_entries(host->rrdctx.pp_queue));
+        bool pp_queue_empty = !rrdcontext_queue_entries(&host->rrdctx.pp_queue);
 
-        if (!pp_queue_empty && (wc->node_info_send_time || wc->node_collectors_send)) {
+        if (!pp_queue_empty && (aclk_host_config->node_info_send_time || aclk_host_config->node_collectors_send)) {
             context_pp++;
             context_pp_host = host->hostname;
         }
 
-        if (pp_queue_empty && wc->node_info_send_time && wc->node_info_send_time + 30 < now) {
-            wc->node_info_send_time = 0;
+        if (pp_queue_empty && aclk_host_config->node_info_send_time &&
+            aclk_host_config->node_info_send_time + 30 < now) {
+            aclk_host_config->node_info_send_time = 0;
             build_node_info(host);
             schedule_node_state_update(host, 10000);
             internal_error(true, "ACLK SYNC: Sending node info for %s", rrdhost_hostname(host));
         }
 
-        if (pp_queue_empty && wc->node_collectors_send && wc->node_collectors_send + 30 < now) {
+        if (pp_queue_empty && aclk_host_config->node_collectors_send &&
+            aclk_host_config->node_collectors_send + 30 < now) {
             build_node_collectors(host);
             internal_error(true, "ACLK SYNC: Sending collectors for %s", rrdhost_hostname(host));
-            wc->node_collectors_send = 0;
+            aclk_host_config->node_collectors_send = 0;
         }
     }
     dfe_done(host);
@@ -180,8 +184,8 @@ void aclk_check_node_info_and_collectors(void)
 #ifdef REPLICATION_TRACKING
         char replay_counters_txt[1024];
         snprintfz(replay_counters_txt, sizeof(replay_counters_txt),
-                  " - REPLAY WHO RCV { %zu unknown, %zu me, %zu them, %zu finished } - "
-                  "REPLAY WHO SND { %zu unknown, %zu me, %zu them, %zu finished }",
+            " - REPLAY WHO RCV { %zu unknown, %zu me, %zu them, %zu finished } - "
+            "REPLAY WHO SND { %zu unknown, %zu me, %zu them, %zu finished }",
                   replay_counters.rcv[REPLAY_WHO_UNKNOWN], replay_counters.rcv[REPLAY_WHO_ME], replay_counters.rcv[REPLAY_WHO_THEM], replay_counters.rcv[REPLAY_WHO_FINISHED],
                   replay_counters.snd[REPLAY_WHO_UNKNOWN], replay_counters.snd[REPLAY_WHO_ME], replay_counters.snd[REPLAY_WHO_THEM], replay_counters.snd[REPLAY_WHO_FINISHED]
         );
@@ -195,21 +199,21 @@ void aclk_check_node_info_and_collectors(void)
             context_loading_body = string2str(context_loading_host);
             context_loading_post = "')";
         }
-        
+
         const char *replicating_rcv_pre = "", *replicating_rcv_body = "", *replicating_rcv_post = "";
         if(replicating_rcv == 1) {
             replicating_rcv_pre = " (host '";
             replicating_rcv_body = string2str(replicating_rcv_host);
             replicating_rcv_post = "')";
         }
-        
+
         const char *replicating_snd_pre = "", *replicating_snd_body = "", *replicating_snd_post = "";
         if(replicating_snd == 1) {
             replicating_snd_pre = " (host '";
             replicating_snd_body = string2str(replicating_snd_host);
             replicating_snd_post = "')";
         }
-        
+
         const char *context_pp_pre = "", *context_pp_body = "", *context_pp_post = "";
         if(context_pp == 1) {
             context_pp_pre = " (host '";
@@ -219,7 +223,7 @@ void aclk_check_node_info_and_collectors(void)
 
         nd_log_limit_static_global_var(erl, 10, 100 * USEC_PER_MS);
         nd_log_limit(&erl, NDLS_DAEMON, NDLP_INFO,
-                     "NODES INFO: %zu nodes loading contexts%s%s%s, %zu receiving replication%s%s%s, %zu sending replication%s%s%s, %zu pending context post processing%s%s%s%s",
+            "NODES INFO: %zu nodes loading contexts%s%s%s, %zu receiving replication%s%s%s, %zu sending replication%s%s%s, %zu pending context post processing%s%s%s%s",
                      context_loading, context_loading_pre, context_loading_body, context_loading_post,
                      replicating_rcv, replicating_rcv_pre, replicating_rcv_body, replicating_rcv_post,
                      replicating_snd, replicating_snd_pre, replicating_snd_body, replicating_snd_post,

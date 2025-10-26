@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/netdata/netdata/go/plugins/pkg/confopt"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/confopt"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/iprange"
 )
 
@@ -40,11 +40,12 @@ func New() *Collector {
 }
 
 type Config struct {
-	Vnode        string           `yaml:"vnode,omitempty" json:"vnode"`
-	UpdateEvery  int              `yaml:"update_every,omitempty" json:"update_every"`
-	Address      string           `yaml:"address" json:"address"`
-	Timeout      confopt.Duration `yaml:"timeout,omitempty" json:"timeout"`
-	CollectPeers bool             `yaml:"collect_peers" json:"collect_peers"`
+	Vnode              string           `yaml:"vnode,omitempty" json:"vnode"`
+	UpdateEvery        int              `yaml:"update_every,omitempty" json:"update_every"`
+	AutoDetectionRetry int              `yaml:"autodetection_retry,omitempty" json:"autodetection_retry"`
+	Address            string           `yaml:"address" json:"address"`
+	Timeout            confopt.Duration `yaml:"timeout,omitempty" json:"timeout"`
+	CollectPeers       bool             `yaml:"collect_peers" json:"collect_peers"`
 }
 
 type Collector struct {
@@ -60,7 +61,7 @@ type Collector struct {
 	findPeersEvery   time.Duration
 	peerAddr         map[string]bool
 	peerIDs          []uint16
-	peerIPAddrFilter iprange.Pool
+	peerIPAddrFilter *iprange.Pool
 }
 
 func (c *Collector) Configuration() any {
@@ -78,7 +79,7 @@ func (c *Collector) Init(context.Context) error {
 		return fmt.Errorf("error on parsing ip range '%s': %v", txt, err)
 	}
 
-	c.peerIPAddrFilter = r
+	c.peerIPAddrFilter = iprange.NewPool(r...)
 
 	return nil
 }

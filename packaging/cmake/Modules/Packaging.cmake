@@ -9,6 +9,7 @@ else()
 endif()
 
 set(CPACK_THREADS 0)
+set(CPACK_COMPONENTS_GROUPING IGNORE)
 
 set(CPACK_STRIP_FILES NO)
 set(CPACK_DEBIAN_DEBUGINFO_PACKAGE NO)
@@ -55,9 +56,9 @@ set(CPACK_DEBIAN_NETDATA_PACKAGE_NAME "netdata")
 set(CPACK_DEBIAN_NETDATA_PACKAGE_SECTION "net")
 set(CPACK_DEBIAN_NETDATA_PACKAGE_PREDEPENDS "adduser, libcap2-bin")
 set(CPACK_DEBIAN_NETDATA_PACKAGE_SUGGESTS
-		"netdata-plugin-cups, netdata-plugin-freeipmi")
+		"netdata-plugin-cups, netdata-plugin-freeipmi, netdata-plugin-ibm")
 set(CPACK_DEBIAN_NETDATA_PACKAGE_RECOMMENDS
-		"netdata-plugin-systemd-journal, \
+		"netdata-plugin-systemd-journal, netdata-plugin-systemd-units, \
 netdata-plugin-network-viewer")
 set(CPACK_DEBIAN_NETDATA_PACKAGE_CONFLICTS
 		"netdata-core, netdata-plugins-bash, netdata-plugins-python, netdata-web")
@@ -308,10 +309,50 @@ set(CPACK_DEBIAN_PLUGIN-GO_PACKAGE_CONTROL_EXTRA
 set(CPACK_DEBIAN_PLUGIN-GO_DEBUGINFO_PACKAGE Off)
 
 #
+# ibm.plugin
+#
+
+set(CPACK_COMPONENT_PLUGIN-IBM_DEPENDS "netdata")
+set(CPACK_COMPONENT_PLUGIN-IBM_DESCRIPTION
+		"The IBM ecosystem metrics collection plugin for the Netdata Agent
+ This plugin allows the Netdata Agent to collect metrics from IBM
+ systems including AS/400 (IBM i), DB2 databases, MQ queues, and WebSphere
+ application servers. Database collectors use unixODBC and require appropriate
+ ODBC drivers.")
+
+set(CPACK_DEBIAN_PLUGIN-IBM_PACKAGE_NAME "netdata-plugin-ibm")
+set(CPACK_DEBIAN_PLUGIN-IBM_PACKAGE_SECTION "net")
+set(CPACK_DEBIAN_PLUGIN-IBM_PACKAGE_CONFLICTS "netdata (<< 1.40)")
+set(CPACK_DEBIAN_PLUGIN-IBM_PACKAGE_PREDEPENDS "adduser")
+set(CPACK_DEBIAN_PLUGIN-IBM_PACKAGE_DEPENDS "unixodbc, netdata-plugin-ibm-libs (= ${CPACK_PACKAGE_VERSION})")
+set(CPACK_DEBIAN_PLUGIN-IBM_PACKAGE_SUGGESTS "libxml2")
+
+set(CPACK_DEBIAN_PLUGIN-IBM_PACKAGE_CONTROL_EXTRA
+	  "${PKG_FILES_PATH}/deb/plugin-ibm/preinst;"
+	  "${PKG_FILES_PATH}/deb/plugin-ibm/postinst")
+
+set(CPACK_DEBIAN_PLUGIN-IBM_DEBUGINFO_PACKAGE Off)
+
+set(CPACK_DEBIAN_PLUGIN-IBM-LIBS_DESCRIPTION
+		"IBM MQ client libraries for the Netdata IBM ecosystem metrics collection plugin.
+ This package provides the IBM MQ client libraries needed by Netdata IBM
+ ecosystem metrics collection plugin.")
+
+set(CPACK_DEBIAN_PLUGIN-IBM-LIBS_PACKAGE_NAME "netdata-plugin-ibm-libs")
+set(CPACK_DEBIAN_PLUGIN-IBM-LIBS_PACKAGE_SECTION "net")
+set(CPACK_DEBIAN_PLUGIN-IBM-LIBS_PACKAGE_CONFLICTS "netdata (<< 1.40)")
+set(CPACK_DEBIAN_PLUGIN-IBM-LIBS_PACKAGE_PREDEPENDS "adduser")
+
+set(CPACK_DEBIAN_PLUGIN-IBM-LIBS_PACKAGE_CONTROL_EXTRA
+	  "${PKG_FILES_PATH}/deb/plugin-ibm-libs/preinst")
+
+set(CPACK_DEBIAN_PLUGIN-IBM-LIBS_DEBUGINFO_PACKAGE Off)
+set(CPACK_DEBIAN_PLUGIN-IBM-LIBS_PACKAGE_SHLIBDEPS Off)
+
+#
 # network-viewer.plugin
 #
 
-# TODO: recommends netdata-plugin-ebpf
 set(CPACK_COMPONENT_PLUGIN-NETWORK-VIEWER_DEPENDS "netdata")
 set(CPACK_COMPONENT_PLUGIN-NETWORK-VIEWER_DESCRIPTION
 		"The network viewer plugin for the Netdata Agent
@@ -328,6 +369,28 @@ set(CPACK_DEBIAN_PLUGIN-NETWORK-VIEWER_PACKAGE_CONTROL_EXTRA
 	  "${PKG_FILES_PATH}/deb/plugin-network-viewer/postinst")
 
 set(CPACK_DEBIAN_PLUGIN-NETWORK-VIEWER_DEBUGINFO_PACKAGE On)
+
+#
+# otel.plugin
+#
+
+set(CPACK_COMPONENT_PLUGIN-OTEL_DEPENDS "netdata")
+set(CPACK_COMPONENT_PLUGIN-OTEL_DESCRIPTION
+		"The OpenTelemetry collection plugin for the Netdata Agent
+ This plugin allows the Netdata Agent to collect metrics and logs via
+ OpenTelemetry gRPC protocol, providing integration with modern observability
+ stacks.")
+
+set(CPACK_DEBIAN_PLUGIN-OTEL_PACKAGE_NAME "netdata-plugin-otel")
+set(CPACK_DEBIAN_PLUGIN-OTEL_PACKAGE_SECTION "net")
+set(CPACK_DEBIAN_PLUGIN-OTEL_PACKAGE_CONFLICTS "netdata (<< 1.40)")
+set(CPACK_DEBIAN_PLUGIN-OTEL_PACKAGE_PREDEPENDS "adduser")
+
+set(CPACK_DEBIAN_PLUGIN-OTEL_PACKAGE_CONTROL_EXTRA
+	  "${PKG_FILES_PATH}/deb/plugin-otel/preinst;"
+	  "${PKG_FILES_PATH}/deb/plugin-otel/postinst")
+
+set(CPACK_DEBIAN_PLUGIN-OTEL_DEBUGINFO_PACKAGE Off)
 
 #
 # nfacct.plugin
@@ -415,7 +478,7 @@ set(CPACK_DEBIAN_PLUGIN-SLABINFO_PACKAGE_CONTROL_EXTRA
 	  "${PKG_FILES_PATH}/deb/plugin-slabinfo/preinst;"
 	  "${PKG_FILES_PATH}/deb/plugin-slabinfo/postinst")
 
-set(CPACK_DEBIAN_PLUGIN-SLABINFO_DEBUGINFO_PACKAGE On)
+set(CPACK_DEBIAN_PLUGIN-SLABINFO-DEBUGINFO_PACKAGE On)
 
 #
 # systemd-journal.plugin
@@ -435,7 +498,26 @@ set(CPACK_DEBIAN_PLUGIN-SYSTEMD-JOURNAL_PACKAGE_CONTROL_EXTRA
 	  "${PKG_FILES_PATH}/deb/plugin-systemd-journal/preinst;"
 	  "${PKG_FILES_PATH}/deb/plugin-systemd-journal/postinst")
 
-set(CPACK_DEBIAN_PLUGIN-SYSTEMD_JOURNAL_DEBUGINFO_PACKAGE On)
+set(CPACK_DEBIAN_PLUGIN-SYSTEMD-JOURNAL_DEBUGINFO_PACKAGE On)
+
+#
+# systemd-units.plugin
+#
+
+set(CPACK_COMPONENT_PLUGIN-SYSTEMD-UNITS_DEPENDS "netdata")
+set(CPACK_COMPONENT_PLUGIN-SYSTEMD-UNITS_DESCRIPTION
+		"The systemd-units collector for the Netdata Agent
+ This plugin allows the Netdata Agent to collect metrics about systmed units.")
+
+set(CPACK_DEBIAN_PLUGIN-SYSTEMD-UNITS_PACKAGE_NAME "netdata-plugin-systemd-units")
+set(CPACK_DEBIAN_PLUGIN-SYSTEMD-UNITS_PACKAGE_SECTION "net")
+set(CPACK_DEBIAN_PLUGIN-SYSTEMD-UNITS_PACKAGE_PREDEPENDS "adduser")
+
+set(CPACK_DEBIAN_PLUGIN-SYSTEMD-UNITS_PACKAGE_CONTROL_EXTRA
+	  "${PKG_FILES_PATH}/deb/plugin-systemd-units/preinst;"
+	  "${PKG_FILES_PATH}/deb/plugin-systemd-units/postinst")
+
+set(CPACK_DEBIAN_PLUGIN-SYSTEMD_UNITS_DEBUGINFO_PACKAGE On)
 
 #
 # xenstat.plugin
@@ -490,6 +572,10 @@ endif()
 if(ENABLE_PLUGIN_GO)
         list(APPEND CPACK_COMPONENTS_ALL "plugin-go")
 endif()
+if(ENABLE_PLUGIN_IBM)
+  list(APPEND CPACK_COMPONENTS_ALL "plugin-ibm")
+  list(APPEND CPACK_COMPONENTS_ALL "plugin-ibm-libs")
+endif()
 if(ENABLE_PLUGIN_NETWORK_VIEWER)
         list(APPEND CPACK_COMPONENTS_ALL "plugin-network-viewer")
 endif()
@@ -510,6 +596,9 @@ if(ENABLE_PLUGIN_SYSTEMD_JOURNAL)
 endif()
 if(ENABLE_PLUGIN_XENSTAT)
         list(APPEND CPACK_COMPONENTS_ALL "plugin-xenstat")
+endif()
+if(ENABLE_PLUGIN_OTEL)
+        list(APPEND CPACK_COMPONENTS_ALL "plugin-otel")
 endif()
 
 include(CPack)

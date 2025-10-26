@@ -6,6 +6,9 @@
 #include "libnetdata/libnetdata.h"
 
 #define HOST_LABEL_IS_EPHEMERAL "_is_ephemeral"
+#define NETDATA_VIRTUAL_HOST "Netdata Virtual Host 1.0"
+
+#define IS_VIRTUAL_HOST_OS(host) (strcmp(string2str(host->os), NETDATA_VIRTUAL_HOST) == 0)
 
 struct stream_thread;
 struct rrdset;
@@ -24,6 +27,14 @@ typedef struct rrdhost_acquired RRDHOST_ACQUIRED;
 //#include "streaming/stream-traffic-types.h"
 #include "rrdlabels.h"
 #include "health/health-alert-log.h"
+
+struct rrdcontext;
+DEFINE_JUDYL_TYPED_ADVANCED(RRDCONTEXT_QUEUE, struct rrdcontext *, JUDYL_TYPED_NO_CONVERSION, JUDYL_TYPED_NO_CONVERSION, \
+                            SPINLOCK spinlock; \
+                            Word_t id; \
+                            uint32_t version; \
+                            int32_t entries; \
+                            );
 
 // ----------------------------------------------------------------------------
 // RRDHOST flags
@@ -130,6 +141,8 @@ struct rrdhost {
     STRING *program_name;                           // the program name that collects metrics for this host
     STRING *program_version;                        // the program version that collects metrics for this host
 
+    uint32_t node_stale_after_seconds;              // vnode stale timeout
+
     OBJECT_STATE state_id;                          // every time data collection (stream receiver) (dis)connects,
                            // this gets incremented - it is used to detect stale functions,
                            // stale backfilling requests, etc.
@@ -217,9 +230,6 @@ struct rrdhost {
 
                 time_t last_connected;              // the time the last sender was connected
                 time_t last_disconnected;           // the time the last sender was disconnected
-                time_t last_chart;                  // the time of the last CHART streaming command
-                bool check_obsolete;                // set when child connects, will instruct parent to
-                                                    // trigger a check for obsoleted charts since previous connect
 
                 uint32_t connections;               // the number of times this receiver has connected
                 STREAM_HANDSHAKE reason;            // the last receiver exit reason
@@ -253,7 +263,7 @@ struct rrdhost {
 
     // ------------------------------------------------------------------------
 
-    struct aclk_sync_cfg_t *aclk_config;
+    struct aclk_sync_cfg_t *aclk_host_config;
 
     // ------------------------------------------------------------------------
     // health monitoring options
@@ -304,8 +314,8 @@ struct rrdhost {
 
     struct {
         DICTIONARY *contexts;
-        DICTIONARY *hub_queue;
-        DICTIONARY *pp_queue;
+        RRDCONTEXT_QUEUE_JudyLSet pp_queue;
+        RRDCONTEXT_QUEUE_JudyLSet hub_queue;
         uint32_t metrics_count;                     // atomic
         uint32_t instances_count;                   // atomic
         uint32_t contexts_count;                    // atomic
@@ -352,9 +362,12 @@ extern RRDHOST *localhost;
 #define rrdhost_sender_replicating_charts_minus_one(host) (__atomic_sub_fetch(&((host)->stream.snd.status.replication.charts), 1, __ATOMIC_RELAXED))
 #define rrdhost_sender_replicating_charts_zero(host) (__atomic_store_n(&((host)->stream.snd.status.replication.charts), 0, __ATOMIC_RELAXED))
 
+#define rrdhost_is_virtual(host)                                                                                \
+    rrdhost_option_check(host, RRDHOST_OPTION_VIRTUAL_HOST)
+
 #define rrdhost_is_local(host)  ( \
     (host) == localhost ||                                                                                      \
-    rrdhost_option_check(host, RRDHOST_OPTION_VIRTUAL_HOST)                                                     \
+    rrdhost_is_virtual(host)                                                                                    \
     )
 
 #define rrdhost_is_online_flags(flags) ((flags & RRDHOST_FLAG_COLLECTOR_ONLINE) && !(flags & RRDHOST_FLAG_ORPHAN))
@@ -384,7 +397,7 @@ void rrdhost_acquired_release(RRDHOST_ACQUIRED *rha);
 
 RRDHOST *rrdhost_find_by_hostname(const char *hostname);
 RRDHOST *rrdhost_find_by_guid(const char *guid);
-RRDHOST *rrdhost_find_by_node_id(char *node_id);
+RRDHOST *rrdhost_find_by_node_id(const char *node_id);
 
 #ifdef RRDHOST_INTERNALS
 RRDHOST *rrdhost_create(

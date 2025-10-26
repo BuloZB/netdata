@@ -34,6 +34,10 @@ modules:
           - `v$system_wait_class`
           - `dba_data_files`
           - `dba_free_space`
+          - `dba_segments`
+          - `dba_temp_files`
+          - `dba_tablespaces`
+          - `v$temp_space_header`
       default_behavior:
         auto_detection:
           description: |
@@ -78,21 +82,32 @@ modules:
             enabled: true
           list:
             - name: update_every
-              description: Data collection frequency.
+              description: Data collection interval (seconds).
               default_value: 1
               required: false
+              group: Collection
             - name: autodetection_retry
-              description: Recheck interval in seconds. Zero means no recheck will be scheduled.
+              description: Autodetection retry interval (seconds). Set 0 to disable.
               default_value: 0
               required: false
+              group: Collection
+
             - name: dsn
-              description: Oracle server DSN (Data Source Name). Format is `oracle://username:password@host:port/service?param1=value1&...&paramN=valueN`.
+              description: "Oracle server DSN (Data Source Name). Format: `oracle://username:password@host:port/service?param1=value1&...&paramN=valueN`."
               default_value: ""
               required: true
+              group: Target
             - name: timeout
-              description: Query timeout in seconds.
+              description: Query timeout (seconds).
               default_value: 1
               required: false
+              group: Target
+
+            - name: vnode
+              description: Associates this data collection job with a [Virtual Node](https://learn.netdata.cloud/docs/netdata-agent/configuration/organize-systems-metrics-and-alerts#virtual-nodes).
+              default_value: ""
+              required: false
+              group: Virtual Node
         examples:
           folding:
             title: Config
@@ -243,6 +258,8 @@ modules:
           labels:
             - name: tablespace
               description: Tablespace name.
+            - name: autoextend_status
+              description: Autoextend status (enabled, disabled, mixed).
           metrics:
             - name: oracledb.tablespace_utilization
               description: Tablespace Utilization

@@ -28,7 +28,6 @@ add_cmake_option CMAKE_BUILD_TYPE RelWithDebInfo
 add_cmake_option CMAKE_INSTALL_PREFIX /
 add_cmake_option ENABLE_DASHBOARD on
 add_cmake_option ENABLE_DBENGINE On
-add_cmake_option ENABLE_H2O Off
 add_cmake_option ENABLE_ML On
 
 add_cmake_option ENABLE_PLUGIN_APPS On
@@ -40,9 +39,11 @@ add_cmake_option ENABLE_PLUGIN_PYTHON On
 add_cmake_option ENABLE_PLUGIN_CHARTS On
 add_cmake_option ENABLE_PLUGIN_LOCAL_LISTENERS On
 add_cmake_option ENABLE_PLUGIN_NFACCT On
+add_cmake_option ENABLE_PLUGIN_OTEL On
 add_cmake_option ENABLE_PLUGIN_PERF On
 add_cmake_option ENABLE_PLUGIN_SLABINFO On
 add_cmake_option ENABLE_PLUGIN_SYSTEMD_JOURNAL On
+add_cmake_option ENABLE_PLUGIN_SYSTEMD_UNITS On
 
 add_cmake_option ENABLE_EXPORTER_PROMETHEUS_REMOTE_WRITE On
 add_cmake_option ENABLE_EXPORTER_MONGODB On
@@ -61,18 +62,22 @@ case "${PKG_TYPE}" in
             amd64)
                 add_cmake_option ENABLE_PLUGIN_XENSTAT On
                 add_cmake_option ENABLE_PLUGIN_EBPF On
+                add_cmake_option ENABLE_PLUGIN_IBM On
                 ;;
             arm64)
                 add_cmake_option ENABLE_PLUGIN_XENSTAT On
                 add_cmake_option ENABLE_PLUGIN_EBPF Off
+                add_cmake_option ENABLE_PLUGIN_IBM Off
                 ;;
             armhf)
                 add_cmake_option ENABLE_PLUGIN_XENSTAT Off
                 add_cmake_option ENABLE_PLUGIN_EBPF Off
+                add_cmake_option ENABLE_PLUGIN_IBM Off
                 ;;
             *)
                 add_cmake_option ENABLE_PLUGIN_XENSTAT Off
                 add_cmake_option ENABLE_PLUGIN_EBPF Off
+                add_cmake_option ENABLE_PLUGIN_IBM Off
                 ;;
         esac
         ;;

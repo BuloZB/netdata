@@ -44,7 +44,6 @@ The default configuration for this integration does not impose any limits on dat
 
 The default configuration for this integration is not expected to impose a significant performance impact on the system.
 
-
 ## Metrics
 
 Metrics grouped by *scope*.
@@ -82,10 +81,11 @@ The following alerts are available:
 
 | Alert name  | On metric | Description |
 |:------------|:----------|:------------|
-| [ linux_power_supply_capacity ](https://github.com/netdata/netdata/blob/master/src/health/health.d/linux_power_supply.conf) | powersupply.capacity | percentage of remaining power supply capacity |
+| [ power_supply_capacity ](https://github.com/netdata/netdata/blob/master/src/health/health.d/power_supply_capacity.conf) | powersupply.capacity | percentage of remaining power supply capacity |
 
 
 ## Setup
+
 
 ### Prerequisites
 
@@ -93,16 +93,19 @@ No action required.
 
 ### Configuration
 
-#### File
-
-There is no configuration file.
 #### Options
 
 
 
 There are no configuration options.
 
-#### Examples
+
+
+#### via File
+
+There is no configuration file.
+
+##### Examples
 There are no configuration examples.
 
 

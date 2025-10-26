@@ -17,6 +17,8 @@ enum event_loop_job {
     UV_EVENT_DBENGINE_EXTENT_PAGE_LOOKUP,
     UV_EVENT_DBENGINE_EXTENT_PAGE_POPULATION,
     UV_EVENT_DBENGINE_EXTENT_PAGE_ALLOCATION,
+    // Metrics calculation
+    UV_EVENT_WEIGHTS_CALCULATION,
 
     // flushing related
     UV_EVENT_DBENGINE_FLUSH_MAIN_CACHE,
@@ -24,7 +26,6 @@ enum event_loop_job {
     UV_EVENT_DBENGINE_FLUSHED_TO_OPEN,
 
     // datafile full
-    UV_EVENT_DBENGINE_JOURNAL_INDEX_WAIT,
     UV_EVENT_DBENGINE_JOURNAL_INDEX,
 
     // db rotation related
@@ -83,11 +84,74 @@ enum event_loop_job {
     UV_EVENT_CREATE_NODE_INSTANCE,
     UV_EVENT_UNREGISTER_NODE,
 
+    // maintenance
+    UV_EVENT_CLEANUP_OBSOLETE_CHARTS,
+    UV_EVENT_ARCHIVE_CHART_DIMENSIONS,
+    UV_EVENT_ARCHIVE_DIMENSION,
+    UV_EVENT_CLEANUP_ORPHAN_HOSTS,
+    UV_EVENT_CLEANUP_OBSOLETE_CHARTS_ON_HOSTS,
+    UV_EVENT_FREE_HOST,
+    UV_EVENT_FREE_CHART,
+    UV_EVENT_FREE_DIMENSION,
+
     // netdatacli
     UV_EVENT_SCHEDULE_CMD,
 };
 
+#define MAX_ACTIVE_WORKERS (256)
+
+typedef struct worker_data {
+    uv_work_t request;
+    void *config;
+    void *pending_alert_list;
+    void *pending_ctx_cleanup_list;
+    void *pending_uuid_deletion;
+    void *pending_sql_statement;
+    union {
+        void *payload;
+        void *work_buffer;
+    };
+    bool allocated;
+} worker_data_t;
+
+typedef struct {
+    worker_data_t workers[MAX_ACTIVE_WORKERS];  // Preallocated worker data pool
+    int free_stack[MAX_ACTIVE_WORKERS];  // Stack of available worker data indices
+    int top;  // Stack pointer
+} WorkerPool;
+
+typedef struct {
+    uint8_t opcode;
+    uint8_t padding[sizeof(void *) - sizeof(uint8_t)]; // Padding to align the union
+    union {
+        void *param[2];
+        char data[sizeof(void *) * 2];
+    };
+} cmd_data_t;
+
+typedef struct {
+    cmd_data_t *buffer;
+    int size;
+    int head;
+    int tail;
+    int count;
+
+    netdata_mutex_t lock;
+    netdata_cond_t not_full;
+} CmdPool;
+
+
 void register_libuv_worker_jobs();
-int create_uv_thread(uv_thread_t *thread, uv_thread_cb thread_func, void *arg, int *retries);
+void libuv_close_callback(uv_handle_t *handle, void *data __maybe_unused);
+
+void init_worker_pool(WorkerPool *pool);
+worker_data_t *get_worker(WorkerPool *pool);
+void return_worker(WorkerPool *pool, worker_data_t *worker);
+
+void init_cmd_pool(CmdPool *pool, int size);
+bool push_cmd(CmdPool *pool, const cmd_data_t *cmd, bool wait_on_full);
+bool pop_cmd(CmdPool *pool, cmd_data_t *out_cmd);
+void release_cmd_pool(CmdPool *pool);
+int test_cmd_pool_fifo();
 
 #endif //NETDATA_EVENT_LOOP_H

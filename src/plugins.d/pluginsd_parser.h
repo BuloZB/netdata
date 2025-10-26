@@ -57,7 +57,7 @@ typedef struct parser_user_object {
     struct plugind *cd;
     int trust_durations;
     RRDLABELS *new_host_labels;
-    RRDLABELS *chart_rrdlabels_linked_temporarily;
+    size_t clabel_count;
     size_t data_collections_count;
     int enabled;
 
@@ -69,6 +69,7 @@ typedef struct parser_user_object {
 
     struct {
         bool parsing_host;
+        uint32_t node_stale_after_seconds;
         nd_uuid_t machine_guid;
         char machine_guid_str[UUID_STR_LEN];
         STRING *hostname;
@@ -95,6 +96,11 @@ typedef struct parser_user_object {
         time_t wall_clock_time;
         bool ml_locked;
     } v2;
+
+    struct {
+        Pvoid_t JudyL;
+    } vnodes;
+
 } PARSER_USER_OBJECT;
 
 typedef void (*parser_deferred_action_t)(struct parser *parser, void *action_data);
@@ -110,10 +116,6 @@ struct parser {
     ND_SOCK *sock;
     send_to_plugin_callback_t send_to_plugin_cb;
     void *send_to_plugin_data;
-
-#ifdef ENABLE_H2O
-    void *h2o_ctx;                  // if set we use h2o_stream functions to send data
-#endif
 
     PARSER_USER_OBJECT user;        // User defined structure to hold extra state between calls
 

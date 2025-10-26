@@ -13,27 +13,27 @@
 struct ml_queue_t;
 
 typedef struct machine_learning_stats_t {
-    size_t num_machine_learning_status_enabled;
-    size_t num_machine_learning_status_disabled_sp;
+    uint32_t num_machine_learning_status_enabled;
+    uint32_t num_machine_learning_status_disabled_sp;
 
-    size_t num_metric_type_constant;
-    size_t num_metric_type_variable;
+    uint32_t num_metric_type_constant;
+    uint32_t num_metric_type_variable;
 
-    size_t num_training_status_untrained;
-    size_t num_training_status_pending_without_model;
-    size_t num_training_status_trained;
-    size_t num_training_status_pending_with_model;
-    size_t num_training_status_silenced;
+    uint32_t num_training_status_untrained;
+    uint32_t num_training_status_pending_without_model;
+    uint32_t num_training_status_trained;
+    uint32_t num_training_status_pending_with_model;
+    uint32_t num_training_status_silenced;
 
-    size_t num_anomalous_dimensions;
-    size_t num_normal_dimensions;
+    uint32_t num_anomalous_dimensions;
+    uint32_t num_normal_dimensions;
 } ml_machine_learning_stats_t;
 
 typedef struct {
     RRDDIM *rd;
-    size_t normal_dimensions;
-    size_t anomalous_dimensions;
-} ml_type_anomaly_rate_t;
+    uint32_t normal_dimensions;
+    uint32_t anomalous_dimensions;
+} ml_context_anomaly_rate_t;
 
 typedef struct {
     RRDHOST *rh;
@@ -81,9 +81,11 @@ typedef struct {
     RRDDIM *detector_events_above_threshold_rd;
     RRDDIM *detector_events_new_anomaly_event_rd;
 
-    RRDSET *type_anomaly_rate_rs;
-    SPINLOCK type_anomaly_rate_spinlock;
-    std::unordered_map<STRING *, ml_type_anomaly_rate_t> type_anomaly_rate;
+    RRDSET *context_anomaly_rate_rs;
+    SPINLOCK context_anomaly_rate_spinlock;
+    std::unordered_map<STRING *, ml_context_anomaly_rate_t> context_anomaly_rate;
+
+    bool reset_pointers;
 } ml_host_t;
 
 #endif /* NETDATA_ML_HOST_H */

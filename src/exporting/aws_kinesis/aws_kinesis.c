@@ -58,9 +58,9 @@ int init_aws_kinesis_instance(struct instance *instance)
                           instance->config.name);
         return 1;
     }
-    if (uv_mutex_init(&instance->mutex))
+    if (netdata_mutex_init(&instance->mutex))
         return 1;
-    if (uv_cond_init(&instance->cond_var))
+    if (netdata_cond_init(&instance->cond_var))
         return 1;
 
     if (!instance->engine->aws_sdk_initialized) {
@@ -94,27 +94,23 @@ int init_aws_kinesis_instance(struct instance *instance)
  *
  * @param instance_p an instance data structure.
  */
-void aws_kinesis_connector_worker(void *instance_p)
+void *aws_kinesis_connector_worker(void *instance_p)
 {
     struct instance *instance = (struct instance *)instance_p;
     struct aws_kinesis_specific_config *connector_specific_config = instance->config.connector_specific_config;
     struct aws_kinesis_specific_data *connector_specific_data = instance->connector_specific_data;
 
-    char threadname[ND_THREAD_TAG_MAX + 1];
-    snprintfz(threadname, ND_THREAD_TAG_MAX, "EXPKNSS[%zu]", instance->index);
-    uv_thread_set_name_np(threadname);
-
     while (!instance->engine->exit) {
         unsigned long long partition_key_seq = 0;
         struct stats *stats = &instance->stats;
 
-        uv_mutex_lock(&instance->mutex);
+        netdata_mutex_lock(&instance->mutex);
         while (!instance->data_is_ready)
-            uv_cond_wait(&instance->cond_var, &instance->mutex);
+            netdata_cond_wait(&instance->cond_var, &instance->mutex);
         instance->data_is_ready = 0;
 
         if (unlikely(instance->engine->exit)) {
-            uv_mutex_unlock(&instance->mutex);
+            netdata_mutex_unlock(&instance->mutex);
             break;
         }
 
@@ -212,7 +208,7 @@ void aws_kinesis_connector_worker(void *instance_p)
 
         stats->buffered_metrics = 0;
 
-        uv_mutex_unlock(&instance->mutex);
+        netdata_mutex_unlock(&instance->mutex);
 
 #ifdef UNIT_TESTING
         return;
@@ -220,4 +216,5 @@ void aws_kinesis_connector_worker(void *instance_p)
     }
 
     aws_kinesis_cleanup(instance);
+    return NULL;
 }

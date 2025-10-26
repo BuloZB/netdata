@@ -7,10 +7,10 @@ import (
 	_ "embed"
 	"time"
 
+	"github.com/netdata/netdata/go/plugins/pkg/confopt"
 	"github.com/netdata/netdata/go/plugins/pkg/matcher"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/openvpn/client"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/confopt"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/socket"
 )
 
@@ -38,11 +38,12 @@ func New() *Collector {
 }
 
 type Config struct {
-	Vnode        string             `yaml:"vnode,omitempty" json:"vnode"`
-	UpdateEvery  int                `yaml:"update_every,omitempty" json:"update_every"`
-	Address      string             `yaml:"address" json:"address"`
-	Timeout      confopt.Duration   `yaml:"timeout,omitempty" json:"timeout"`
-	PerUserStats matcher.SimpleExpr `yaml:"per_user_stats,omitempty" json:"per_user_stats"`
+	Vnode              string             `yaml:"vnode,omitempty" json:"vnode"`
+	UpdateEvery        int                `yaml:"update_every,omitempty" json:"update_every"`
+	AutoDetectionRetry int                `yaml:"autodetection_retry,omitempty" json:"autodetection_retry"`
+	Address            string             `yaml:"address" json:"address"`
+	Timeout            confopt.Duration   `yaml:"timeout,omitempty" json:"timeout"`
+	PerUserStats       matcher.SimpleExpr `yaml:"per_user_stats,omitempty" json:"per_user_stats"`
 }
 
 type (

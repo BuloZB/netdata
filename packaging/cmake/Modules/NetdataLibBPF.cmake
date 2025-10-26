@@ -29,13 +29,11 @@ function(netdata_bundle_libbpf)
     if(USE_LEGACY_LIBBPF)
         set(_libbpf_tag 673424c56127bb556e64095f41fd60c26f9083ec) # v0.0.9_netdata-1
     else()
-        set(_libbpf_tag ad7c3a4266bf5ce301a5691eb7b405dbb27c7f3d) # v1.5.0p_netdata
+        set(_libbpf_tag 5acba1722d66a25ad5a545f9296e59d0cb73d548) # v1.6.2p_netdata
     endif()
 
-    if(DEFINED BUILD_SHARED_LIBS)
-        if(NOT BUILD_SHARED_LIBS)
-            set(need_static TRUE)
-        endif()
+    if(STATIC_BUILD)
+      set(need_static TRUE)
     endif()
 
     if(NOT need_static)
@@ -71,7 +69,7 @@ function(netdata_bundle_libbpf)
         GIT_TAG ${_libbpf_tag}
         SOURCE_DIR "${libbpf_SOURCE_DIR}"
         CONFIGURE_COMMAND ""
-        BUILD_COMMAND ${MAKE_COMMAND} -C src CC=${CMAKE_C_COMPILER} BUILD_STATIC_ONLY=1 OBJDIR=build/ DESTDIR=../ install
+        BUILD_COMMAND ${MAKE_COMMAND} -C src CC=${CMAKE_C_COMPILER} BUILD_STATIC_ONLY=1 OBJDIR=build/ DESTDIR=../ LIBSUBDIR=${_libbpf_lib_dir} install
         BUILD_IN_SOURCE 1
         BUILD_BYPRODUCTS "${_libbpf_library}"
         INSTALL_COMMAND ""

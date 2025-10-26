@@ -46,7 +46,7 @@ modules:
       configuration:
         file:
           name: "netdata.conf"
-          section_name: "[plugin:windows]"
+          section_name: "[plugin:windows:PerflibProcessor]"
           description: "The Netdata main configuration file"
         options:
           description: ""
@@ -54,9 +54,9 @@ modules:
             title: "Config option"
             enabled: false
           list:
-            - name: PerflibProcessor
-              description: An option to enable or disable the data collection.
-              default_value: yes
+            - name: update every
+              description: Data collection frequency.
+              default_value: 1
               required: false
         examples:
           folding:
@@ -150,7 +150,7 @@ modules:
       configuration:
         file:
           name: "netdata.conf"
-          section_name: "[plugin:windows]"
+          section_name: "[plugin:windows:PerflibMemory]"
           description: "The Netdata main configuration file"
         options:
           description: ""
@@ -158,9 +158,9 @@ modules:
             title: "Config option"
             enabled: false
           list:
-            - name: PerflibMemory
-              description: An option to enable or disable the data collection.
-              default_value: yes
+            - name: update every
+              description: Data collection frequency.
+              default_value: 1
               required: false
         examples:
           folding:
@@ -203,6 +203,12 @@ modules:
               dimensions:
                 - name: paged
                 - name: pool-paged
+            - name: mem.system_page_table_entries
+              description: Unused page table entries.
+              unit: "pages"
+              chart_type: line
+              dimensions:
+                - name: free
   - meta:
       plugin_name: windows.plugin
       module_name: PerflibProcesses
@@ -248,7 +254,7 @@ modules:
       configuration:
         file:
           name: "netdata.conf"
-          section_name: "[plugin:windows]"
+          section_name: "[plugin:windows:PerflibProcesses]"
           description: "The Netdata main configuration file"
         options:
           description: ""
@@ -256,9 +262,9 @@ modules:
             title: "Config option"
             enabled: false
           list:
-            - name: PerflibProcesses
-              description: An option to enable or disable the data collection.
-              default_value: yes
+            - name: update every
+              description: Data collection frequency.
+              default_value: 1
               required: false
         examples:
           folding:
@@ -298,6 +304,12 @@ modules:
               chart_type: line
               dimensions:
                 - name: switches
+            - name: system.processor_queue_length
+              description: The number of threads in the processor queue.
+              unit: "threads"
+              chart_type: line
+              dimensions:
+                - name: threads
   - meta:
       plugin_name: windows.plugin
       module_name: PerflibStorage
@@ -346,7 +358,7 @@ modules:
       configuration:
         file:
           name: "netdata.conf"
-          section_name: "[plugin:windows]"
+          section_name: "[plugin:windows:PerflibStorage]"
           description: "The Netdata main configuration file"
         options:
           description: ""
@@ -354,9 +366,9 @@ modules:
             title: "Config option"
             enabled: false
           list:
-            - name: PerflibStorage
-              description: An option to enable or disable the data collection.
-              default_value: yes
+            - name: update every
+              description: Data collection frequency.
+              default_value: 1
               required: false
         examples:
           folding:
@@ -529,7 +541,7 @@ modules:
       configuration:
         file:
           name: "netdata.conf"
-          section_name: "[plugin:windows]"
+          section_name: "[plugin:windows:PerflibNetwork]"
           description: "The Netdata main configuration file"
         options:
           description: ""
@@ -537,9 +549,9 @@ modules:
             title: "Config option"
             enabled: false
           list:
-            - name: PerflibNetwork
-              description: An option to enable or disable the data collection.
-              default_value: yes
+            - name: update every
+              description: Data collection frequency.
+              default_value: 1
               required: false
         examples:
           folding:
@@ -853,7 +865,7 @@ modules:
       configuration:
         file:
           name: "netdata.conf"
-          section_name: "[plugin:windows]"
+          section_name: "[plugin:windows:PerflibObjects]"
           description: "The Netdata main configuration file"
         options:
           description: ""
@@ -861,9 +873,9 @@ modules:
             title: "Config option"
             enabled: false
           list:
-            - name: PerflibObjects
-              description: An option to enable or disable the data collection.
-              default_value: yes
+            - name: update every
+              description: Data collection frequency.
+              default_value: 1
               required: false
         examples:
           folding:
@@ -934,7 +946,7 @@ modules:
         list: []
       configuration:
         file:
-          section_name: "[plugin:windows]"
+          section_name: "[plugin:windows:PerflibThermalZone]"
           name: "netdata.conf"
           description: "The Netdata main configuration file."
         options:
@@ -943,9 +955,9 @@ modules:
             title: "Config Option"
             enabled: false
           list:
-            - name: PerflibThermalZone
-              description: An option to enable or disable the data collection.
-              default_value: yes
+            - name: update every
+              description: Data collection frequency.
+              default_value: 5
               required: false
         examples:
           folding:
@@ -973,6 +985,286 @@ modules:
               chart_type: line
               dimensions:
                 - name: temperature
+  - meta:
+      plugin_name: windows.plugin
+      module_name: GetPowerSupply
+      monitored_instance:
+        name: Power supply
+        link: "https://learn.microsoft.com/en-us/windows/win32/power/power-management-portal"
+        categories:
+          - data-collection.windows-systems
+        icon_filename: "powersupply.svg"
+      related_resources:
+        integrations:
+          list: []
+      info_provided_to_referring_integrations:
+        description: ""
+      keywords:
+        - power supply
+      most_popular: false
+    overview:
+      data_collection:
+        metrics_description: |
+          This collector monitors power supply statistics on Windows systems.
+        method_description: |
+          It uses Windows Internal API to retrieve available data.
+      supported_platforms:
+        include: ["windows"]
+        exclude: []
+      multi_instance: false
+      additional_permissions:
+        description: ""
+      default_behavior:
+        auto_detection:
+          description: |
+            The collector automatically detects all of the metrics, no further configuration is required.
+        limits:
+          description: ""
+        performance_impact:
+          description: ""
+    setup:
+      prerequisites:
+        list: []
+      configuration:
+        file:
+          section_name: "[plugin:windows:GetPowerSupply]"
+          name: "netdata.conf"
+          description: "The Netdata main configuration file."
+        options:
+          description: ""
+          folding:
+            title: "Config Option"
+            enabled: false
+          list:
+            - name: update every
+              description: Data collection frequency.
+              default_value: 1
+              required: false
+        examples:
+          folding:
+            enabled: false
+            title: ""
+          list: []
+    troubleshooting:
+      problems:
+        list: []
+    alerts:
+      - name: power_supply_capacity
+        link: https://github.com/netdata/netdata/blob/master/src/health/health.d/power_supply_capacity.conf
+        metric: powersupply.capacity
+        info: percentage of remaining power supply capacity
+    metrics:
+      folding:
+        title: Metrics
+        enabled: false
+      description: ""
+      availability: []
+      scopes:
+        - name: Power Supply
+          description: "These metrics refer to Power Supply device."
+          labels:
+            - name: device
+              description: Device name delivered as a Windows path.
+          metrics:
+            - name: powersupply.capacity
+              description: Battery capacity
+              unit: "percentage"
+              chart_type: line
+              dimensions:
+                - name: capacity
+            - name: powersupply.voltage
+              description: Power supply voltage
+              unit: "V"
+              chart_type: line
+              dimensions:
+                - name: now
+  - meta:
+      plugin_name: windows.plugin
+      module_name: GetSensors
+      monitored_instance:
+        name: Sensors
+        link: "https://learn.microsoft.com/en-us/windows/win32/sensorsapi/portal"
+        categories:
+          - data-collection.windows-systems
+        icon_filename: "windows.svg"
+      related_resources:
+        integrations:
+          list: []
+      info_provided_to_referring_integrations:
+        description: ""
+      keywords:
+        - Sensors
+        - Windows
+      most_popular: false
+    overview:
+      data_collection:
+        metrics_description: |
+          This collector monitors sensors on Windows systems.
+        method_description: |
+          It uses Sensors API to retrieve available data.
+      supported_platforms:
+        include: ["windows"]
+        exclude: []
+      multi_instance: false
+      additional_permissions:
+        description: ""
+      default_behavior:
+        auto_detection:
+          description: |
+            The collector automatically detects all of the metrics, no further configuration is required.
+        limits:
+          description: ""
+        performance_impact:
+          description: ""
+    setup:
+      prerequisites:
+        list: []
+      configuration:
+        file:
+          section_name: "[plugin:windows:GetSensors]"
+          name: "netdata.conf"
+          description: "The Netdata main configuration file."
+        options:
+          description: ""
+          folding:
+            title: "Config Option"
+            enabled: false
+          list:
+            - name: update every
+              description: Data collection frequency.
+              default_value: 1
+              required: false
+        examples:
+          folding:
+            enabled: false
+            title: ""
+          list: []
+    troubleshooting:
+      problems:
+        list: []
+    alerts: []
+    metrics:
+      folding:
+        title: Metrics
+        enabled: false
+      description: ""
+      availability: []
+      scopes:
+        - name: Sensor
+          description: "These metrics refer to Sensors."
+          labels:
+            - name: name
+              description: Sensor friendly name.
+            - name: manufacturer
+              description: The sensor manufacturer.
+            - name: model
+              description: The sensor model.
+          metrics:
+            - name: system.hw.sensor.temperature.input
+              description: Sensor Temperature
+              unit: "Cel"
+              chart_type: line
+              dimensions:
+                - name: input
+            - name: system.hw.sensor.power.input
+              description: Sensor Power
+              unit: "W"
+              chart_type: line
+              dimensions:
+                - name: input
+            - name: system.hw.sensor.current.input
+              description: Sensor Current
+              unit: "A"
+              chart_type: line
+              dimensions:
+                - name: input
+            - name: system.hw.sensor.humidity.input
+              description: Sensor Humidity
+              unit: "%"
+              chart_type: line
+              dimensions:
+                - name: input
+            - name: system.hw.sensor.lux.input
+              description: Ambient light level
+              unit: "lx"
+              chart_type: line
+              dimensions:
+                - name: input
+            - name: system.hw.sensor.color.input
+              description: Color temperature of light
+              unit: "Cel"
+              chart_type: line
+              dimensions:
+                - name: input
+            - name: system.hw.sensor.voltage.input
+              description: Electrical potential
+              unit: "V"
+              chart_type: line
+              dimensions:
+                - name: input
+            - name: system.hw.sensor.resistence.input
+              description: Electrical resistence.
+              unit: "Ohms"
+              chart_type: line
+              dimensions:
+                - name: input
+            - name: system.hw.sensor.pressure.input
+              description: Ambient atmospheric pressure
+              unit: "Pa"
+              chart_type: line
+              dimensions:
+                - name: input
+            - name: system.hw.sensor.latitude.input
+              description: Geographic latitude
+              unit: "Degrees"
+              chart_type: line
+              dimensions:
+                - name: input
+            - name: system.hw.sensor.longitude.input
+              description: Geographic longitude
+              unit: "Degrees"
+              chart_type: line
+              dimensions:
+                - name: input
+            - name: system.hw.sensor.force.input
+              description: Force
+              unit: "N"
+              chart_type: line
+              dimensions:
+                - name: input
+            - name: system.hw.sensor.gauge_pressure.input
+              description: Gauge Pressure
+              unit: "Pa"
+              chart_type: line
+              dimensions:
+                - name: input
+            - name: system.hw.sensor.distance.input
+              description: Distance
+              unit: "m"
+              chart_type: line
+              dimensions:
+                - name: inputX
+                - name: inputY
+                - name: inputZ
+            - name: system.hw.sensor.acceleration.input
+              description: Acceleration
+              unit: "g"
+              chart_type: line
+              dimensions:
+                - name: inputX
+                - name: inputY
+                - name: inputZ
+            - name: system.hw.sensor.state.input
+              description: Current sensor state.
+              unit: "status"
+              chart_type: line
+              dimensions:
+                - name: ready
+                - name: not_available
+                - name: no_data
+                - name: initializing
+                - name: access_denied
+                - name: error
   - meta:
       plugin_name: windows.plugin
       module_name: PerflibWebService
@@ -1018,7 +1310,7 @@ modules:
       configuration:
         file:
           name: "netdata.conf"
-          section_name: "[plugin:windows]"
+          section_name: "[plugin:windows:PerflibWebService]"
           description: "The Netdata main configuration file"
         options:
           description: ""
@@ -1026,9 +1318,9 @@ modules:
             title: "Config option"
             enabled: false
           list:
-            - name: PerflibWebService
-              description: An option to enable or disable the data collection.
-              default_value: yes
+            - name: update every
+              description: Data collection frequency.
+              default_value: 1
               required: false
         examples:
           folding:
@@ -1206,6 +1498,90 @@ modules:
               chart_type: line
               dimensions:
                 - name: uptime
+        - name: IIS W3SCV W3MP
+          description: "These metrics refer to the World Wide Web Publishing Service, the service responsible for hosting and serving web content."
+          labels:
+            - name: app
+              description: Application name.
+          metrics:
+            - name: iis.w3svc_w3wp_active_threads
+              description: Threads actively processing requests in the worker process
+              unit: "threads"
+              chart_type: line
+              dimensions:
+                - name: threads
+            - name: iis.w3svc_w3wp_requests_total
+              description: HTTP requests served by the worker process
+              unit: "requests/s"
+              chart_type: line
+              dimensions:
+                - name: requests
+            - name: iis.w3svc_w3wp_requests_active
+              description: Current number of requests being processed by the worker process
+              unit: "requests"
+              chart_type: line
+              dimensions:
+                - name: requests
+            - name: iis.w3svc_w3wp_file_cache_mem_usage
+              description: Current memory usage by the worker process
+              unit: "bytes"
+              chart_type: area
+              dimensions:
+                - name: used
+            - name: iis.w3svc_w3wp_files_cache_total
+              description: Files whose contents were ever added to the cache
+              unit: "files/s"
+              chart_type: line
+              dimensions:
+                - name: cached_files
+            - name: iis.w3svc_w3wp_files_flushed_total
+              description: File handles that have been removed from the cache
+              unit: "flushes/s"
+              chart_type: line
+              dimensions:
+                - name: file_handles
+            - name: iis.w3svc_w3wp_uri_cache_flushed
+              description: URI cache flushes
+              unit: "flushes/s"
+              chart_type: line
+              dimensions:
+                - name: cached_uris
+            - name: iis.w3svc_w3wp_total_uri_cached
+              description: URI information blocks added to the cache
+              unit: "blocks/s"
+              chart_type: line
+              dimensions:
+                - name: uri_cache_blocks
+            - name: iis.w3svc_w3wp_total_metadata_cached
+              description: Metadata information blocks added to the user-mode cache
+              unit: "blocks/s"
+              chart_type: line
+              dimensions:
+                - name: metadata_blocks
+            - name: iis.w3svc_w3wp_total_metadata_flushed
+              description: User-mode metadata cache flushes
+              unit: "flushes/s"
+              chart_type: line
+              dimensions:
+                - name: metadata_blocks
+            - name: iis.w3svc_w3wp_output_cache_active_flushed_items
+              description: Items flushed but still in memory for active responses
+              unit: "items"
+              chart_type: line
+              dimensions:
+                - name: used
+            - name: iis.w3svc_w3wp_output_cache_memory_usage
+              description: Current number of bytes used by output cache
+              unit: "bytes"
+              chart_type: area
+              dimensions:
+                - name: used
+            - name: iis.w3svc_w3wp_output_cache_flushed_total
+              description: Flushes of output cache
+              unit: "flushes"
+              chart_type: line
+              dimensions:
+                - name: output_cache_entries
   - meta:
       plugin_name: windows.plugin
       module_name: PerflibHyperV
@@ -1253,7 +1629,7 @@ modules:
       configuration:
         file:
           name: "netdata.conf"
-          section_name: "[plugin:windows]"
+          section_name: "[plugin:windows:PerflibHyperV]"
           description: "The Netdata main configuration file"
         options:
           description: ""
@@ -1261,9 +1637,9 @@ modules:
             title: "Config option"
             enabled: false
           list:
-            - name: PerflibHyperV
-              description: An option to enable or disable the data collection.
-              default_value: yes
+            - name: update every
+              description: Data collection frequency.
+              default_value: 5
               required: false
         examples:
           folding:
@@ -1609,34 +1985,179 @@ modules:
       default_behavior:
         auto_detection:
           description: |
-            The collector automatically detects all of the metrics, no further configuration is required.
+            The collector automatically discovers and monitors standard SQL Server metrics without additional setup. However, for transaction-level metrics,
+            the size of all the data files, and the wait stats in the database you must:
+
+            - Complete the "Configure SQL Server for Monitoring" steps in the Setup -> Prerequisites section.
+            - Configure a database connection (see Setup → Configuration → Examples).
         limits:
           description: ""
         performance_impact:
           description: ""
     setup:
       prerequisites:
-        list: []
+        list:
+          - title: Configure SQL Server for Monitoring
+            description: |
+              For **each SQL Server** instance you want to monitor, complete the following steps:
+
+              1. **Create Monitoring User**
+
+                 Create an SQL Server user with the necessary permissions to collect monitoring data:
+
+                 ```tsql
+                 USE master;
+                 CREATE LOGIN netdata_user WITH PASSWORD = '1ReallyStrongPasswordShouldBeInsertedHere';
+                 CREATE USER netdata_user FOR LOGIN netdata_user;
+                 GRANT CONNECT SQL TO netdata_user;
+                 GRANT VIEW SERVER STATE TO netdata_user;
+                 GO
+                 ```
+
+              2. **Enable Query Store**
+
+                 Enable the [Query Store](https://learn.microsoft.com/en-us/sql/relational-databases/performance/monitoring-performance-by-using-the-query-store?view=sql-server-ver16) and grant access               to    the monitoring user on all relevant databases:
+
+                 ```tsql
+                 DECLARE @dbname NVARCHAR(max)
+                 DECLARE nd_user_cursor CURSOR FOR SELECT name
+                                     FROM master.dbo.sysdatabases
+                                     WHERE name NOT IN ('master')
+
+                 OPEN nd_user_cursor
+                 FETCH NEXT FROM nd_user_cursor INTO @dbname
+                 WHILE @@FETCH_STATUS = 0
+                 BEGIN
+                   EXECUTE ("USE "+ @dbname+"; CREATE USER netdata_user FOR LOGIN netdata_user; ALTER DATABASE "+@dbname+" SET QUERY_STORE = ON ( QUERY_CAPTURE_MODE = ALL, DATA_FLUSH_INTERVAL_SECONDS               =    900 )");
+                   FETCH next FROM nd_user_cursor INTO @dbname;
+                 END
+                 CLOSE nd_user_cursor
+                 DEALLOCATE nd_user_cursor
+                 GO
+                 ```
+
+              3. **Enable Query Job status**
+
+                 Connect to your database and grant `SELECT` permission to `netdata_user`:
+
+                ```tsql
+                USE msdb;
+                GO
+                GRANT SELECT ON SCHEMA::[dbo] TO netdata_user;
+                GO
+                ```
+
+              4. **Configure SQL Server Network Settings**
+
+                 Enable SQL Server to accept TCP connections:
+
+                - Open `SQL Server Configuration Manager`
+                - Expand `SQL Server Network Configuration`
+                - Select `Protocols for <instance name>` in the console panel
+                - Double-click the `TCP` protocol in the details panel and set `Enabled` to `Yes`
+                - Go to the `IP Address` tab and locate the `IPAII` section:
+                  - Clear any value from the `TCP Dynamic Ports` field
+                  - Enter a port number in the `TCP Port` field (default is `1433`)
+                - Select `SQL Server Services` and restart your SQL Server instance
+
+              5. **Configure SQL Server Authentication (Optional)**
+
+                 If you're using SQL Server authentication (rather than Windows authentication):
+
+                - Open `SQL Server Management Studio`
+                - Right-click your server and select `Properties`
+                - Select `Security` in the left panel
+                - Choose `SQL Server and Windows Authentication mode` under `Server authentication`
+                - Click `OK`
+                - Right-click your server and select `Restart`
       configuration:
         file:
           name: "netdata.conf"
-          section_name: "[plugin:windows]"
+          section_name: "[plugin:windows:PerflibMSSQL]"
           description: "The Netdata main configuration file"
         options:
-          description: ""
+          description: "These options allow the collector to connect to your MSSQL instance and collect transaction data from it."
           folding:
             title: "Config option"
             enabled: false
           list:
-            - name: PerflibMSSQL
-              description: An option to enable or disable the data collection.
-              default_value: yes
+            - name: update every
+              description: Data collection frequency.
+              default_value: 10
+              required: false
+            - name: driver
+              description: ODBC driver used to connect to the SQL Server.
+              default_value: SQL Server
+              required: false
+            - name: instance
+              description: Instance name
+              default_value: empty
+              required: true
+            - name: server
+              description: Server address or instance name.
+              default_value: empty
+              required: true
+            - name: address
+              description: Alternative to `server`; supports named pipes if the server supports them.
+              default_value: empty
+              required: true
+            - name: uid
+              description: SQL Server user identifier.
+              default_value: empty
+              required: true
+            - name: pwd
+              description: Password for the specified user.
+              default_value: empty
+              required: true
+            - name: additional instances
+              description: Number of additional SQL Server instances to monitor.
+              default_value: 0
+              required: false
+            - name: windows authentication
+              description: Set to yes to use Windows credentials instead of SQL Server authentication.
+              default_value: no
+              required: false
+            - name: express
+              description: Set to yes when running SQL Express version.
+              default_value: no
               required: false
         examples:
           folding:
             enabled: true
             title: ""
-          list: []
+          list:
+            - name: Single Instance
+              description: An example configuration with one instance.
+              folding:
+                enabled: false
+              config: |
+                [plugin:windows:PerflibMSSQL]
+                   driver = SQL Server
+                   instance = Dev
+                   server = 127.0.0.1\\Dev, 1433
+                   uid = netdata_user
+                   pwd = 1ReallyStrongPasswordShouldBeInsertedHere
+                   express = no
+            - name: Multiple Instances
+              description: An example configuration with two instances.
+              folding:
+                enabled: false
+              config: |
+                [plugin:windows:PerflibMSSQL]
+                  driver = SQL Server
+                  server = 127.0.0.1\\Dev, 1433
+                  instance = Dev
+                  uid = netdata_user
+                  pwd = 1ReallyStrongPasswordShouldBeInsertedHere
+                  additional instances = 1
+                  express = no
+                [plugin:windows:PerflibMSSQL1]
+                  driver = SQL Server
+                  server = 127.0.0.1\\Production, 1434
+                  instance = Production
+                  uid = netdata_user
+                  pwd = AnotherReallyStrongPasswordShouldBeInsertedHere2
+                  express = no
     troubleshooting:
       problems:
         list: []
@@ -1727,12 +2248,42 @@ modules:
               chart_type: line
               dimensions:
                 - name: life_expectancy
+            - name: mssql.instance_bufman_lazy_write
+              description: Buffers written by buffer manager's lazy writer
+              unit: writes/s
+              chart_type: line
+              dimensions:
+                - name: writes
+            - name: mssql.instance_bufman_page_lookups
+              description: Requests to find a page in the buffer pool.
+              unit: lookups/s
+              chart_type: line
+              dimensions:
+                - name: lookups
             - name: mssql.instance_memmgr_server_memory
               description: Memory committed
               unit: bytes
               chart_type: line
               dimensions:
                 - name: memory
+            - name: mssql.database_readonly
+              description: Current database write status.
+              unit: status
+              chart_type: line
+              dimensions:
+                - name: writable
+                - name: readonly
+            - name: mssql.database_state
+              description: Current database state.
+              unit: status
+              chart_type: line
+              dimensions:
+                - name: online
+                - name: restoring
+                - name: recovering
+                - name: recovering_pending
+                - name: suspect
+                - name: offline
             - name: mssql.instance_memmgr_connection_memory_bytes
               description: Amount of dynamic memory to maintain connections
               unit: bytes
@@ -1751,50 +2302,87 @@ modules:
               chart_type: line
               dimensions:
                 - name: benefit
-            - name: mssql.instance_locks_deadlocks
-              description: Lock requests that resulted in deadlock
-              unit: deadlocks/s
-              chart_type: line
-              dimensions:
-                - name: alloc_unit
-                - name: application
-                - name: database
-                - name: extent
-                - name: file
-                - name: hobt
-                - name: key
-                - name: metadata
-                - name: oib
-                - name: object
-                - name: page
-                - name: rid
-                - name: row_group
-                - name: xact
-            - name: mssql.instance_locks_lock_wait
-              description: Lock requests that required the caller to wait
-              unit: locks/s
-              chart_type: line
-              dimensions:
-                - name: alloc_unit
-                - name: application
-                - name: database
-                - name: extent
-                - name: file
-                - name: hobt
-                - name: key
-                - name: metadata
-                - name: oib
-                - name: object
-                - name: page
-                - name: rid
-                - name: row_group
-                - name: xact
             - name: mssql.instance_blocked_processes
               description: Blocked processes
               unit: processes
               chart_type: line
               dimensions:
                 - name: blocked
+        - name: MSSQL Jobs
+          description: "These metrics refer to the Microsoft SQL Servers jobs on host."
+          labels:
+            - name: mssql_instance
+              description: The instance name.
+            - name: job_name
+              description: The job name.
+          metrics:
+            - name: mssql.instance_jobs_status
+              description: Jobs running
+              unit: jobs
+              chart_type: line
+              dimensions:
+                - name: enabled
+                - name: disabled
+        - name: MSSQL Resource Locks
+          description: "Monitors SQL Server resource locks by type. SQL Server uses locks to manage concurrent access to database resources during transactions, preventing conflicts when multiple users access the same data simultaneously. This metric tracks locks on different [resource types](https://learn.microsoft.com/en-us/sql/relational-databases/performance-monitor/sql-server-locks-object?view=sql-server-ver17) like rows, pages, tables, and databases."
+          labels:
+            - name: mssql_instance
+              description: The SQL Server instance name (e.g., 'MSSQLSERVER' for default instance or named instance like 'INSTANCE01').
+            - name: resource
+              description: "The specific resource type being locked (e.g., 'Database', 'Table', 'Page', 'Row', 'Key', 'Extent', 'RID', 'Application', 'Metadata', 'Allocation_Unit')."
+          metrics:
+            - name: mssql.instance_resource_deadlocks
+              description: Active lock requests that resulted in deadlock per resource
+              unit: deadlock/s
+              chart_type: line
+              dimensions:
+                - name: locks
+            - name: mssql.instance_resource_lock_waits
+              description: Lock requests that required the caller to wait per resource
+              unit: lock/s
+              chart_type: line
+              dimensions:
+                - name: locks
+        - name: MSSQL Waits
+          description: "These metrics refer to the Microsoft SQL Server instances defined on the host and their associated wait events."
+          labels:
+            - name: mssql_instance
+              description: The instance name.
+            - name: wait_type
+              description: A wait defined in https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-os-wait-stats-transact-sql?view=sql-server-ver16#WaitTypes.
+            - name: wait_category
+              description: "Wait categories are groupings of specific wait types that indicate the reason a SQL Server worker is waiting."
+          metrics:
+            - name: mssql.instance_total_wait_time
+              description: Wait time for each wait type and category
+              unit: ms
+              chart_type: line
+              dimensions:
+                - name: duration
+            - name: mssql.instance_resource_wait_time
+              description: Wait time for threads waiting on specific resource types for each wait type and category
+              unit: ms
+              chart_type: line
+              dimensions:
+                - name: duration
+            - name: mssql.instance_signal_wait_time
+              description: Delay between thread wakeup signal and actual execution start for each wait type and category
+              unit: ms
+              chart_type: line
+              dimensions:
+                - name: duration
+            - name: mssql.instance_max_wait_time
+              description: Maximum wait time for each wait type and category
+              unit: ms
+              chart_type: line
+              dimensions:
+                - name: duration
+            - name: mssql.instance_waits
+              description: Number of waits for each wait type and category
+              unit: waits/s
+              chart_type: line
+              dimensions:
+                - name: waits
         - name: Database
           description: "These metrics refer to Microsoft SQL Server databases."
           labels:
@@ -1821,6 +2409,30 @@ modules:
               chart_type: line
               dimensions:
                 - name: write
+            - name: mssql.database_lockwait
+              description: Lock requests that required the caller to wait.
+              unit: locks/s
+              chart_type: line
+              dimensions:
+                - name: lock
+            - name: mssql.database_deadlocks
+              description: Lock requests that resulted in deadlock.
+              unit: deadlocks/s
+              chart_type: line
+              dimensions:
+                - name: deadlocks
+            - name: mssql.database_lock_timeouts
+              description: Lock that timed out.
+              unit: timeouts/s
+              chart_type: line
+              dimensions:
+                - name: timeouts
+            - name: mssql.database_lock_requests
+              description: Number of new locks and lock conversions requested.
+              unit: requests/s
+              chart_type: line
+              dimensions:
+                - name: requests
             - name: mssql.database_backup_restore_operations
               description: Backup IO per database
               unit: operations/s
@@ -1839,6 +2451,12 @@ modules:
               chart_type: line
               dimensions:
                 - name: flushed
+            - name: mssql.database_data_files_size
+              description: Current database size
+              unit: bytes
+              chart_type: line
+              dimensions:
+                - name: size
   - meta:
       plugin_name: windows.plugin
       module_name: PerflibNetFramework
@@ -1885,7 +2503,7 @@ modules:
       configuration:
         file:
           name: "netdata.conf"
-          section_name: "[plugin:windows]"
+          section_name: "[plugin:windows:PerflibNetFramework]"
           description: "The Netdata main configuration file"
         options:
           description: ""
@@ -1893,9 +2511,9 @@ modules:
             title: "Config option"
             enabled: false
           list:
-            - name: PerflibNetFramework
-              description: An option to enable or disable the data collection.
-              default_value: yes
+            - name: update every
+              description: Data collection frequency.
+              default_value: 1
               required: false
         examples:
           folding:
@@ -2151,7 +2769,7 @@ modules:
       configuration:
         file:
           name: "netdata.conf"
-          section_name: "[plugin:windows]"
+          section_name: "[plugin:windows:PerflibAD]"
           description: "The Netdata main configuration file"
         options:
           description: ""
@@ -2159,9 +2777,9 @@ modules:
             title: "Config option"
             enabled: false
           list:
-            - name: PerflibAD
-              description: An option to enable or disable the data collection.
-              default_value: yes
+            - name: update every
+              description: Data collection frequency.
+              default_value: 10
               required: false
         examples:
           folding:
@@ -2330,7 +2948,7 @@ modules:
       configuration:
         file:
           name: "netdata.conf"
-          section_name: "[plugin:windows]"
+          section_name: "[plugin:windows:PerflibADCS]"
           description: "The Netdata main configuration file"
         options:
           description: ""
@@ -2338,9 +2956,9 @@ modules:
             title: "Config option"
             enabled: false
           list:
-            - name: PerflibADCS
-              description: An option to enable or disable the data collection.
-              default_value: yes
+            - name: update every
+              description: Data collection frequency.
+              default_value: 10
               required: false
         examples:
           folding:
@@ -2507,7 +3125,7 @@ modules:
       configuration:
         file:
           name: "netdata.conf"
-          section_name: "[plugin:windows]"
+          section_name: "[plugin:windows:PerflibADFS]"
           description: "The Netdata main configuration file"
         options:
           description: ""
@@ -2515,9 +3133,9 @@ modules:
             title: "Config option"
             enabled: false
           list:
-            - name: PerflibADFS
-              description: An option to enable or disable the data collection.
-              default_value: yes
+            - name: update every
+              description: Data collection frequency.
+              default_value: 10
               required: false
         examples:
           folding:
@@ -2738,3 +3356,711 @@ modules:
               chart_type: line
               dimensions:
                 - name: success
+  - meta:
+      plugin_name: windows.plugin
+      module_name: PerflibServices
+      monitored_instance:
+        name: Windows Services
+        link: "https://learn.microsoft.com/en-us/dotnet/framework/windows-services/"
+        categories:
+          - data-collection.windows-systems
+        icon_filename: "windows.svg"
+      related_resources:
+        integrations:
+          list: []
+      info_provided_to_referring_integrations:
+        description: ""
+      keywords:
+        - windows
+        - microsoft
+        - services
+      most_popular: false
+    overview:
+      data_collection:
+        metrics_description: |
+          This collector monitors Windows Services Status and States.
+        method_description: |
+          It queries Service Management to get the metrics.
+      supported_platforms:
+        include: ["windows"]
+        exclude: []
+      multi_instance: false
+      additional_permissions:
+        description: ""
+      default_behavior:
+        auto_detection:
+          description: |
+            The collector automatically detects all of the metrics, no further configuration is required.
+        limits:
+          description: ""
+        performance_impact:
+          description: ""
+    setup:
+      prerequisites:
+        list: []
+      configuration:
+        file:
+          name: "netdata.conf"
+          section_name: "[plugin:windows:PerflibServices]"
+          description: "The Netdata main configuration file"
+        options:
+          description: ""
+          folding:
+            title: "Config option"
+            enabled: false
+          list:
+            - name: update every
+              description: Data collection frequency.
+              default_value: 30
+              required: false
+        examples:
+          folding:
+            enabled: true
+            title: ""
+          list: []
+    troubleshooting:
+      problems:
+        list: []
+    alerts: []
+    metrics:
+      folding:
+        title: Metrics
+        enabled: false
+      description: ""
+      availability: []
+      scopes:
+        - name: Windows Service
+          description: "These metrics refer to Windows Services."
+          labels:
+            - name: service
+              description: The service name
+          metrics:
+            - name: windows.service_state
+              description: Service state
+              unit: state
+              chart_type: line
+              dimensions:
+                - name: running
+                - name: stopped
+                - name: start_pending
+                - name: stop_pending
+                - name: continue_pending
+                - name: pause_pending
+                - name: paused
+                - name: unknown
+  - meta:
+      plugin_name: windows.plugin
+      module_name: PerflibExchange
+      monitored_instance:
+        name: MS Exchange
+        link: "https://www.microsoft.com/en-us/microsoft-365/exchange/email"
+        categories:
+          - data-collection.windows-systems
+        icon_filename: "exchange.svg"
+      related_resources:
+        integrations:
+          list: []
+      info_provided_to_referring_integrations:
+        description: ""
+      keywords:
+        - windows
+        - microsoft
+        - exchange
+        - mail
+      most_popular: false
+    overview:
+      data_collection:
+        metrics_description: |
+          This collector monitors Microsoft Exchange.
+        method_description: |
+          It queries different Exchange objects from Perflib in order to gather the metrics.
+      supported_platforms:
+        include: ["windows"]
+        exclude: []
+      multi_instance: false
+      additional_permissions:
+        description: ""
+      default_behavior:
+        auto_detection:
+          description: |
+            The collector automatically detects all of the metrics, no further configuration is required.
+        limits:
+          description: ""
+        performance_impact:
+          description: ""
+    setup:
+      prerequisites:
+        list: []
+      configuration:
+        file:
+          name: "netdata.conf"
+          section_name: "[plugin:windows:PerflibExchange]"
+          description: "The Netdata main configuration file"
+        options:
+          description: ""
+          folding:
+            title: "Config option"
+            enabled: false
+          list:
+            - name: update every
+              description: Data collection frequency.
+              default_value: 10
+              required: false
+        examples:
+          folding:
+            enabled: true
+            title: ""
+          list: []
+    troubleshooting:
+      problems:
+        list: []
+    alerts: []
+    metrics:
+      folding:
+        title: Metrics
+        enabled: false
+      description: ""
+      availability: []
+      scopes:
+        - name: Windows Exchange
+          description: "These metrics refer to Windows Exchange."
+          labels: []
+          metrics:
+            - name: exchange.transport_queues_active_mail_box_delivery
+              description: Active Mailbox Delivery Queue length.
+              unit: messages
+              chart_type: line
+              dimensions:
+                - name: active
+            - name: exchange.transport_queues_external_active_remote_delivery
+              description: External Active Remote Delivery Queue length.
+              unit: messages
+              chart_type: line
+              dimensions:
+                - name: active
+            - name: exchange.transport_queues_internal_active_remote_delivery
+              description: Internal Active Remote Delivery Queue length.
+              unit: messages
+              chart_type: line
+              dimensions:
+                - name: active
+            - name: exchange.transport_queues_unreachable
+              description: Unreachable Queue length.
+              unit: messages
+              chart_type: line
+              dimensions:
+                - name: unreachable
+            - name: exchange.transport_queues_poison
+              description: Poison Queue Length.
+              unit: messages
+              chart_type: line
+              dimensions:
+                - name: unreachable
+            - name: exchange.activesync_ping_cmds_pending
+              description: Ping commands pending in queue.
+              unit: commands
+              chart_type: line
+              dimensions:
+                - name: pending
+            - name: exchange.activesync_requests
+              description: HTTP requests received from ASP.NET.
+              unit: requests/s
+              chart_type: line
+              dimensions:
+                - name: received
+            - name: exchange.activesync_sync_cmds
+              description: Sync commands processed.
+              unit: commands/s
+              chart_type: line
+              dimensions:
+                - name: processed
+            - name: exchange.rpc_active_user_count
+              description: Active unique users in the last 2 minutes.
+              unit: users
+              chart_type: line
+              dimensions:
+                - name: active
+            - name: exchange.rpc_avg_latency
+              description: Average latency.
+              unit: seconds
+              chart_type: line
+              dimensions:
+                - name: latency
+            - name: exchange.rpc_connection_count
+              description: Client connections.
+              unit: connections
+              chart_type: line
+              dimensions:
+                - name: connections
+            - name: exchange.rpc_requests
+              description: Clients requests currently being processed.
+              unit: requests
+              chart_type: line
+              dimensions:
+                - name: processed
+            - name: exchange.rpc_active_user
+              description: Active unique users in the last 2 minutes.
+              unit: users
+              chart_type: line
+              dimensions:
+                - name: users
+            - name: exchange.rpc_connection
+              description: Client connections.
+              unit: connections
+              chart_type: line
+              dimensions:
+                - name: connections
+            - name: exchange.rpc_operations
+              description: RPC operations.
+              unit: operations/s
+              chart_type: line
+              dimensions:
+                - name: operations
+            - name: exchange.rpc_user_count
+              description: RPC users.
+              unit: users
+              chart_type: line
+              dimensions:
+                - name: users
+            - name: exchange.owa_current_unique_users
+              description: Unique users currently logged on to Outlook Web App.
+              unit: users
+              chart_type: line
+              dimensions:
+                - name: logged-in
+            - name: exchange.owa_requests_total
+              description: Requests handled by Outlook Web App.
+              unit: requests/s
+              chart_type: line
+              dimensions:
+                - name: handled
+            - name: exchange.workload_active_tasks
+              description: Workload active tasks.
+              unit: tasks
+              chart_type: line
+              dimensions:
+                - name: active
+            - name: exchange.workload_completed_tasks
+              description: Workload completed tasks.
+              unit: tasks/s
+              chart_type: line
+              dimensions:
+                - name: completed
+            - name: exchange.workload_queued_tasks
+              description: Workload queued tasks.
+              unit: tasks/s
+              chart_type: line
+              dimensions:
+                - name: queued
+            - name: exchange.workload_yielded_tasks
+              description: Workload yielded tasks.
+              unit: tasks/s
+              chart_type: line
+              dimensions:
+                - name: yielded
+            - name: exchange.workload_activity_status
+              description: Workload activity status
+              unit: status
+              chart_type: line
+              dimensions:
+                - name: active
+                - name: paused
+            - name: exchange.http_proxy_avg_auth_latency
+              description: Average time spent authenticating CAS requests.
+              unit: seconds
+              chart_type: line
+              dimensions:
+                - name: latency
+            - name: exchange.http_proxy_avg_cas_processing_latency_sec
+              description: Average latency (sec) of CAS processing time.
+              unit: seconds
+              chart_type: line
+              dimensions:
+                - name: latency
+            - name: exchange.http_proxy_mailbox_proxy_failure_rate
+              description: Percentage of failures between this CAS and MBX servers.
+              unit: seconds
+              chart_type: line
+              dimensions:
+                - name: failures
+            - name: exchange.http_proxy_mailbox_server_locator_avg_latency_sec
+              description: Average latency of MailboxServerLocator web service calls.
+              unit: seconds
+              chart_type: line
+              dimensions:
+                - name: latency
+            - name: exchange.http_proxy_outstanding_proxy_requests
+              description: Concurrent outstanding proxy requests.
+              unit: seconds
+              chart_type: line
+              dimensions:
+                - name: requests
+            - name: exchange.http_proxy_requests
+              description: Number of proxy requests processed each second.
+              unit: seconds
+              chart_type: line
+              dimensions:
+                - name: requests
+            - name: exchange.autodiscover_requests
+              description: Autodiscover service requests processed
+              unit: requests/s
+              chart_type: line
+              dimensions:
+                - name: processed
+            - name: exchange.avail_service_requests
+              description: Requests serviced
+              unit: requests/s
+              chart_type: line
+              dimensions:
+                - name: serviced
+  - meta:
+      plugin_name: windows.plugin
+      module_name: PerflibNUMA
+      monitored_instance:
+        name: NUMA Architecture
+        link: "https://learn.microsoft.com/en-us/windows/win32/procthread/numa-support"
+        categories:
+          - data-collection.windows-systems
+        icon_filename: "windows.svg"
+      related_resources:
+        integrations:
+          list: []
+      info_provided_to_referring_integrations:
+        description: ""
+      keywords:
+        - windows
+        - NUMA
+        - processor
+      most_popular: false
+    overview:
+      data_collection:
+        metrics_description: |
+          This collector monitors NUMA Architecture on Windows.
+        method_description: |
+          It queries NUMA Node Memory from Perflib in order to gather the metrics.
+      supported_platforms:
+        include: ["windows"]
+        exclude: []
+      multi_instance: false
+      additional_permissions:
+        description: ""
+      default_behavior:
+        auto_detection:
+          description: |
+            The collector automatically detects all of the metrics, no further configuration is required.
+        limits:
+          description: ""
+        performance_impact:
+          description: ""
+    setup:
+      prerequisites:
+        list: []
+      configuration:
+        file:
+          name: "netdata.conf"
+          section_name: "[plugin:windows:PerflibNUMA]"
+          description: "The Netdata main configuration file"
+        options:
+          description: ""
+          folding:
+            title: "Config option"
+            enabled: false
+          list:
+            - name: update every
+              description: Data collection frequency.
+              default_value: 1
+              required: false
+        examples:
+          folding:
+            enabled: true
+            title: ""
+          list: []
+    troubleshooting:
+      problems:
+        list: []
+    alerts: []
+    metrics:
+      folding:
+        title: Metrics
+        enabled: false
+      description: ""
+      availability: []
+      scopes:
+        - name: NUMA
+          description: "These metrics refer to memory utilization on NUMA systems."
+          labels:
+            - name: node
+              description: The identifier of the CPU node.
+          metrics:
+            - name: mem.numa_node_mem_usage
+              description: NUMA Node Memory Usage
+              unit: bytes
+              chart_type: line
+              dimensions:
+                - name: free
+                - name: standby
+                - name: available
+  - meta:
+      plugin_name: windows.plugin
+      module_name: PerflibASP
+      monitored_instance:
+        name: ASP.NET
+        link: "https://dotnet.microsoft.com/en-us/apps/aspnet"
+        categories:
+          - data-collection.windows-systems
+        icon_filename: "windows.svg"
+      related_resources:
+        integrations:
+          list: []
+      info_provided_to_referring_integrations:
+        description: ""
+      keywords:
+        - windows
+        - ASP
+        - webservice
+      most_popular: false
+    overview:
+      data_collection:
+        metrics_description: |
+          This collector monitors ASP.NET applications.
+        method_description: |
+          It queries for the 'ASP.NET' and 'ASP.NET Applications' objects from Perflib in order to gather the metrics.
+      supported_platforms:
+        include: ["windows"]
+        exclude: []
+      multi_instance: false
+      additional_permissions:
+        description: ""
+      default_behavior:
+        auto_detection:
+          description: |
+            The collector automatically detects all of the metrics, no further configuration is required.
+        limits:
+          description: ""
+        performance_impact:
+          description: ""
+    setup:
+      prerequisites:
+        list: []
+      configuration:
+        file:
+          name: "netdata.conf"
+          section_name: "[plugin:windows]"
+          description: "The Netdata main configuration file"
+        options:
+          description: ""
+          folding:
+            title: "Config option"
+            enabled: false
+          list:
+            - name: PerflibASP
+              description: An option to enable or disable the data collection.
+              default_value: yes
+              required: false
+        examples:
+          folding:
+            enabled: true
+            title: ""
+          list: []
+    troubleshooting:
+      problems:
+        list: []
+    alerts: []
+    metrics:
+      folding:
+        title: Metrics
+        enabled: false
+      description: ""
+      availability: []
+      scopes:
+        - name: ASP.NET Global Data
+          description: "These metrics refer to ASP.NET global metrics."
+          labels: []
+          metrics:
+            - name: aspnet.application_restarts
+              description: Number of times the application has been restarted.
+              unit: restarts
+              chart_type: line
+              dimensions:
+                - name: restarts
+            - name: aspnet.worker_process_restarts
+              description: Number of times a worker process has restarted on the machine.
+              unit: restarts
+              chart_type: line
+              dimensions:
+                - name: restarts
+        - name: ASP.NET Applications
+          description: "ASP.NET application performance counters"
+          labels:
+            - name: aspnet_app
+              description: The application name.
+          metrics:
+            - name: aspnet.anonymous_request
+              description: Number of requests utilizing anonymous authentication.
+              unit: requests
+              chart_type: line
+              dimensions:
+                - name: requests
+            - name: aspnet.compilation_totals
+              description: Number of source files dynamically compiled.
+              unit: compilations
+              chart_type: line
+              dimensions:
+                - name: compilations
+            - name: aspnet.errors_during_preprocessing
+              description: Errors During Preprocessing.
+              unit: errors
+              chart_type: line
+              dimensions:
+                - name: preprocessing
+            - name: aspnet.errors_during_compilation
+              description: Errors During Compilation.
+              unit: errors
+              chart_type: line
+              dimensions:
+                - name: compilation
+            - name: aspnet.errors_during_execution
+              description: Errors During Execution.
+              unit: errors
+              chart_type: line
+              dimensions:
+                - name: execution
+            - name: aspnet.errors_during_unhandled_execution
+              description: Errors Unhandled During Execution.
+              unit: errors
+              chart_type: line
+              dimensions:
+                - name: unhandled
+            - name: aspnet.requests_byte_total
+              description: Size of responses and request.
+              unit: bytes
+              chart_type: line
+              dimensions:
+                - name: in
+                - name: out
+            - name: aspnet.requests_executing
+              description: The number of requests currently executing.
+              unit: requests
+              chart_type: line
+              dimensions:
+                - name: executing
+            - name: aspnet.requests_failed
+              description: Number of failed requests.
+              unit: requests
+              chart_type: line
+              dimensions:
+                - name: executing
+            - name: aspnet.requests_not_found
+              description: Requests for resources that were not found.
+              unit: requests
+              chart_type: line
+              dimensions:
+                - name: not found
+            - name: aspnet.requests_in_application_queue
+              description: Requests in the application queue.
+              unit: requests
+              chart_type: line
+              dimensions:
+                - name: queue
+            - name: aspnet.requests_timeout
+              description: Requests that timed out.
+              unit: requests
+              chart_type: line
+              dimensions:
+                - name: timeout
+            - name: aspnet.requests_succeeded
+              description: Requests that executed successfully.
+              unit: requests
+              chart_type: line
+              dimensions:
+                - name: success
+            - name: aspnet.sessions_active
+              description: Sessions currently active.
+              unit: sessions
+              chart_type: line
+              dimensions:
+                - name: active
+            - name: aspnet.sessions_abandoned
+              description: Sessions explicitly abandoned.
+              unit: sessions
+              chart_type: line
+              dimensions:
+                - name: abandoned
+            - name: aspnet.sessions_abandoned
+              description: Sessions explicitly abandoned.
+              unit: sessions
+              chart_type: line
+              dimensions:
+                - name: abandoned
+            - name: aspnet.sessions_timed_out
+              description: Sessions timed out.
+              unit: sessions
+              chart_type: line
+              dimensions:
+                - name: timed out
+            - name: aspnet.transactions_aborted
+              description: Transactions Aborted.
+              unit: transactions
+              chart_type: line
+              dimensions:
+                - name: aborted
+            - name: aspnet.transactions_committed
+              description: Transactions Committed.
+              unit: transactions
+              chart_type: line
+              dimensions:
+                - name: committed
+            - name: aspnet.transactions_pending
+              description: Transactions Pending.
+              unit: transactions
+              chart_type: line
+              dimensions:
+                - name: pending
+            - name: aspnet.events_raised_per_sec
+              description: Instrumentation events.
+              unit: events
+              chart_type: line
+              dimensions:
+                - name: raised
+            - name: aspnet.error_events_raised_per_sec
+              description: Runtime error events raised.
+              unit: errors
+              chart_type: line
+              dimensions:
+                - name: events
+            - name: aspnet.events_audit_success
+              description: Audit successes in the application.
+              unit: errors
+              chart_type: line
+              dimensions:
+                - name: events
+            - name: aspnet.events_audit_failure
+              description: Audit Failure Events Raised
+              unit: failures
+              chart_type: line
+              dimensions:
+                - name: audit
+            - name: aspnet.membership_auth_success
+              description: Membership Authentication Success.
+              unit: auth
+              chart_type: line
+              dimensions:
+                - name: success
+            - name: aspnet.form_authentication_success
+              description: Membership Authentication Failure.
+              unit: auth
+              chart_type: line
+              dimensions:
+                - name: success
+            - name: aspnet.form_authentication_success
+              description: Forms Authentication Success.
+              unit: auth
+              chart_type: line
+              dimensions:
+                - name: success
+            - name: aspnet.form_authentication_failure
+              description: Forms Authentication Failure.
+              unit: auth
+              chart_type: line
+              dimensions:
+                - name: failure

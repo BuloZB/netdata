@@ -129,6 +129,15 @@ void simple_connector_send_buffer(
     flags += MSG_NOSIGNAL;
 #endif
 
+    // Safety check to prevent NULL pointer crashes, but don't allocate new memory
+    if (unlikely(!buffer || !header)) {
+        netdata_log_error("EXPORTING: NULL %s passed to simple_connector_send_buffer for instance %s", 
+                          (!buffer && !header) ? "buffer and header" : (!buffer ? "buffer" : "header"),
+                          instance->config.name ? instance->config.name : "unknown");
+        (*failures)++;
+        return;
+    }
+
     uint32_t options = (uint32_t)instance->config.options;
     struct simple_connector_data *connector_specific_data = instance->connector_specific_data;
 
@@ -201,9 +210,7 @@ void simple_connector_worker(void *instance_p)
     struct instance *instance = (struct instance*)instance_p;
     struct simple_connector_data *connector_specific_data = instance->connector_specific_data;
 
-    char threadname[ND_THREAD_TAG_MAX + 1];
-    snprintfz(threadname, ND_THREAD_TAG_MAX, "EXPSMPL[%zu]", instance->index);
-    uv_thread_set_name_np(threadname);
+    // Thread name is set during creation
 
     uint32_t options = (uint32_t)instance->config.options;
 
@@ -224,16 +231,16 @@ void simple_connector_worker(void *instance_p)
         if (instance->data_is_ready)
             send_stats = 1;
 
-        uv_mutex_lock(&instance->mutex);
+        netdata_mutex_lock(&instance->mutex);
         if (!connector_specific_data->first_buffer->used || failures) {
             while (!instance->data_is_ready)
-                uv_cond_wait(&instance->cond_var, &instance->mutex);
+                netdata_cond_wait(&instance->cond_var, &instance->mutex);
             instance->data_is_ready = 0;
             send_stats = 1;
         }
 
         if (unlikely(instance->engine->exit)) {
-            uv_mutex_unlock(&instance->mutex);
+            netdata_mutex_unlock(&instance->mutex);
             break;
         }
 
@@ -265,7 +272,7 @@ void simple_connector_worker(void *instance_p)
             buffered_metrics = connector_specific_data->buffered_metrics;
         }
 
-        uv_mutex_unlock(&instance->mutex);
+        netdata_mutex_unlock(&instance->mutex);
 
         // ------------------------------------------------------------------------
         // if we are connected, receive a response, without blocking
@@ -347,7 +354,7 @@ void simple_connector_worker(void *instance_p)
             break;
 
         if (send_stats) {
-            uv_mutex_lock(&instance->mutex);
+            netdata_mutex_lock(&instance->mutex);
 
             stats->buffered_metrics = connector_specific_data->total_buffered_metrics;
 
@@ -369,7 +376,7 @@ void simple_connector_worker(void *instance_p)
             stats->lost_metrics =
             stats->lost_bytes = 0;
 
-            uv_mutex_unlock(&instance->mutex);
+            netdata_mutex_unlock(&instance->mutex);
         }
 
 #ifdef UNIT_TESTING

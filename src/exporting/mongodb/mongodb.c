@@ -113,9 +113,9 @@ int init_mongodb_instance(struct instance *instance)
                           instance->config.name);
         return 1;
     }
-    if (uv_mutex_init(&instance->mutex))
+    if (netdata_mutex_init(&instance->mutex))
         return 1;
-    if (uv_cond_init(&instance->cond_var))
+    if (netdata_cond_init(&instance->cond_var))
         return 1;
 
     struct mongodb_specific_data *connector_specific_data = callocz(1, sizeof(struct mongodb_specific_data));
@@ -285,23 +285,19 @@ void mongodb_connector_worker(void *instance_p)
     struct mongodb_specific_data *connector_specific_data =
         (struct mongodb_specific_data *)instance->connector_specific_data;
 
-    char threadname[ND_THREAD_TAG_MAX + 1];
-    snprintfz(threadname, ND_THREAD_TAG_MAX, "EXPMNG[%zu]", instance->index);
-    uv_thread_set_name_np(threadname);
-
     while (!instance->engine->exit) {
         struct stats *stats = &instance->stats;
 
-        uv_mutex_lock(&instance->mutex);
+        netdata_mutex_lock(&instance->mutex);
         if (!connector_specific_data->first_buffer->insert ||
             !connector_specific_data->first_buffer->documents_inserted) {
             while (!instance->data_is_ready)
-                uv_cond_wait(&instance->cond_var, &instance->mutex);
+                netdata_cond_wait(&instance->cond_var, &instance->mutex);
             instance->data_is_ready = 0;
         }
 
         if (unlikely(instance->engine->exit)) {
-            uv_mutex_unlock(&instance->mutex);
+            netdata_mutex_unlock(&instance->mutex);
             break;
         }
 
@@ -326,7 +322,7 @@ void mongodb_connector_worker(void *instance_p)
         connector_specific_data->first_buffer->buffered_bytes = 0;
         connector_specific_data->first_buffer = connector_specific_data->first_buffer->next;
 
-        uv_mutex_unlock(&instance->mutex);
+        netdata_mutex_unlock(&instance->mutex);
 
         size_t data_size = 0;
         for (size_t i = 0; i < documents_inserted; i++) {
@@ -374,7 +370,7 @@ void mongodb_connector_worker(void *instance_p)
         if (unlikely(instance->engine->exit))
             break;
 
-        uv_mutex_lock(&instance->mutex);
+        netdata_mutex_lock(&instance->mutex);
 
         stats->buffered_metrics = connector_specific_data->total_documents_inserted;
 
@@ -385,7 +381,7 @@ void mongodb_connector_worker(void *instance_p)
         stats->buffered_metrics = 0;
         stats->buffered_bytes -= buffered_bytes;
 
-        uv_mutex_unlock(&instance->mutex);
+        netdata_mutex_unlock(&instance->mutex);
 
 #ifdef UNIT_TESTING
         return;

@@ -296,10 +296,8 @@ static ALWAYS_INLINE_HOT size_t get_page_list_from_pgc(PGC *cache, METRIC *metri
                 if(datafile_acquire(datafile, DATAFILE_ACQUIRE_PAGE_DETAILS)) { // for pd
                     struct extent_io_data *xio = (struct extent_io_data *) pgc_page_custom_data(cache, page);
                     pd->datafile.ptr = pgc_page_data(page);
-                    pd->datafile.file = xio->file;
-                    pd->datafile.extent.pos = xio->pos;
-                    pd->datafile.extent.bytes = xio->bytes;
-                    pd->datafile.fileno = pd->datafile.ptr->fileno;
+                    pd->datafile.block = xio->block;
+                    pd->datafile.bytes = xio->bytes;
                     pd->status |= PDC_PAGE_DATAFILE_ACQUIRED | PDC_PAGE_DISK_PENDING;
                 }
                 else {
@@ -464,9 +462,8 @@ static ALWAYS_INLINE_HOT size_t list_has_time_gaps(
 
                 internal_fatal(pd->status & PDC_PAGE_SKIP, "page is disk pending and skipped");
                 internal_fatal(!pd->datafile.ptr, "datafile is NULL");
-                internal_fatal(!pd->datafile.extent.bytes, "datafile.extent.bytes zero");
-                internal_fatal(!pd->datafile.extent.pos, "datafile.extent.pos is zero");
-                internal_fatal(!pd->datafile.fileno, "datafile.fileno is zero");
+                internal_fatal(!pd->datafile.bytes, "datafile.bytes zero");
+                internal_fatal(!pd->datafile.block, "datafile.block is zero");
             }
         }
         else {
@@ -488,7 +485,7 @@ static ALWAYS_INLINE_HOT size_t list_has_time_gaps(
 // ----------------------------------------------------------------------------
 
 typedef void (*page_found_callback_t)(PGC_PAGE *page, void *data);
-static ALWAYS_INLINE_HOT size_t get_page_list_from_journal_v2(struct rrdengine_instance *ctx, METRIC *metric, usec_t start_time_ut, usec_t end_time_ut, page_found_callback_t callback, void *callback_data) {
+static NOT_INLINE_HOT size_t get_page_list_from_journal_v2(struct rrdengine_instance *ctx, METRIC *metric, usec_t start_time_ut, usec_t end_time_ut, page_found_callback_t callback, void *callback_data) {
     nd_uuid_t *uuid = mrg_metric_uuid(main_mrg, metric);
     Word_t metric_id = mrg_metric_id(main_mrg, metric);
 
@@ -513,98 +510,117 @@ static ALWAYS_INLINE_HOT size_t get_page_list_from_journal_v2(struct rrdengine_i
         if (unlikely(!j2_header))
             continue;
 
-        time_t journal_start_time_s = (time_t)(j2_header->start_time_ut / USEC_PER_SEC);
-        size_t journal_v2_file_size = datafile->journalfile->mmap.size;
+        char file_path[RRDENG_PATH_MAX];
+        journalfile_v2_generate_path(datafile, file_path, sizeof(file_path));
+        PROTECTED_ACCESS_SETUP(datafile->journalfile->mmap.data, datafile->journalfile->mmap.size, file_path, "read");
+        if(no_signal_received) {
+            time_t journal_start_time_s = (time_t)(j2_header->start_time_ut / USEC_PER_SEC);
+            size_t journal_v2_file_size = datafile->journalfile->mmap.size;
 
-        // the datafile possibly contains useful data for this query
+            // the datafile possibly contains useful data for this query
 
-        size_t journal_metric_count = (size_t)j2_header->metric_count;
-        struct journal_metric_list *uuid_list = (struct journal_metric_list *)((uint8_t *) j2_header + j2_header->metric_offset);
-        size_t metric_offset = (uint8_t *) uuid_list - (uint8_t *) j2_header;
-        if (metric_offset >= journal_v2_file_size) {
-            nd_log_limit_static_thread_var(erl, 60, 0);
-            nd_log_limit(&erl, NDLS_DAEMON, NDLP_ERR, "DBENGINE: Invalid metric list header in journalfile %u of tier %u", datafile->fileno, datafile->tier);
-            journalfile_v2_data_release(datafile->journalfile);
-            continue;
-        }
-
-        struct journal_metric_list *uuid_entry = bsearch(uuid,uuid_list,journal_metric_count,sizeof(*uuid_list), journal_metric_uuid_compare);
-
-        if (unlikely(!uuid_entry)) {
-            // our UUID is not in this datafile
-            journalfile_v2_data_release(datafile->journalfile);
-            continue;
-        }
-
-        struct journal_page_header *page_list_header = (struct journal_page_header *) ((uint8_t *) j2_header + uuid_entry->page_offset);
-        size_t page_offset = (uint8_t *) page_list_header - (uint8_t *) j2_header;
-        if (page_offset >= journal_v2_file_size) {
-            nd_log_limit_static_thread_var(erl, 60, 0);
-            nd_log_limit(&erl, NDLS_DAEMON, NDLP_ERR, "DBENGINE: Invalid page list header in journalfile %u of tier %u", datafile->fileno, datafile->tier);
-            journalfile_v2_data_release(datafile->journalfile);
-            continue;
-        }
-
-        struct journal_page_list *page_list = (struct journal_page_list *)((uint8_t *) page_list_header + sizeof(*page_list_header));
-        struct journal_extent_list *extent_list = (void *)((uint8_t *)j2_header + j2_header->extent_offset);
-        uint32_t extent_entries = j2_header->extent_count;
-        uint32_t uuid_page_entries = page_list_header->entries;
-
-        for (uint32_t index = 0; index < uuid_page_entries; index++) {
-            struct journal_page_list *page_entry_in_journal = &page_list[index];
-
-            time_t page_first_time_s = page_entry_in_journal->delta_start_s + journal_start_time_s;
-            time_t page_last_time_s = page_entry_in_journal->delta_end_s + journal_start_time_s;
-
-            TIME_RANGE_COMPARE prc = is_page_in_time_range(page_first_time_s, page_last_time_s, wanted_start_time_s, wanted_end_time_s);
-            if(prc == PAGE_IS_IN_THE_PAST)
-                continue;
-
-            if(prc == PAGE_IS_IN_THE_FUTURE)
-                break;
-
-            // Make sure index is valid for this file
-            if (page_entry_in_journal->extent_index > extent_entries) {
+            size_t journal_metric_count = (size_t)j2_header->metric_count;
+            struct journal_metric_list *uuid_list =
+                (struct journal_metric_list *)((uint8_t *)j2_header + j2_header->metric_offset);
+            size_t metric_offset = (uint8_t *)uuid_list - (uint8_t *)j2_header;
+            if (metric_offset >= journal_v2_file_size) {
                 nd_log_limit_static_thread_var(erl, 60, 0);
-                nd_log_limit(&erl, NDLS_DAEMON, NDLP_ERR, "DBENGINE: Invalid extent index in journalfile %u", datafile->fileno);
-                break;
+                nd_log_limit(&erl, NDLS_DAEMON, NDLP_ERR,
+                             "DBENGINE: Invalid metric list header in journalfile %u of tier %u",
+                             datafile->fileno, datafile->tier);
+                journalfile_v2_data_release(datafile->journalfile);
+                continue;
             }
 
-            uint32_t page_update_every_s = page_entry_in_journal->update_every_s;
-            size_t page_length = page_entry_in_journal->page_length;
+            struct journal_metric_list *uuid_entry =
+                bsearch(uuid, uuid_list, journal_metric_count, sizeof(*uuid_list), journal_metric_uuid_compare);
 
-            if(datafile_acquire(datafile, DATAFILE_ACQUIRE_OPEN_CACHE)) { //for open cache item
-                // add this page to open cache
-                bool added = false;
-                struct extent_io_data ei = {
-                        .pos = extent_list[page_entry_in_journal->extent_index].datafile_offset,
-                        .bytes = extent_list[page_entry_in_journal->extent_index].datafile_size,
-                        .page_length = page_length,
-                        .file = datafile->file,
-                        .fileno = datafile->fileno,
-                };
-
-                PGC_PAGE *page = pgc_page_add_and_acquire(open_cache, (PGC_ENTRY) {
-                        .hot = false,
-                        .section = (Word_t) ctx,
-                        .metric_id = metric_id,
-                        .start_time_s = page_first_time_s,
-                        .end_time_s = page_last_time_s,
-                        .update_every_s = page_update_every_s,
-                        .data = datafile,
-                        .size = 0,
-                        .custom_data = (uint8_t *) &ei,
-                }, &added);
-
-                if(!added)
-                    datafile_release(datafile, DATAFILE_ACQUIRE_OPEN_CACHE);
-
-                callback(page, callback_data);
-
-                pgc_page_release(open_cache, page);
-
-                pages_found++;
+            if (unlikely(!uuid_entry)) {
+                // our UUID is not in this datafile
+                journalfile_v2_data_release(datafile->journalfile);
+                continue;
             }
+
+            struct journal_page_header *page_list_header =
+                (struct journal_page_header *)((uint8_t *)j2_header + uuid_entry->page_offset);
+            size_t page_offset = (uint8_t *)page_list_header - (uint8_t *)j2_header;
+            if (page_offset >= journal_v2_file_size) {
+                nd_log_limit_static_thread_var(erl, 60, 0);
+                nd_log_limit(&erl, NDLS_DAEMON, NDLP_ERR,
+                             "DBENGINE: Invalid page list header in journalfile %u of tier %u",
+                             datafile->fileno, datafile->tier);
+                journalfile_v2_data_release(datafile->journalfile);
+                continue;
+            }
+
+            struct journal_page_list *page_list =
+                (struct journal_page_list *)((uint8_t *)page_list_header + sizeof(*page_list_header));
+            struct journal_extent_list *extent_list = (void *)((uint8_t *)j2_header + j2_header->extent_offset);
+            uint32_t extent_entries = j2_header->extent_count;
+            uint32_t uuid_page_entries = page_list_header->entries;
+
+            for (uint32_t index = 0; index < uuid_page_entries; index++) {
+                struct journal_page_list *page_entry_in_journal = &page_list[index];
+
+                time_t page_first_time_s = page_entry_in_journal->delta_start_s + journal_start_time_s;
+                time_t page_last_time_s = page_entry_in_journal->delta_end_s + journal_start_time_s;
+
+                TIME_RANGE_COMPARE prc =
+                    is_page_in_time_range(page_first_time_s, page_last_time_s, wanted_start_time_s, wanted_end_time_s);
+
+                if (prc == PAGE_IS_IN_THE_PAST)
+                    continue;
+
+                if (prc == PAGE_IS_IN_THE_FUTURE)
+                    break;
+
+                // Make sure index is valid for this file
+                if (page_entry_in_journal->extent_index > extent_entries) {
+                    nd_log_limit_static_thread_var(erl, 60, 0);
+                    nd_log_limit(&erl, NDLS_DAEMON, NDLP_ERR,
+                                 "DBENGINE: Invalid extent index in journalfile %u",
+                                 datafile->fileno);
+                    break;
+                }
+
+                uint32_t page_update_every_s = page_entry_in_journal->update_every_s;
+
+                if (datafile_acquire(datafile, DATAFILE_ACQUIRE_OPEN_CACHE)) {
+                    //for open cache item
+                    // add this page to open cache
+                    bool added = false;
+                    struct extent_io_data ei = {0};
+                    ei.block = OFFSET_TO_BLOCK(extent_list[page_entry_in_journal->extent_index].datafile_offset);
+                    ei.bytes = extent_list[page_entry_in_journal->extent_index].datafile_size;
+                    ei.fileno = datafile->fileno;
+
+                    PGC_ENTRY e = {0};
+                    e.hot = false;
+                    e.section = (Word_t)ctx;
+                    e.metric_id = metric_id;
+                    e.start_time_s = page_first_time_s;
+                    e.end_time_s = page_last_time_s;
+                    e.update_every_s = page_update_every_s;
+                    e.data = datafile;
+                    e.size = 0;
+                    e.custom_data = (uint8_t *)&ei;
+                    PGC_PAGE *page = pgc_page_add_and_acquire(open_cache, e, &added);
+
+                    if (!added)
+                        datafile_release(datafile, DATAFILE_ACQUIRE_OPEN_CACHE);
+
+                    callback(page, callback_data);
+
+                    pgc_page_release(open_cache, page);
+
+                    pages_found++;
+                }
+            }
+        }
+        else {
+            nd_log_limit_static_thread_var(erl, 10, 0);
+            nd_log_limit(&erl, NDLS_DAEMON, NDLP_ERR, "DBENGINE: failed to access journal file %u of tier %d (SIGBUS)",
+                         datafile->fileno, datafile->ctx->config.tier);
         }
 
         journalfile_v2_data_release(datafile->journalfile);
@@ -635,10 +651,8 @@ void add_page_details_from_journal_v2(PGC_PAGE *page, void *JudyL_pptr) {
     struct page_details *pd = page_details_get();
     *PValue = pd;
 
-    pd->datafile.extent.pos = ei->pos;
-    pd->datafile.extent.bytes = ei->bytes;
-    pd->datafile.file = ei->file;
-    pd->datafile.fileno = ei->fileno;
+    pd->datafile.block = ei->block;
+    pd->datafile.bytes = ei->bytes;
     pd->first_time_s = pgc_page_start_time_s(page);
     pd->last_time_s = pgc_page_end_time_s(page);
     pd->datafile.ptr = datafile;
@@ -1021,18 +1035,24 @@ struct pgc_page *pg_cache_lookup_next(
     return page;
 }
 
-void pgc_open_add_hot_page(Word_t section, Word_t metric_id, time_t start_time_s, time_t end_time_s, uint32_t update_every_s,
-           struct rrdengine_datafile *datafile, uint64_t extent_offset, unsigned extent_size, uint32_t page_length) {
+void pgc_open_add_hot_page(
+    Word_t section,
+    Word_t metric_id,
+    time_t start_time_s,
+    time_t end_time_s,
+    uint32_t update_every_s,
+    struct rrdengine_datafile *datafile,
+    uint64_t extent_offset,
+    unsigned extent_size)
+{
 
     if(!datafile_acquire(datafile, DATAFILE_ACQUIRE_OPEN_CACHE)) // for open cache item
         fatal("DBENGINE: cannot acquire datafile to put page in open cache");
 
     struct extent_io_data ext_io_data = {
-            .file  = datafile->file,
             .fileno = datafile->fileno,
-            .pos = extent_offset,
+            .block = OFFSET_TO_BLOCK(extent_offset),
             .bytes = extent_size,
-            .page_length = page_length
     };
 
     PGC_ENTRY page_entry = {

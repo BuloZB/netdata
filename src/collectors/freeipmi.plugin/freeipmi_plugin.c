@@ -20,7 +20,7 @@
 
 #define FREEIPMI_GLOBAL_FUNCTION_SENSORS() do { \
         fprintf(stdout, PLUGINSD_KEYWORD_FUNCTION " GLOBAL \"ipmi-sensors\" %d \"%s\" \"top\" "HTTP_ACCESS_FORMAT" %d\n", \
-                5, "Displays current sensor state and readings",                                                     \
+                5, "Shows IPMI hardware sensor readings including temperatures, voltages, fan speeds, and component health status.",                                                     \
                 (HTTP_ACCESS_FORMAT_CAST)(HTTP_ACCESS_NONE), 100); \
     } while(0)
 
@@ -84,7 +84,16 @@ static void netdata_update_ipmi_sel_events_count(struct netdata_ipmi_state *stt,
 
 /* Communication Configuration - Initialize accordingly */
 
-static netdata_mutex_t stdout_mutex = NETDATA_MUTEX_INITIALIZER;
+static netdata_mutex_t stdout_mutex;
+
+static void __attribute__((constructor)) init_mutex(void) {
+    netdata_mutex_init(&stdout_mutex);
+}
+
+static void __attribute__((destructor)) destroy_mutex(void) {
+    netdata_mutex_destroy(&stdout_mutex);
+}
+
 static bool function_plugin_should_exit = false;
 
 int update_every = IPMI_SENSORS_MIN_UPDATE_EVERY; // this is the minimum update frequency
@@ -1187,7 +1196,7 @@ struct ipmi_collection_thread {
     struct netdata_ipmi_state state;
 };
 
-void *netdata_ipmi_collection_thread(void *ptr) {
+void netdata_ipmi_collection_thread(void *ptr) {
     struct ipmi_collection_thread *t = ptr;
 
     if(t->debug) fprintf(stderr, "%s: calling initialize_ipmi_config() for %s\n",
@@ -1210,7 +1219,7 @@ void *netdata_ipmi_collection_thread(void *ptr) {
             t->state.sel.last_iteration_ut = 0;
         }
 
-        return ptr;
+        return;
     }
     else {
         if(t->type & IPMI_COLLECT_TYPE_SENSORS) {
@@ -1282,8 +1291,6 @@ void *netdata_ipmi_collection_thread(void *ptr) {
         t->state = tmp_state;
         spinlock_unlock(&t->spinlock);
     }
-
-    return ptr;
 }
 
 // ----------------------------------------------------------------------------
@@ -1983,7 +1990,7 @@ int main (int argc, char **argv) {
     };
 
     nd_thread_create("IPMI[sensors]", NETDATA_THREAD_OPTION_DONT_LOG, netdata_ipmi_collection_thread, &sensors_data);
-    if(netdata_do_sel)
+    if (netdata_do_sel)
         nd_thread_create("IPMI[sel]", NETDATA_THREAD_OPTION_DONT_LOG, netdata_ipmi_collection_thread, &sel_data);
 
     // ------------------------------------------------------------------------
@@ -2107,6 +2114,7 @@ int main (int argc, char **argv) {
         if (restart_every && (now_monotonic_sec() - started_t > IPMI_RESTART_EVERY_SECONDS)) {
             collector_info("%s(): reached my lifetime expectancy. Exiting to restart.", __FUNCTION__);
             fprintf(stdout, "EXIT\n");
+            netdata_mutex_unlock(&stdout_mutex);
             plugin_exit(0);
         }
 

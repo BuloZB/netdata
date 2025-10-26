@@ -56,6 +56,9 @@ README
 TODO.md
 TODO.txt
 
+# vscode extension Continue
+.continue
+
 # related to karma/javascript/node
 /node_modules/
 /coverage/
@@ -179,6 +182,7 @@ src/libnetdata/gorilla/fuzz-*.log
 
 # ignore build/ directory (default dir for many IDEs/LSPs)
 build/
+build-*/
 
 # ignore rules for go plugin code
 src/go/plugin/go.d/bin/
@@ -186,3 +190,22 @@ src/go/plugin/go.d/vendor
 
 # ignore files used with msi installer
 packaging/windows/*.msi
+
+# agent-events build artifacts and test files
+packaging/tools/agent-events/agent-events
+packaging/tools/agent-events/expected_metrics.txt
+packaging/tools/agent-events/cf_patch.txt
+packaging/tools/agent-events/parseBehaviorTest.go
+packaging/tools/agent-events/server
+packaging/tools/agent-events/go.mod
+packaging/tools/agent-events/go.sum
+
+**/.claude/settings.local.json
+.mcp.json
+.users_cache.json
+.channels_cache_v2.json
+build-ibm.sh
+compile.sh
+run-ibm.sh
+
+tmp/

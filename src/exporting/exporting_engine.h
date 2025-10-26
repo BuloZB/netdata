@@ -74,6 +74,7 @@ struct instance_config {
     const char *prefix;
     const char *label_prefix;
     const char *hostname;
+    const char *thread_tag;
 
     int update_every;
     int buffer_on_failures;
@@ -208,9 +209,9 @@ struct instance {
     time_t after;
     time_t before;
 
-    uv_thread_t thread;
-    uv_mutex_t mutex;
-    uv_cond_t cond_var;
+    ND_THREAD *thread;
+    netdata_mutex_t mutex;
+    netdata_cond_t cond_var;
     int data_is_ready;
 
     int (*start_batch_formatting)(struct instance *instance);
@@ -251,7 +252,7 @@ struct engine {
 
 extern struct instance *prometheus_exporter_instance;
 
-void *exporting_main(void *ptr);
+void exporting_main(void *ptr);
 
 struct engine *read_exporting_config();
 EXPORTING_CONNECTOR_TYPE exporting_select_type(const char *type);
@@ -299,11 +300,19 @@ void send_internal_metrics(struct instance *instance);
 void clean_instance(struct instance *ptr);
 void simple_connector_cleanup(struct instance *instance);
 
+/**
+ * Free exporting configuration
+ * 
+ * Free all memory associated with the exporting configuration.
+ * Called during shutdown to prevent memory leaks.
+ */
+void exporting_config_free(void);
+
 static inline void disable_instance(struct instance *instance)
 {
     instance->disabled = 1;
     instance->scheduled = 0;
-    uv_mutex_unlock(&instance->mutex);
+    netdata_mutex_unlock(&instance->mutex);
     netdata_log_error("EXPORTING: Instance %s disabled", instance->config.name);
 }
 

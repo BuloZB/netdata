@@ -47,7 +47,6 @@ The default configuration for this integration does not impose any limits on dat
 
 This thread will add overhead every time that an internal kernel function monitored by this thread is called.
 
-
 ## Metrics
 
 Metrics grouped by *scope*.
@@ -94,6 +93,7 @@ There are no alerts configured by default for this integration.
 
 ## Setup
 
+
 ### Prerequisites
 
 #### Compile kernel
@@ -121,11 +121,27 @@ This thread needs to attach a tracepoint to monitor when a process schedule an e
 
 ### Configuration
 
-#### File
+#### Options
+
+Overwrite default configuration reducing number of I/O events
+
+
+
+
+#### via File
 
 The configuration file name for this integration is `ebpf.d/oomkill.conf`.
 
+The file format is a modified INI syntax. The general structure is:
 
+```ini
+[section1]
+    option1 = some value
+    option2 = some other value
+
+[section2]
+    option3 = some third value
+```
 You can edit the configuration file using the [`edit-config`](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#edit-a-configuration-file-using-edit-config) script from the
 Netdata [config directory](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#the-netdata-config-directory).
 
@@ -133,12 +149,8 @@ Netdata [config directory](https://github.com/netdata/netdata/blob/master/docs/n
 cd /etc/netdata 2>/dev/null || cd /opt/netdata/etc/netdata
 sudo ./edit-config ebpf.d/oomkill.conf
 ```
-#### Options
 
-Overwrite default configuration reducing number of I/O events
-
-
-#### Examples
+##### Examples
 There are no configuration examples.
 
 

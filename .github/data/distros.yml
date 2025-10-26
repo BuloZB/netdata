@@ -9,7 +9,6 @@ platform_map:  # map packaging architectures to docker platforms
   armv6l: linux/arm/v6
   armv7l: linux/arm/v7
   i386: linux/386
-  ppc64le: linux/ppc64le
   x86_64: linux/amd64
 arch_order:  # sort order for per-architecture jobs in CI
   - amd64
@@ -21,7 +20,6 @@ arch_order:  # sort order for per-architecture jobs in CI
   - armv7l
   - arm64
   - aarch64
-  - ppc64le
 arch_data:  # Mapping of per-architecture matrix behavior.
   amd64: &amd64
     qemu: false
@@ -38,21 +36,15 @@ arch_data:  # Mapping of per-architecture matrix behavior.
     qemu: false
     runner: *arm-runner
   aarch64: *arm64
-  ppc64le:
-    qemu: true
-    runner: *x86-runner
 static_arches:  # Static build architectures
   - x86_64
   - armv6l
   - armv7l
   - aarch64
-  - ppc64le
 docker_arches:  # Docker build archtiectures
   - amd64
-  - i386
   - armv7l
   - arm64
-  - ppc64le
 default_sentry: &default_sentry # Default configuration for Sentry usage
   amd64: false
   x86_64: false
@@ -76,6 +68,11 @@ include:
       apk del json-c-dev
     test:
       ebpf-core: true
+  - <<: *alpine
+    version: "3.21"
+    support_type: Core
+    notes: ''
+    eol_check: true
   - <<: *alpine
     version: "3.20"
     support_type: Core
@@ -141,8 +138,8 @@ include:
 
   - &centos_stream
     distro: centos-stream
-    base_image: 'quay.io/centos/centos:stream9'
-    version: '9'
+    base_image: 'quay.io/centos/centos:stream10'
+    version: '10'
     support_type: 'Community'
     notes: ''
     jsonc_removal: |
@@ -151,20 +148,26 @@ include:
     bundle_sentry: *default_sentry
     packages: &cs_packages
       type: rpm
-      repo_distro: el/c9s
+      repo_distro: el/c10s
       builder_rev: *def_builder_rev
       arches:
         - x86_64
         - aarch64
     test:
       ebpf-core: true
+  - <<: *centos_stream
+    base_image: 'quay.io/centos/centos:stream9'
+    version: '9'
+    packages:
+      <<: *cs_packages
+      repo_distro: el/c9s
 
   - &debian
     distro: debian
-    version: "12"
+    version: "13"
     support_type: Core
     notes: ''
-    base_image: debian:bookworm
+    base_image: debian:trixie
     eol_check: true
     eol_lts: true
     bundle_sentry:
@@ -176,8 +179,20 @@ include:
       apt-get purge -y libjson-c-dev
     packages: &debian_packages
       type: deb
-      repo_distro: debian/bookworm
+      repo_distro: debian/trixie
       builder_rev: v2
+      arches:
+        - amd64
+        - armhf
+        - arm64
+    test:
+      ebpf-core: true
+  - <<: *debian
+    version: "12"
+    base_image: debian:bookworm
+    packages:
+      <<: *debian_packages
+      repo_distro: debian/bookworm
       arches:
         - i386
         - amd64
@@ -191,12 +206,17 @@ include:
     packages:
       <<: *debian_packages
       repo_distro: debian/bullseye
+      arches:
+        - i386
+        - amd64
+        - armhf
+        - arm64
     test:
       ebpf-core: false
 
   - &fedora
     distro: fedora
-    version: "41"
+    version: "43"
     support_type: Core
     notes: ''
     eol_check: true
@@ -205,7 +225,7 @@ include:
       dnf remove -y json-c-devel
     packages: &fedora_packages
       type: rpm
-      repo_distro: fedora/41
+      repo_distro: fedora/43
       builder_rev: *def_builder_rev
       arches:
         - x86_64
@@ -213,36 +233,49 @@ include:
     test:
       ebpf-core: true
   - <<: *fedora
-    version: "40"
+    version: "42"
     packages:
       <<: *fedora_packages
-      repo_distro: fedora/40
+      repo_distro: fedora/42
+    test:
+      ebpf-core: true
+  - <<: *fedora
+    version: "41"
+    packages:
+      <<: *fedora_packages
+      repo_distro: fedora/41
     test:
       ebpf-core: true
 
   - &opensuse
     distro: opensuse
-    version: "15.6"
+    version: "16.0"
     support_type: Core
     notes: ''
     eol_check: true
     bundle_sentry: *default_sentry
-    base_image: opensuse/leap:15.6
+    base_image: opensuse/leap:16.0
     jsonc_removal: |
       zypper rm -y libjson-c-devel
     packages: &opensuse_packages
       type: rpm
-      repo_distro: opensuse/15.6
+      repo_distro: opensuse/16.0
       builder_rev: *def_builder_rev
       arches:
         - x86_64
         - aarch64
     test:
       ebpf-core: true
+  - <<: *opensuse
+    version: "15.6"
+    base_image: opensuse/leap:15.6
+    packages:
+      <<: *opensuse_packages
+      repo_distro: opensuse/15.6
 
   - &oracle
     distro: oraclelinux
-    version: "8"
+    version: "10"
     support_type: Core
     notes: ''
     eol_check: true
@@ -251,22 +284,35 @@ include:
       dnf remove -y json-c-devel
     packages: &oracle_packages
       type: rpm
-      repo_distro: ol/8
+      repo_distro: ol/10
       builder_rev: *def_builder_rev
       arches:
         - x86_64
         - aarch64
     test:
       ebpf-core: true
+      skip-local-build: true
   - <<: *oracle
     version: "9"
     packages:
       <<: *oracle_packages
       repo_distro: ol/9
+    test:
+      ebpf-core: true
+      skip-local-build: false
+  - <<: *oracle
+    version: "8"
+    packages:
+      <<: *oracle_packages
+      repo_distro: ol/8
+    test:
+      ebpf-core: true
+      skip-local-build: false
 
   - &rocky
     distro: rockylinux
-    version: "9"
+    version: "10"
+    base_image: "quay.io/rockylinux/rockylinux:10"
     support_type: Core
     notes: ''
     jsonc_removal: |
@@ -275,19 +321,30 @@ include:
     bundle_sentry: *default_sentry
     packages: &rocky_packages
       type: rpm
-      repo_distro: el/9
+      repo_distro: el/10
       builder_rev: *def_builder_rev
       alt_links:
-        - el/9Server
-        - el/9Client
-        - el/9RedHatVirtualizationHost
+        - el/10Server
+        - el/10Client
+        - el/10RedHatVirtualizationHost
       arches:
         - x86_64
         - aarch64
     test:
       ebpf-core: true
   - <<: *rocky
+    version: "9"
+    base_image: rockylinux:9
+    packages:
+      <<: *rocky_packages
+      repo_distro: el/9
+      alt_links:
+        - el/9Server
+        - el/9Client
+        - el/9RedHatVirtualizationHost
+  - <<: *rocky
     version: "8"
+    base_image: rockylinux:8
     packages:
       <<: *rocky_packages
       repo_distro: el/8
@@ -320,10 +377,15 @@ include:
     test:
       ebpf-core: true
   - <<: *ubuntu
-    version: "24.10"
+    version: "25.10"
     packages:
       <<: *ubuntu_packages
-      repo_distro: ubuntu/oracular
+      repo_distro: ubuntu/questing
+  - <<: *ubuntu
+    version: "25.04"
+    packages:
+      <<: *ubuntu_packages
+      repo_distro: ubuntu/plucky
   - <<: *ubuntu
     version: "22.04"
     packages:
@@ -357,6 +419,13 @@ legacy: # Info for platforms we used to support and still need to handle package
       repo_distro: fedora/39
     test:
       ebpf-core: true
+  - <<: *fedora
+    version: "40"
+    packages:
+      <<: *fedora_packages
+      repo_distro: fedora/40
+    test:
+      ebpf-core: true
   - <<: *opensuse
     version: "15.4"
     packages:
@@ -379,6 +448,11 @@ legacy: # Info for platforms we used to support and still need to handle package
     packages:
       <<: *ubuntu_packages
       repo_distro: ubuntu/mantic
+  - <<: *ubuntu
+    version: "24.10"
+    packages:
+      <<: *ubuntu_packages
+      repo_distro: ubuntu/oracular
 no_include: # Info for platforms not covered in CI
   - distro: docker
     version: "19.03 or newer"
@@ -390,7 +464,6 @@ no_include: # Info for platforms not covered in CI
         - linux/amd64
         - linux/arm/v7
         - linux/arm64
-        - linux/ppc64le
 
   - distro: clearlinux
     version: latest
@@ -399,13 +472,15 @@ no_include: # Info for platforms not covered in CI
 
   - &rhel
     distro: rhel
-    version: "9.x"
+    version: "10.x"
     support_type: Core
     notes: ''
     packages:
       arches:
         - x86_64
         - aarch64
+  - <<: *rhel
+    version: "9.x"
   - <<: *rhel
     version: "8.x"
   - <<: *rhel

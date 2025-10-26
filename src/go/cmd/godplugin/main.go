@@ -9,14 +9,15 @@ import (
 	"os/user"
 	"strings"
 
-	"github.com/netdata/netdata/go/plugins/logger"
-	"github.com/netdata/netdata/go/plugins/pkg/buildinfo"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/cli"
-
 	"go.uber.org/automaxprocs/maxprocs"
 	"golang.org/x/net/http/httpproxy"
 
+	"github.com/netdata/netdata/go/plugins/logger"
+	"github.com/netdata/netdata/go/plugins/pkg/buildinfo"
+	"github.com/netdata/netdata/go/plugins/pkg/cli"
+	"github.com/netdata/netdata/go/plugins/pkg/executable"
+	"github.com/netdata/netdata/go/plugins/pkg/pluginconfig"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent"
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector"
 )
 
@@ -33,38 +34,42 @@ func main() {
 	opts := parseCLI()
 
 	if opts.Version {
-		fmt.Printf("go.d.plugin, version: %s\n", buildinfo.Version)
+		fmt.Printf("%s.plugin, version: %s\n", executable.Name, buildinfo.Version)
 		return
 	}
 
-	env := newEnvConfig()
-	cfg := newConfig(opts, env)
+	pluginconfig.MustInit(opts)
 
-	if env.logLevel != "" {
-		logger.Level.SetByName(env.logLevel)
+	if lvl := pluginconfig.EnvLogLevel(); lvl != "" {
+		logger.Level.SetByName(lvl)
 	}
 	if opts.Debug {
 		logger.Level.Set(slog.LevelDebug)
 	}
 
 	a := agent.New(agent.Config{
-		Name:                      cfg.name,
-		PluginConfigDir:           cfg.pluginDir,
-		CollectorsConfigDir:       cfg.collectorsDir,
-		ServiceDiscoveryConfigDir: cfg.serviceDiscoveryDir,
-		CollectorsConfigWatchPath: cfg.collectorsWatchPath,
-		VarLibDir:                 cfg.varLibDir,
+		Name:                      executable.Name,
+		PluginConfigDir:           pluginconfig.ConfigDir(),
+		CollectorsConfigDir:       pluginconfig.CollectorsDir(),
+		ServiceDiscoveryConfigDir: pluginconfig.ServiceDiscoveryDir(),
+		CollectorsConfigWatchPath: pluginconfig.CollectorsConfigWatchPaths(),
+		VarLibDir:                 pluginconfig.VarLibDir(),
 		RunModule:                 opts.Module,
+		RunJob:                    opts.Job,
 		MinUpdateEvery:            opts.UpdateEvery,
+		DumpSummary:               opts.DumpSummary,
 	})
 
-	a.Debugf("plugin: name=%s, version=%s", a.Name, buildinfo.Version)
+	a.Debugf("plugin: name=%s, %s", a.Name, buildinfo.Info())
 	if u, err := user.Current(); err == nil {
 		a.Debugf("current user: name=%s, uid=%s", u.Username, u.Uid)
 	}
 
 	proxyCfg := httpproxy.FromEnvironment()
 	a.Infof("env HTTP_PROXY '%s', HTTPS_PROXY '%s'", proxyCfg.HTTPProxy, proxyCfg.HTTPSProxy)
+
+	a.Infof("directories → config: %s | collectors: %s | sd: %s | varlib: %s",
+		a.ConfigDir, a.CollectorsConfDir, a.ServiceDiscoveryConfigDir, a.VarLibDir)
 
 	a.Run()
 }

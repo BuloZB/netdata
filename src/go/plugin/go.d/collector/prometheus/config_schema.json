@@ -11,6 +11,13 @@
         "minimum": 1,
         "default": 10
       },
+      "autodetection_retry": {
+        "title": "Detection retry",
+        "description": "Recheck interval in seconds. Zero means no recheck will be scheduled.",
+        "type": "integer",
+        "minimum": 0,
+        "default": 60
+      },
       "url": {
         "title": "URL",
         "description": "The URL of the Prometheus metrics endpoint.",
@@ -210,14 +217,16 @@
       "method": {
         "title": "Method",
         "type": "string"
+      },
+      "force_http2": {
+        "title": "Force HTTP2",
+        "description": "If set, forces the use of HTTP/2 protocol for all requests, even over plain TCP (h2c).",
+        "type": "boolean"
       }
     },
     "required": [
       "url"
-    ],
-    "patternProperties": {
-      "^name$": {}
-    }
+    ]
   },
   "uiSchema": {
     "uiOptions": {
@@ -230,6 +239,7 @@
           "title": "Base",
           "fields": [
             "update_every",
+            "autodetection_retry",
             "url",
             "timeout",
             "not_follow_redirects",
@@ -290,6 +300,9 @@
         }
       ]
     },
+    "autodetection_retry": {
+      "ui:help": "This option determines how frequently (in seconds) Netdata will retry data collection jobs that failed initially, with the value of 60 meaning it retries to start data collection jobs every 60 seconds, while setting it to 0 disables this retry mechanism entirely."
+    },
     "vnode": {
       "ui:placeholder": "To use this option, first create a Virtual Node and then reference its name here."
     },
@@ -318,6 +331,9 @@
       "ui:widget": "hidden"
     },
     "method": {
+      "ui:widget": "hidden"
+    },
+    "force_http2": {
       "ui:widget": "hidden"
     }
   }

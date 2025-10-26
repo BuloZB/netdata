@@ -8,9 +8,9 @@ import (
 	"errors"
 	"time"
 
+	"github.com/netdata/netdata/go/plugins/pkg/confopt"
+	"github.com/netdata/netdata/go/plugins/pkg/tlscfg"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/confopt"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/tlscfg"
 )
 
 //go:embed "config_schema.json"
@@ -42,13 +42,14 @@ func New() *Collector {
 }
 
 type Config struct {
-	Vnode            string           `yaml:"vnode,omitempty" json:"vnode"`
-	UpdateEvery      int              `yaml:"update_every,omitempty" json:"update_every"`
-	URL              string           `yaml:"url" json:"url"`
-	Timeout          confopt.Duration `yaml:"timeout,omitempty" json:"timeout"`
-	Username         string           `yaml:"username" json:"username"`
-	Password         string           `yaml:"password" json:"password"`
-	tlscfg.TLSConfig `yaml:",inline" json:""`
+	Vnode              string           `yaml:"vnode,omitempty" json:"vnode"`
+	UpdateEvery        int              `yaml:"update_every,omitempty" json:"update_every"`
+	AutoDetectionRetry int              `yaml:"autodetection_retry,omitempty" json:"autodetection_retry"`
+	URL                string           `yaml:"url" json:"url"`
+	Timeout            confopt.Duration `yaml:"timeout,omitempty" json:"timeout"`
+	Username           string           `yaml:"username" json:"username"`
+	Password           string           `yaml:"password" json:"password"`
+	tlscfg.TLSConfig   `yaml:",inline" json:""`
 }
 
 type Collector struct {

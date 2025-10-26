@@ -74,8 +74,8 @@ ALWAYS_INLINE int64_t JudyAllocThreadPulseGetAndReset(void) {
 // --------------------------------------------------------------------------------------------------------------------
 // Judy dedicated jemalloc arena
 
-static unsigned jemalloc_arena_index = 0;
-static bool jemalloc_initialized = false;
+static unsigned jemalloc_arena_index __maybe_unused = 0;
+static bool jemalloc_initialized __maybe_unused = false;
 
 #ifdef HAVE_JEMALLOC_ARENA_API
 #include <jemalloc/jemalloc.h>
@@ -159,6 +159,9 @@ void JudyFreeVirtual(void * PWord, Word_t Words) {
 void libjudy_malloc_init(void) {
     // IMPORTANT: this is not called on external plugins
     // the allocator should run even if this is not called
+
+    (void)jemalloc_initialized;
+    (void)jemalloc_arena_index;
 
 #ifdef HAVE_JEMALLOC_ARENA_API
     jemalloc_init();

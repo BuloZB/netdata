@@ -5,6 +5,7 @@
 // Key OF HS ARRRAY
 
 struct {
+    int count;
     Pvoid_t JudyHS;
     SPINLOCK spinlock;
 } global_labels = {
@@ -28,7 +29,7 @@ typedef struct labels_registry_idx_entry {
 
 typedef struct rrdlabels {
     SPINLOCK spinlock;
-    size_t version;
+    uint32_t version;
     Pvoid_t JudyL;
 } RRDLABELS;
 
@@ -64,30 +65,10 @@ typedef struct rrdlabels {
     }                                                                                                                  \
     while (0)
 
-static inline void STATS_PLUS_MEMORY(struct dictionary_stats *stats, int64_t judy_mem, size_t item_size, size_t value_size) {
-    if(judy_mem)
-        __atomic_fetch_add(&stats->memory.index, judy_mem, __ATOMIC_RELAXED);
-
-    if(item_size)
-        __atomic_fetch_add(&stats->memory.dict, (ssize_t)item_size, __ATOMIC_RELAXED);
-
-    if(value_size)
-        __atomic_fetch_add(&stats->memory.values, (long)value_size, __ATOMIC_RELAXED);
+static inline void RRDLABELS_MEMORY_DELTA(struct dictionary_stats *stats, int64_t judy_mem, int64_t item_size) {
+    __atomic_fetch_add(&stats->memory.index, judy_mem, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&stats->memory.dict, item_size, __ATOMIC_RELAXED);
 }
-
-static inline void STATS_MINUS_MEMORY(struct dictionary_stats *stats, int64_t judy_mem, size_t item_size, size_t value_size) {
-    if(judy_mem)
-        __atomic_fetch_add(&stats->memory.index, judy_mem, __ATOMIC_RELAXED);
-
-    if(item_size)
-        __atomic_fetch_sub(&stats->memory.dict, (ssize_t)item_size, __ATOMIC_RELAXED);
-
-    if(value_size)
-        __atomic_fetch_sub(&stats->memory.values, (long)value_size, __ATOMIC_RELAXED);
-}
-
-#define RRDLABELS_MAX_NAME_LENGTH 200
-#define RRDLABELS_MAX_VALUE_LENGTH 800 // 800 in bytes, up to 200 UTF-8 characters
 
 __attribute__((constructor)) void initialize_label_stats(void) {
     dictionary_stats_category_rrdlabels.memory.dict = 0;
@@ -95,13 +76,37 @@ __attribute__((constructor)) void initialize_label_stats(void) {
     dictionary_stats_category_rrdlabels.memory.values = 0;
 }
 
+
+static ARAL *labels_aral;
+
+static struct aral_statistics label_aral_statistics = { 0 };
+
+void rrdlabels_aral_init(bool with_stats)
+{
+    labels_aral =
+        aral_create("label_stat", sizeof(RRDLABELS), 1, 0, &label_aral_statistics, NULL, NULL, false, false, false);
+
+    if (with_stats)
+        pulse_aral_register_statistics(&label_aral_statistics, "labels");
+}
+
+void rrdlabels_aral_destroy(bool with_stats)
+{
+    aral_destroy(labels_aral);
+    if (with_stats)
+        pulse_aral_unregister_statistics(&label_aral_statistics);
+}
+
+
 // ----------------------------------------------------------------------------
 // rrdlabels_create()
 
 RRDLABELS *rrdlabels_create(void)
 {
-    RRDLABELS *labels = callocz(1, sizeof(*labels));
-    STATS_PLUS_MEMORY(&dictionary_stats_category_rrdlabels, 0, sizeof(RRDLABELS), 0);
+    RRDLABELS *labels = aral_mallocz(labels_aral);
+    spinlock_init(&labels->spinlock);
+    labels->version = 0;
+    labels->JudyL = NULL;
     return labels;
 }
 
@@ -143,12 +148,13 @@ static RRDLABEL *add_label_name_value(const char *name, const char *value)
         rrdlabel = *PValue;
         string_freez(label_index.key);
         string_freez(label_index.value);
-        STATS_PLUS_MEMORY(&dictionary_stats_category_rrdlabels, judy_mem, 0, 0);
+        RRDLABELS_MEMORY_DELTA(&dictionary_stats_category_rrdlabels, judy_mem, 0);
     } else {
         rrdlabel = callocz(1, sizeof(*rrdlabel));
         rrdlabel->label.index = label_index;
         *PValue = rrdlabel;
-        STATS_PLUS_MEMORY(&dictionary_stats_category_rrdlabels, judy_mem, sizeof(RRDLABEL_IDX), 0);
+        RRDLABELS_MEMORY_DELTA(&dictionary_stats_category_rrdlabels, judy_mem, sizeof(RRDLABEL_IDX));
+        global_labels.count++;
     }
     __atomic_add_fetch(&rrdlabel->refcount, 1, __ATOMIC_RELAXED);
 
@@ -167,17 +173,26 @@ static void delete_label(RRDLABEL *label)
         if (refcount == 0) {
             JudyAllocThreadPulseReset();
 
-            JudyHSDel(&global_labels.JudyHS, (void *)label, sizeof(*label), PJE0);
+            int rc = JudyHSDel(&global_labels.JudyHS, (void *)&label->index, sizeof(label->index), PJE0);
+            if(rc)
+                global_labels.count--;
 
             int64_t judy_mem = JudyAllocThreadPulseGetAndReset();
 
-            STATS_MINUS_MEMORY(&dictionary_stats_category_rrdlabels, judy_mem, sizeof(*rrdlabel), 0);
+            RRDLABELS_MEMORY_DELTA(&dictionary_stats_category_rrdlabels, judy_mem, -(int64_t)sizeof(*rrdlabel));
             string_freez(label->index.key);
             string_freez(label->index.value);
             freez(rrdlabel);
         }
     }
     spinlock_unlock(&global_labels.spinlock);
+}
+
+int rrdlabels_registry_count(void) {
+    spinlock_lock(&global_labels.spinlock);
+    int count = global_labels.count;
+    spinlock_unlock(&global_labels.spinlock);
+    return count;
 }
 
 // ----------------------------------------------------------------------------
@@ -195,8 +210,10 @@ void rrdlabels_flush(RRDLABELS *labels) {
     while ((PValue = JudyLFirstThenNext(labels->JudyL, &Index, &first_then_next))) {
         delete_label((RRDLABEL *)Index);
     }
-    size_t memory_freed = JudyLFreeArray(&labels->JudyL, PJE0);
-    STATS_MINUS_MEMORY(&dictionary_stats_category_rrdlabels, 0, memory_freed + sizeof(RRDLABELS), 0);
+    JudyAllocThreadPulseReset();
+    JudyLFreeArray(&labels->JudyL, PJE0);
+    int64_t judy_mem = JudyAllocThreadPulseGetAndReset();
+    RRDLABELS_MEMORY_DELTA(&dictionary_stats_category_rrdlabels, judy_mem, 0);
     spinlock_unlock(&labels->spinlock);
 }
 
@@ -206,7 +223,7 @@ void rrdlabels_destroy(RRDLABELS *labels)
         return;
 
     rrdlabels_flush(labels);
-    freez(labels);
+    aral_freez(labels_aral, labels);
 }
 
 //
@@ -237,17 +254,22 @@ static RRDLABEL *rrdlabels_find_label_with_key_unsafe(RRDLABELS *labels, RRDLABE
 
 static void labels_add_already_sanitized(RRDLABELS *labels, const char *key, const char *value, RRDLABEL_SRC ls)
 {
+    if (unlikely(!labels || !key)) return;
+
     RRDLABEL *new_label = add_label_name_value(key, value);
 
     spinlock_lock(&labels->spinlock);
 
     RRDLABEL_SRC new_ls = (ls & ~(RRDLABEL_FLAG_NEW | RRDLABEL_FLAG_OLD));
 
-    size_t mem_before_judyl = JudyLMemUsed(labels->JudyL);
+    JudyAllocThreadPulseReset();
 
     Pvoid_t *PValue = JudyLIns(&labels->JudyL, (Word_t)new_label, PJE0);
     if (!PValue || PValue == PJERR)
         fatal("RRDLABELS: corrupted labels JudyL array");
+
+    int64_t judy_mem = JudyAllocThreadPulseGetAndReset();
+    RRDLABELS_MEMORY_DELTA(&dictionary_stats_category_rrdlabels, judy_mem, 0);
 
     if(*PValue) {
         new_ls |= RRDLABEL_FLAG_OLD;
@@ -261,15 +283,18 @@ static void labels_add_already_sanitized(RRDLABELS *labels, const char *key, con
 
         RRDLABEL *old_label_with_same_key = rrdlabels_find_label_with_key_unsafe(labels, new_label, false);
         if (old_label_with_same_key) {
-            (void) JudyLDel(&labels->JudyL, (Word_t) old_label_with_same_key, PJE0);
+            int del_result = JudyLDel(&labels->JudyL, (Word_t) old_label_with_same_key, PJE0);
+            (void)del_result;
+            judy_mem = JudyAllocThreadPulseGetAndReset();
+            RRDLABELS_MEMORY_DELTA(&dictionary_stats_category_rrdlabels, judy_mem, 0);
             delete_label(old_label_with_same_key);
         }
     }
 
     labels->version++;
 
-    size_t mem_after_judyl = JudyLMemUsed(labels->JudyL);
-    STATS_PLUS_MEMORY(&dictionary_stats_category_rrdlabels, 0, mem_after_judyl - mem_before_judyl, 0);
+//    judy_mem = JudyAllocThreadPulseGetAndReset();
+//    RRDLABELS_MEMORY_DELTA(&dictionary_stats_category_rrdlabels, judy_mem, 0);
 
     spinlock_unlock(&labels->spinlock);
 }
@@ -399,6 +424,36 @@ void rrdlabels_key_to_buffer_array_item(RRDLABELS *labels, BUFFER *wb)
     lfe_done(labels);
 }
 
+void rrdlabels_key_to_buffer_array_or_string_or_null(RRDLABELS *labels, BUFFER *wb)
+{
+    if(!labels) {
+        buffer_json_add_array_item_string(wb, NULL);
+        return;
+    }
+
+    size_t items = rrdlabels_entries(labels);
+    if(!items) {
+        buffer_json_add_array_item_string(wb, NULL);
+        return;
+    }
+
+    if(items > 1)
+        buffer_json_add_array_item_array(wb);
+
+    RRDLABEL *lb;
+    RRDLABEL_SRC ls;
+    lfe_start_read(labels, lb, ls) {
+        buffer_json_add_array_item_string(wb, string2str(lb->index.key));
+        if(items == 1)
+            break;
+    }
+    lfe_done(labels);
+
+    if(items > 1)
+        buffer_json_array_close(wb);
+
+}
+
 // ----------------------------------------------------------------------------
 
 void rrdlabels_get_value_strcpyz(RRDLABELS *labels, char *dst, size_t dst_len, const char *key) {
@@ -504,11 +559,11 @@ static void rrdlabels_remove_all_unmarked_unsafe(RRDLABELS *labels)
     while ((PValue = JudyLFirstThenNext(labels->JudyL, &Index, &first_then_next))) {
         if (!((*((RRDLABEL_SRC *)PValue)) & (RRDLABEL_FLAG_INTERNAL))) {
 
-            size_t mem_before_judyl = JudyLMemUsed(labels->JudyL);
+            JudyAllocThreadPulseReset();
             (void)JudyLDel(&labels->JudyL, Index, PJE0);
-            size_t mem_after_judyl = JudyLMemUsed(labels->JudyL);
+            int64_t judy_mem = JudyAllocThreadPulseGetAndReset();
 
-            STATS_MINUS_MEMORY(&dictionary_stats_category_rrdlabels, 0, mem_before_judyl - mem_after_judyl, 0);
+            RRDLABELS_MEMORY_DELTA(&dictionary_stats_category_rrdlabels, judy_mem, 0);
 
             delete_label((RRDLABEL *)Index);
             if (labels->JudyL != (Pvoid_t) NULL) {
@@ -540,6 +595,25 @@ int rrdlabels_walkthrough_read(RRDLABELS *labels, int (*callback)(const char *na
     lfe_start_read(labels, lb, ls)
     {
         ret = callback(string2str(lb->index.key), string2str(lb->index.value), ls, data);
+        if (ret < 0)
+            break;
+    }
+    lfe_done(labels);
+
+    return ret;
+}
+
+int rrdlabels_walkthrough_read_string(RRDLABELS *labels, int (*callback)(STRING *name, STRING *value, RRDLABEL_SRC ls, void *data), void *data)
+{
+    int ret = 0;
+
+    if(unlikely(!labels || !callback)) return 0;
+
+    RRDLABEL *lb;
+    RRDLABEL_SRC ls;
+    lfe_start_read(labels, lb, ls)
+    {
+        ret = callback(lb->index.key, lb->index.value, ls, data);
         if (ret < 0)
             break;
     }
@@ -586,7 +660,8 @@ void rrdlabels_migrate_to_these(RRDLABELS *dst, RRDLABELS *src) {
     RRDLABEL_SRC ls;
     lfe_start_nolock(src, label, ls)
     {
-        size_t mem_before_judyl = JudyLMemUsed(dst->JudyL);
+        JudyAllocThreadPulseGetAndReset();
+
         PValue = JudyLIns(&dst->JudyL, (Word_t)label, PJE0);
         if(unlikely(!PValue || PValue == PJERR))
             fatal("RRDLABELS migrate: corrupted labels array");
@@ -595,8 +670,8 @@ void rrdlabels_migrate_to_these(RRDLABELS *dst, RRDLABELS *src) {
         if (!*PValue) {
             flag = (ls & ~(RRDLABEL_FLAG_OLD | RRDLABEL_FLAG_NEW)) | RRDLABEL_FLAG_NEW;
             dup_label(label);
-            size_t mem_after_judyl = JudyLMemUsed(dst->JudyL);
-            STATS_PLUS_MEMORY(&dictionary_stats_category_rrdlabels, 0, mem_after_judyl - mem_before_judyl, 0);
+            int64_t judy_mem = JudyAllocThreadPulseGetAndReset();
+            RRDLABELS_MEMORY_DELTA(&dictionary_stats_category_rrdlabels, judy_mem, 0);
         }
         else
             flag = RRDLABEL_FLAG_OLD;
@@ -656,7 +731,8 @@ void rrdlabels_copy(RRDLABELS *dst, RRDLABELS *src)
     spinlock_lock(&dst->spinlock);
     spinlock_lock(&src->spinlock);
 
-    size_t mem_before_judyl = JudyLMemUsed(dst->JudyL);
+    JudyAllocThreadPulseReset();
+
     bool update_statistics = false;
     lfe_start_nolock(src, label, ls)
     {
@@ -671,7 +747,9 @@ void rrdlabels_copy(RRDLABELS *dst, RRDLABELS *src)
             dst->version++;
             update_statistics = true;
             if (old_label_with_key) {
+                int64_t judy_mem = JudyAllocThreadPulseGetAndReset();
                 (void)JudyLDel(&dst->JudyL, (Word_t)old_label_with_key, PJE0);
+                RRDLABELS_MEMORY_DELTA(&dictionary_stats_category_rrdlabels, judy_mem, 0);
                 delete_label((RRDLABEL *)old_label_with_key);
             }
         }
@@ -682,8 +760,8 @@ void rrdlabels_copy(RRDLABELS *dst, RRDLABELS *src)
     }
     lfe_done_nolock();
     if (update_statistics) {
-        size_t mem_after_judyl = JudyLMemUsed(dst->JudyL);
-        STATS_PLUS_MEMORY(&dictionary_stats_category_rrdlabels, 0, mem_after_judyl - mem_before_judyl, 0);
+        int64_t judy_mem = JudyAllocThreadPulseGetAndReset();
+        RRDLABELS_MEMORY_DELTA(&dictionary_stats_category_rrdlabels, judy_mem, 0);
     }
 
     spinlock_unlock(&src->spinlock);
@@ -907,12 +985,12 @@ size_t rrdlabels_entries(RRDLABELS *labels __maybe_unused)
     return count;
 }
 
-size_t rrdlabels_version(RRDLABELS *labels __maybe_unused)
+uint32_t rrdlabels_version(RRDLABELS *labels __maybe_unused)
 {
     if (unlikely(!labels))
         return 0;
 
-    return (size_t) labels->version;
+    return labels->version;
 }
 
 void rrdset_update_rrdlabels(RRDSET *st, RRDLABELS *new_rrdlabels) {
@@ -925,154 +1003,6 @@ void rrdset_update_rrdlabels(RRDSET *st, RRDLABELS *new_rrdlabels) {
     rrdset_flag_set(st, RRDSET_FLAG_METADATA_UPDATE);
     rrdhost_flag_set(st->rrdhost, RRDHOST_FLAG_METADATA_UPDATE);
     rrdset_metadata_updated(st);
-}
-
-struct pattern_array *pattern_array_allocate()
-{
-    struct pattern_array *pa = callocz(1, sizeof(*pa));
-    return pa;
-}
-
-static void pattern_array_add_lblkey_with_sp(struct pattern_array *pa, const char *key, SIMPLE_PATTERN *sp)
-{
-    if (!pa || !key || !sp)
-        return;
-
-    STRING *string_key = string_strdupz(key);
-    Pvoid_t *Pvalue = JudyLIns(&pa->JudyL, (Word_t) string_key, PJE0);
-    if (!Pvalue) {
-        string_freez(string_key);
-        simple_pattern_free(sp);
-        return;
-    }
-
-    struct pattern_array_item *pai;
-    if (*Pvalue) {
-        pai = *Pvalue;
-    } else {
-        *Pvalue = pai = callocz(1, sizeof(*pai));
-        pa->key_count++;
-    }
-
-    pai->size++;
-    Pvalue = JudyLIns(&pai->JudyL, (Word_t) pai->size, PJE0);
-    if (!Pvalue) {
-        simple_pattern_free(sp);
-        return;
-    }
-
-    *Pvalue = sp;
-}
-
-bool pattern_array_label_match(
-    struct pattern_array *pa,
-    RRDLABELS *labels,
-    char eq,
-    size_t *searches)
-{
-    if (!pa || !labels)
-        return true;
-
-    Pvoid_t *Pvalue;
-    Word_t Index = 0;
-    bool first_then_next = true;
-    while ((Pvalue = JudyLFirstThenNext(pa->JudyL, &Index, &first_then_next))) {
-        // for each label key in the patterns array
-
-        struct pattern_array_item *pai = *Pvalue;
-        SIMPLE_PATTERN_RESULT match = SP_NOT_MATCHED ;
-        for (Word_t i = 1; i <= pai->size; i++) {
-            // for each pattern in the label key pattern list
-
-            if (!(Pvalue = JudyLGet(pai->JudyL, i, PJE0)) || !*Pvalue)
-                continue;
-
-            match = rrdlabels_match_simple_pattern_parsed(labels, (SIMPLE_PATTERN *)(*Pvalue), eq, searches);
-
-            if(match != SP_NOT_MATCHED)
-                break;
-        }
-
-        if (match != SP_MATCHED_POSITIVE)
-            return false;
-    }
-    return true;
-}
-
-struct pattern_array *pattern_array_add_key_simple_pattern(struct pattern_array *pa, const char *key, SIMPLE_PATTERN *pattern)
-{
-    if (unlikely(!pattern || !key))
-        return pa;
-
-    if (!pa)
-        pa = pattern_array_allocate();
-
-    pattern_array_add_lblkey_with_sp(pa, key, pattern);
-    return pa;
-}
-
-struct pattern_array *pattern_array_add_simple_pattern(struct pattern_array *pa, SIMPLE_PATTERN *pattern, char sep)
-{
-    if (unlikely(!pattern))
-        return pa;
-
-    if (!pa)
-        pa = pattern_array_allocate();
-
-    char *label_key;
-    while (pattern && (label_key = simple_pattern_iterate(&pattern))) {
-        char key[RRDLABELS_MAX_NAME_LENGTH + 1], *key_sep;
-
-        if (unlikely(!label_key || !(key_sep = strchr(label_key, sep))))
-            return pa;
-
-        *key_sep = '\0';
-        strncpyz(key, label_key, RRDLABELS_MAX_NAME_LENGTH);
-        *key_sep = sep;
-
-        pattern_array_add_lblkey_with_sp(pa, key, string_to_simple_pattern(label_key));
-    }
-    return pa;
-}
-
-struct pattern_array *pattern_array_add_key_value(struct pattern_array *pa, const char *key, const char *value, char sep)
-{
-    if (unlikely(!key || !value))
-        return pa;
-
-    if (!pa)
-        pa = pattern_array_allocate();
-
-    char label_key[RRDLABELS_MAX_NAME_LENGTH + RRDLABELS_MAX_VALUE_LENGTH + 2];
-    snprintfz(label_key, sizeof(label_key) - 1, "%s%c%s", key, sep, value);
-    pattern_array_add_lblkey_with_sp(
-        pa, key, simple_pattern_create(label_key, SIMPLE_PATTERN_DEFAULT_WEB_SEPARATORS, SIMPLE_PATTERN_EXACT, true));
-    return pa;
-}
-
-void pattern_array_free(struct pattern_array *pa)
-{
-    if (!pa)
-        return;
-
-    Pvoid_t *Pvalue;
-    Word_t Index = 0;
-    while ((Pvalue = JudyLFirst(pa->JudyL, &Index, PJE0))) {
-        struct pattern_array_item *pai = *Pvalue;
-
-        for (Word_t i = 1; i <= pai->size; i++) {
-            if (!(Pvalue = JudyLGet(pai->JudyL, i, PJE0)))
-                continue;
-            simple_pattern_free((SIMPLE_PATTERN *) (*Pvalue));
-        }
-        JudyLFreeArray(&(pai->JudyL), PJE0);
-
-        string_freez((STRING *)Index);
-        (void) JudyLDel(&(pa->JudyL), Index, PJE0);
-        freez(pai);
-        Index = 0;
-    }
-    freez(pa);
 }
 
 // ----------------------------------------------------------------------------
@@ -1280,6 +1210,7 @@ static int unittest_dump_labels(const char *name, const char *value, RRDLABEL_SR
     return 1;
 }
 
+void pattern_array_add_lblkey_with_sp(struct pattern_array *pa, const char *key, SIMPLE_PATTERN *sp);
 static int rrdlabels_unittest_pattern_check()
 {
     fprintf(stderr, "\n%s() tests\n", __FUNCTION__);
@@ -1344,6 +1275,73 @@ static int rrdlabels_unittest_pattern_check()
     return rc;
 }
 
+// --------------------------------------------------------------------------------------------------------------------
+// Full text search for labels
+
+#include "rrdlabels-aggregated.h"
+
+struct label_full_text_search_data {
+    SIMPLE_PATTERN *pattern;
+    RRDLABELS_AGGREGATED *agg;
+    size_t searches;
+    bool found;
+};
+
+static int label_full_text_search_callback_string(STRING *name, STRING *value, RRDLABEL_SRC ls __maybe_unused, void *data) {
+    struct label_full_text_search_data *d = (struct label_full_text_search_data *)data;
+
+    // Now we have STRING* directly, no need to create them
+    bool key_matches = false;
+    bool value_matches = false;
+
+    // First try to match the key
+    if(simple_pattern_matches_string(d->pattern, name)) {
+        key_matches = true;
+        d->searches++;
+    }
+
+    // Then try to match the value
+    if(simple_pattern_matches_string(d->pattern, value)) {
+        value_matches = true;
+        d->searches++;
+    }
+
+    // If either matched, add this label to the aggregated structure
+    if(key_matches || value_matches) {
+        if(!d->agg) {
+            d->agg = rrdlabels_aggregated_create();
+        }
+        rrdlabels_aggregated_add_label(d->agg, string2str(name), string2str(value));
+        d->found = true;
+    }
+
+    return 0; // Continue walking through labels
+}
+
+RRDLABELS_AGGREGATED *rrdlabels_full_text_search(RRDLABELS *labels, SIMPLE_PATTERN *pattern, RRDLABELS_AGGREGATED *agg, size_t *searches) {
+    if(!labels || !pattern) return agg;
+
+    struct label_full_text_search_data data = {
+        .pattern = pattern,
+        .agg = agg,
+        .searches = 0,
+        .found = false
+    };
+
+    rrdlabels_walkthrough_read_string(labels, label_full_text_search_callback_string, &data);
+
+    if(searches)
+        *searches = data.searches;
+
+    // If we found matches and didn't have an agg structure, one was created
+    // If we had an agg structure, we added to it (or not if no matches)
+    // If no matches and no initial agg, data.agg is still NULL
+    return data.agg;
+}
+
+// --------------------------------------------------------------------------------------------------------------------
+// unittest
+
 static int rrdlabels_unittest_migrate_check()
 {
     fprintf(stderr, "\n%s() tests\n", __FUNCTION__);
@@ -1368,8 +1366,11 @@ static int rrdlabels_unittest_migrate_check()
 
     int rc = 0;
     rc = rrdlabels_unittest_expect_value(labels1, "key1", "value2", RRDLABEL_FLAG_OLD | RRDLABEL_SRC_CONFIG);
-    if (rc)
+    if (rc) {
+        rrdlabels_destroy(labels1);
+        rrdlabels_destroy(labels2);
         return rc;
+    }
 
     fprintf(stderr, "labels1 (migrated) entries found %zu (should be 3)\n",  rrdlabels_entries(labels1));
     size_t entries = rrdlabels_entries(labels1);
@@ -1395,26 +1396,38 @@ static int rrdlabels_unittest_migrate_check()
     rrdlabels_add(labels2, "key2", "value2", RRDLABEL_SRC_CONFIG);
 
     rc = rrdlabels_unittest_expect_value(labels1, "key1", "value1", RRDLABEL_FLAG_NEW | RRDLABEL_SRC_CONFIG);
-    if (rc)
+    if (rc) {
+        rrdlabels_destroy(labels1);
+        rrdlabels_destroy(labels2);
         return rc;
+    }
 
     rrdlabels_walkthrough_index_read(labels2, unittest_dump_labels, "\nlabels2");
 
     rrdlabels_copy(labels1, labels2); // labels1 should have 5 keys
     rc = rrdlabels_unittest_expect_value(labels1, "key1", "value1", RRDLABEL_FLAG_OLD  | RRDLABEL_SRC_CONFIG);
-    if (rc)
+    if (rc) {
+        rrdlabels_destroy(labels1);
+        rrdlabels_destroy(labels2);
         return rc;
+    }
 
     rc = rrdlabels_unittest_expect_value(labels1, "key0", "value0", RRDLABEL_FLAG_NEW | RRDLABEL_SRC_CONFIG);
-    if (rc)
+    if (rc) {
+        rrdlabels_destroy(labels1);
+        rrdlabels_destroy(labels2);
         return rc;
+    }
 
     rrdlabels_walkthrough_index_read(labels1, unittest_dump_labels, "\nlabels1 after copy from labels2");
     entries = rrdlabels_entries(labels1);
 
     fprintf(stderr, "labels1 (copied) entries found %zu (should be 5)\n",  rrdlabels_entries(labels1));
-    if (entries != 5)
+    if (entries != 5) {
+        rrdlabels_destroy(labels1);
+        rrdlabels_destroy(labels2);
         return 1;
+    }
 
     rrdlabels_add(labels1, "key0", "value0", RRDLABEL_SRC_CONFIG);
     rc = rrdlabels_unittest_expect_value(labels1, "key0", "value0", RRDLABEL_FLAG_OLD | RRDLABEL_SRC_CONFIG);
@@ -1610,6 +1623,7 @@ int rrdlabels_unittest(void) {
     errors += rrdlabels_unittest_pattern_check();
 
     fprintf(stderr, "%d errors found\n", errors);
+
+    // string_destroy();
     return errors;
 }
-

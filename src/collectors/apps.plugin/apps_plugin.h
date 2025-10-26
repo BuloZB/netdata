@@ -47,12 +47,15 @@
 #include <sys/proc_info.h>
 #include <sys/sysctl.h>
 #include <mach/mach_time.h> // For mach_timebase_info_data_t and mach_timebase_info
+#include <AvailabilityMacros.h>
 
 struct pid_info {
     struct kinfo_proc proc;
     struct proc_taskinfo taskinfo;
     struct proc_bsdinfo bsdinfo;
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 110000
     struct rusage_info_v4 rusageinfo;
+#endif
 };
 
 #define OS_INIT_PID                          1
@@ -722,7 +725,7 @@ void send_resource_usage_to_netdata(usec_t dt);
 void send_proc_states_count(usec_t dt);
 #endif
 
-#define APPS_PLUGIN_PROCESSES_FUNCTION_DESCRIPTION "Detailed information on the currently running processes."
+#define APPS_PLUGIN_PROCESSES_FUNCTION_DESCRIPTION "Provides detailed process information including CPU usage, memory consumption, I/O statistics, file descriptors, page faults, and parent-child relationships (PPID) for all processes including those in containers."
 void function_processes(const char *transaction, char *function,
                         usec_t *stop_monotonic_ut __maybe_unused, bool *cancelled __maybe_unused,
                         BUFFER *payload __maybe_unused, HTTP_ACCESS access,

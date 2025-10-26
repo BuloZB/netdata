@@ -8,6 +8,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -59,10 +61,16 @@ type Manager struct {
 	PluginName     string
 	Out            io.Writer
 	Modules        module.Registry
+	RunJob         []string
 	ConfigDefaults confgroup.Registry
 	VarLibDir      string
 	FnReg          FunctionRegistry
 	Vnodes         map[string]*vnodes.VirtualNode
+
+	// Dump mode
+	DumpMode     bool
+	DumpAnalyzer interface{} // Will be *agent.DumpAnalyzer but avoid circular dependency
+	DumpDataDir  string
 
 	fileStatus *fileStatus
 
@@ -130,6 +138,11 @@ func (m *Manager) runProcessConfGroups(in chan []*confgroup.Group) {
 			for _, gr := range groups {
 				a, r := m.discoveredConfigs.add(gr)
 				m.Debugf("received configs: %d/+%d/-%d ('%s')", len(gr.Configs), len(a), len(r), gr.Source)
+				if len(m.RunJob) > 0 {
+					a = slices.DeleteFunc(a, func(config confgroup.Config) bool {
+						return !slices.ContainsFunc(m.RunJob, func(name string) bool { return config.Name() == name })
+					})
+				}
 				sendConfigs(m.ctx, m.rmCh, r...)
 				sendConfigs(m.ctx, m.addCh, a...)
 			}
@@ -156,9 +169,9 @@ func (m *Manager) run() {
 				m.removeConfig(cfg)
 			case fn := <-m.dyncfgCh:
 				switch id := fn.Args[0]; true {
-				case strings.HasPrefix(id, dyncfgCollectorIDPrefix):
+				case strings.HasPrefix(id, m.dyncfgCollectorPrefixValue()):
 					m.dyncfgCollectorSeqExec(fn)
-				case strings.HasPrefix(id, dyncfgVnodeID):
+				case strings.HasPrefix(id, m.dyncfgVnodePrefixValue()):
 					m.dyncfgVnodeSeqExec(fn)
 				default:
 					m.dyncfgRespf(fn, 503, "unknown function '%s' (%s).", fn.Name, id)
@@ -189,7 +202,6 @@ func (m *Manager) addConfig(cfg confgroup.Config) {
 	} else {
 		sp, ep := scfg.cfg.SourceTypePriority(), ecfg.cfg.SourceTypePriority()
 		if ep > sp || (ep == sp && ecfg.status == dyncfgRunning) {
-			m.retryingTasks.remove(cfg)
 			return
 		}
 		if ecfg.status == dyncfgRunning {
@@ -204,7 +216,7 @@ func (m *Manager) addConfig(cfg confgroup.Config) {
 	m.dyncfgCollectorJobCreate(ecfg.cfg, ecfg.status)
 
 	if isTerminal || m.PluginName == "nodyncfg" { // FIXME: quick fix of TestAgent_Run (agent_test.go)
-		m.dyncfgConfigEnable(functions.Function{Args: []string{dyncfgJobID(ecfg.cfg), "enable"}})
+		m.dyncfgConfigEnable(functions.Function{Args: []string{m.dyncfgJobID(ecfg.cfg), "enable"}})
 	} else {
 		m.waitCfgOnOff = ecfg.cfg.FullName()
 	}
@@ -306,6 +318,20 @@ func (m *Manager) createCollectorJob(cfg confgroup.Config) (*module.Job, error) 
 		return nil, err
 	}
 
+	var jobDumpDir string
+	if m.DumpDataDir != "" {
+		jobDumpDir = filepath.Join(m.DumpDataDir, sanitizeName(cfg.Module()), sanitizeName(cfg.Name()))
+		if err := os.MkdirAll(jobDumpDir, 0o755); err != nil {
+			return nil, fmt.Errorf("creating dump directory: %w", err)
+		}
+		if analyzer, ok := m.DumpAnalyzer.(interface{ RegisterJob(string, string, string) }); ok {
+			analyzer.RegisterJob(cfg.Name(), cfg.Module(), jobDumpDir)
+		}
+		if dumpAware, ok := mod.(interface{ EnableDump(string) }); ok {
+			dumpAware.EnableDump(jobDumpDir)
+		}
+	}
+
 	jobCfg := module.JobConfig{
 		PluginName:      m.PluginName,
 		Name:            cfg.Name(),
@@ -318,7 +344,10 @@ func (m *Manager) createCollectorJob(cfg confgroup.Config) (*module.Job, error) 
 		IsStock:         cfg.SourceType() == "stock",
 		Module:          mod,
 		Out:             m.Out,
+		DumpMode:        m.DumpMode,
+		DumpAnalyzer:    m.DumpAnalyzer,
 	}
+
 	if vnode != nil {
 		jobCfg.Vnode = *vnode.Copy()
 	}
@@ -326,6 +355,11 @@ func (m *Manager) createCollectorJob(cfg confgroup.Config) (*module.Job, error) 
 	job := module.NewJob(jobCfg)
 
 	return job, nil
+}
+
+func sanitizeName(name string) string {
+	replacer := strings.NewReplacer("/", "_", "\\", "_", " ", "_", ":", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_")
+	return replacer.Replace(name)
 }
 
 func runRetryTask(ctx context.Context, out chan<- confgroup.Config, cfg confgroup.Config) {

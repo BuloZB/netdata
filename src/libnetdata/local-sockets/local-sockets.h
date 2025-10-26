@@ -1602,7 +1602,7 @@ struct local_sockets_namespace_worker {
     uint64_t inode;
 };
 
-static inline void *local_sockets_get_namespace_sockets_worker(void *arg) {
+static inline void local_sockets_get_namespace_sockets_worker(void *arg) {
     struct local_sockets_namespace_worker *data = arg;
     LS_STATE *ls = data->ls;
     const uint64_t inode = data->inode;
@@ -1627,8 +1627,6 @@ static inline void *local_sockets_get_namespace_sockets_worker(void *arg) {
     }
 
     spinlock_unlock(&ls->spinlock);
-
-    return NULL;
 }
 
 static inline void local_sockets_namespaces(LS_STATE *ls) {
@@ -1671,7 +1669,7 @@ static inline void local_sockets_namespaces(LS_STATE *ls) {
         workers_data[last_thread].inode = inode;
         workers[last_thread] = nd_thread_create(
             "local-sockets-worker",
-            NETDATA_THREAD_OPTION_JOINABLE,
+            NETDATA_THREAD_OPTION_DEFAULT,
             local_sockets_get_namespace_sockets_worker,
             &workers_data[last_thread]);
 

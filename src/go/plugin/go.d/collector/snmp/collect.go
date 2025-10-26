@@ -3,132 +3,181 @@
 package snmp
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"maps"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
-
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/discovery/sd/discoverer/snmpsd"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/vnodes"
+	"syscall"
 
 	"github.com/google/uuid"
 	"github.com/gosnmp/gosnmp"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/netdata/netdata/go/plugins/logger"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/vnodes"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp/ddsnmp"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp/ddsnmp/ddsnmpcollector"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/snmputils"
 )
 
 func (c *Collector) collect() (map[string]int64, error) {
-	if c.sysInfo == nil {
-		si, err := snmpsd.GetSysInfo(c.snmpClient)
-		if err != nil {
-			return nil, err
-		}
-
-		c.sysInfo = si
-		c.addSysUptimeChart()
-
-		if c.CreateVnode {
-			c.vnode = c.setupVnode(si)
-		}
-	}
-
-	mx := make(map[string]int64)
-
-	if err := c.collectSysUptime(mx); err != nil {
+	if err := c.ensureInitialized(); err != nil {
 		return nil, err
 	}
 
-	if c.collectIfMib {
-		if err := c.collectNetworkInterfaces(mx); err != nil {
-			return nil, err
-		}
-	}
-
-	if len(c.customOids) > 0 {
-		if err := c.collectOIDs(mx); err != nil {
-			return nil, err
-		}
+	mx, err := c.collectMetrics()
+	if err != nil {
+		return nil, err
 	}
 
 	return mx, nil
 }
 
-func (c *Collector) getSysObjectID(oid string) (string, error) {
-	resp, err := c.snmpClient.Get([]string{oid})
-	if err != nil {
-		return "", err
-	}
+func (c *Collector) collectMetrics() (map[string]int64, error) {
+	var (
+		snmpMx map[string]int64
+		pingMx map[string]int64
+	)
 
-	return strings.Replace(resp.Variables[0].Value.(string), ".", "", 1), nil
-}
+	ctx := context.Background()
 
-func (c *Collector) makeChartsFromMetricMap(mx map[string]int64, metricMap map[string]processedMetric) error {
+	g, _ := errgroup.WithContext(ctx)
 
-	for _, metric := range metricMap {
-		if metric.tableName == "" {
-			switch s := metric.value.(type) {
-			case int:
-
-				// log.Println(metric)
-
-				// c.addSNMPChart(metric)
-				mx[metric.name] = int64(s)
-
-			}
+	g.Go(func() error {
+		m := make(map[string]int64)
+		if err := c.collectSNMP(m); err != nil {
+			return err
 		}
+		snmpMx = m
+		return nil
+	})
+
+	if c.Ping.Enabled && c.prober != nil {
+		g.Go(func() error {
+			m := make(map[string]int64)
+			if err := c.collectPing(m); err != nil {
+				c.Errorf("ping: %v", err)
+				if isPingUnrecoverableError(err) {
+					c.prober = nil
+				}
+				return nil
+			}
+			pingMx = m
+			return nil
+		})
 	}
-	return nil
+
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	mx := make(map[string]int64, len(snmpMx)+len(pingMx))
+
+	maps.Copy(mx, snmpMx)
+	maps.Copy(mx, pingMx)
+
+	return mx, nil
 }
 
-func (c *Collector) collectSysUptime(mx map[string]int64) error {
-	resp, err := c.snmpClient.Get([]string{snmpsd.OidSysUptime})
+func (c *Collector) ensureInitialized() error {
+	if c.snmpClient == nil {
+		return errors.New("snmp client not initialized")
+	}
+
+	if c.sysInfo != nil {
+		return nil
+	}
+
+	si, err := snmputils.GetSysInfo(c.snmpClient)
 	if err != nil {
 		return err
 	}
-	if len(resp.Variables) == 0 {
-		return errors.New("no system uptime")
-	}
-	v, err := pduToInt(resp.Variables[0])
-	if err != nil {
-		return err
+
+	if c.snmpProfiles == nil {
+		c.snmpProfiles = c.setupProfiles(si)
 	}
 
-	mx["uptime"] = v / 100 // the time is in hundredths of a second
+	if c.ddSnmpColl == nil && len(c.snmpProfiles) > 0 {
+		c.ddSnmpColl = c.newDdSnmpColl(ddsnmpcollector.Config{
+			SnmpClient:      c.snmpClient,
+			Profiles:        c.snmpProfiles,
+			Log:             c.Logger,
+			SysObjectID:     si.SysObjectID,
+			DisableBulkWalk: c.disableBulkWalk,
+		})
+	}
+
+	if c.CreateVnode {
+		deviceMeta, err := c.ddSnmpColl.CollectDeviceMetadata()
+		if err != nil {
+			return err
+		}
+		c.vnode = c.setupVnode(si, deviceMeta)
+	}
+
+	c.sysInfo = si
+
+	if c.Ping.Enabled {
+		c.addPingCharts()
+	}
 
 	return nil
 }
 
-func (c *Collector) walkAll(rootOid string) ([]gosnmp.SnmpPDU, error) {
-	if c.snmpClient.Version() == gosnmp.Version1 {
-		return c.snmpClient.WalkAll(rootOid)
-	}
-	return c.snmpClient.BulkWalkAll(rootOid)
-}
-
-func (c *Collector) setupVnode(si *snmpsd.SysInfo) *vnodes.VirtualNode {
+func (c *Collector) setupVnode(si *snmputils.SysInfo, deviceMeta map[string]ddsnmp.MetaTag) *vnodes.VirtualNode {
 	if c.Vnode.GUID == "" {
 		c.Vnode.GUID = uuid.NewSHA1(uuid.NameSpaceDNS, []byte(c.Hostname)).String()
 	}
 
-	hostnames := []string{c.Vnode.Hostname, si.Name, "snmp-device"}
+	hostnames := []string{
+		c.Vnode.Hostname,
+		si.Name,
+		"snmp-device",
+	}
 	i := slices.IndexFunc(hostnames, func(s string) bool { return s != "" })
+	c.Vnode.Hostname = hostnames[i]
 
-	c.Vnode.Hostname = fmt.Sprintf("%s(%s)", hostnames[i], c.Hostname)
+	labels := map[string]string{
+		"_vnode_type":           "snmp",
+		"_net_default_iface_ip": c.Hostname,
+		"address":               c.Hostname,
+	}
 
-	labels := make(map[string]string)
+	if c.UpdateEvery >= 1 && c.VnodeDeviceDownThreshold >= 1 {
+		// Add 2 seconds buffer to account for collection/transmission delays
+		v := c.VnodeDeviceDownThreshold*c.UpdateEvery + 2
+		labels["_node_stale_after_seconds"] = strconv.Itoa(v)
+	}
 
-	for k, v := range c.Vnode.Labels {
-		labels[k] = v
+	labels["sys_object_id"] = si.SysObjectID
+	labels["name"] = si.Name
+	labels["description"] = si.Descr
+	labels["contact"] = si.Contact
+	labels["location"] = si.Location
+	if si.Vendor != "" {
+		labels["vendor"] = si.Vendor
+	} else if si.Organization != "" {
+		labels["vendor"] = si.Organization
 	}
-	if si.Descr != "" {
-		labels["sysDescr"] = si.Descr
+	if si.Category != "" {
+		labels["type"] = si.Category
 	}
-	if si.Contact != "" {
-		labels["sysContact"] = si.Contact
+	if si.Model != "" {
+		labels["model"] = si.Model
 	}
-	if si.Location != "" {
-		labels["sysLocation"] = si.Location
+
+	for k, val := range deviceMeta {
+		if v, ok := labels[k]; !ok || v == "" || val.IsExactMatch {
+			labels[k] = val.Value
+		}
 	}
-	// FIXME: vendor should be obtained from sysDescr, org should be used as a fallback
-	labels["vendor"] = si.Organization
+
+	maps.Copy(labels, c.Vnode.Labels)
 
 	return &vnodes.VirtualNode{
 		GUID:     c.Vnode.GUID,
@@ -137,45 +186,129 @@ func (c *Collector) setupVnode(si *snmpsd.SysInfo) *vnodes.VirtualNode {
 	}
 }
 
-func pduToString(pdu gosnmp.SnmpPDU) (string, error) {
-	switch pdu.Type {
-	case gosnmp.OctetString:
-		// TODO: this isn't reliable (e.g. physAddress we need hex.EncodeToString())
-		bs, ok := pdu.Value.([]byte)
-		if !ok {
-			return "", fmt.Errorf("OctetString is not a []byte but %T", pdu.Value)
+func (c *Collector) setupProfiles(si *snmputils.SysInfo) []*ddsnmp.Profile {
+	snmpProfiles := ddsnmp.FindProfiles(si.SysObjectID, si.Descr, c.ManualProfiles)
+	var profInfo []string
+
+	for _, prof := range snmpProfiles {
+		if logger.Level.Enabled(slog.LevelDebug) {
+			profInfo = append(profInfo, prof.SourceTree())
+		} else {
+			name := strings.TrimSuffix(filepath.Base(prof.SourceFile), filepath.Ext(prof.SourceFile))
+			profInfo = append(profInfo, name)
 		}
-		return strings.ToValidUTF8(string(bs), "�"), nil
-	case gosnmp.Counter32, gosnmp.Counter64, gosnmp.Integer, gosnmp.Gauge32:
-		return gosnmp.ToBigInt(pdu.Value).String(), nil
-	case gosnmp.ObjectIdentifier:
-		v, ok := pdu.Value.(string)
-		if !ok {
-			return "", fmt.Errorf("ObjectIdentifier is not a string but %T", pdu.Value)
-		}
-		return strings.TrimPrefix(v, "."), nil
-	default:
-		return "", fmt.Errorf("unussported type: '%v'", pdu.Type)
 	}
+
+	c.Infof("device matched %d profile(s): %s (sysObjectID: '%s')",
+		len(snmpProfiles), strings.Join(profInfo, ", "), si.SysObjectID)
+
+	return snmpProfiles
 }
 
-func pduToInt(pdu gosnmp.SnmpPDU) (int64, error) {
-	switch pdu.Type {
-	case gosnmp.Counter32, gosnmp.Counter64, gosnmp.Integer, gosnmp.Gauge32, gosnmp.TimeTicks:
-		return gosnmp.ToBigInt(pdu.Value).Int64(), nil
-	default:
-		return 0, fmt.Errorf("unussported type: '%v'", pdu.Type)
+func (c *Collector) initAndConnectSNMPClient() (gosnmp.Handler, error) {
+	snmpClient, err := c.initSNMPClient()
+	if err != nil {
+		return nil, fmt.Errorf("init: %w", err)
 	}
+
+	if err := snmpClient.Connect(); err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+
+	if snmpClient.Version() == gosnmp.Version1 {
+		return snmpClient, nil
+	}
+
+	if c.adjMaxRepetitions != 0 {
+		snmpClient.SetMaxRepetitions(c.adjMaxRepetitions)
+	} else {
+		ok, err := c.adjustMaxRepetitions(snmpClient)
+		if err != nil {
+			return nil, fmt.Errorf("re-adjust max repetitions SNMP client: %w", err)
+		}
+		if !ok {
+			c.Warningf("SNMP bulk walk disabled (device may not support GETBULK or max-repetitions adjustment failed)")
+			c.disableBulkWalk = true
+		}
+		c.adjMaxRepetitions = snmpClient.MaxRepetitions()
+	}
+
+	return snmpClient, nil
 }
 
-//func physAddressToString(pdu gosnmp.SnmpPDU) (string, error) {
-//	address, ok := pdu.Value.([]uint8)
-//	if !ok {
-//		return "", errors.New("physAddress is not a []uint8")
-//	}
-//	parts := make([]string, 0, 6)
-//	for _, v := range address {
-//		parts = append(parts, fmt.Sprintf("%02X", v))
-//	}
-//	return strings.Join(parts, ":"), nil
-//}
+func (c *Collector) adjustMaxRepetitions(snmpClient gosnmp.Handler) (bool, error) {
+	ok, err := c.detectBulkWalkSupport(snmpClient)
+	if err != nil {
+		c.Warningf("bulk support probe error: %v", err)
+		return false, nil
+	}
+	if !ok {
+		return false, nil
+	}
+
+	orig := c.Config.Options.MaxRepetitions
+	maxReps := c.Config.Options.MaxRepetitions
+	attempts := 0
+	const maxAttempts = 20 // Prevent infinite loops
+
+	for maxReps > 0 && attempts < maxAttempts {
+		attempts++
+
+		v, err := snmpClient.BulkWalkAll(snmputils.RootOidMibSystem)
+		if err != nil {
+			return false, err
+		}
+
+		if len(v) > 0 {
+			//c.Config.OptionsConfig.MaxRepetitions = maxReps
+			if orig != maxReps {
+				c.Infof("adjusted max_repetitions: %d → %d (took %d attempts)", orig, maxReps, attempts)
+			}
+			return true, nil
+		}
+
+		// Adaptive decrease strategy
+		prevMaxReps := maxReps
+		if maxReps > 50 {
+			maxReps -= 10
+		} else if maxReps > 10 {
+			maxReps -= 5
+		} else if maxReps > 5 {
+			maxReps -= 2
+		} else {
+			maxReps--
+		}
+
+		maxReps = max(0, maxReps) // Ensure non-negative
+
+		c.Debugf("max_repetitions=%d returned no data, trying %d", prevMaxReps, maxReps)
+		snmpClient.SetMaxRepetitions(uint32(maxReps))
+	}
+
+	// Restore original value since nothing worked
+	snmpClient.SetMaxRepetitions(uint32(orig))
+	c.Debugf("unable to find working max_repetitions value after %d attempts", attempts)
+	return false, nil
+}
+
+func isPingUnrecoverableError(err error) bool {
+	var errno syscall.Errno
+	return errors.As(err, &errno) && (errors.Is(errno, syscall.EPERM) || errors.Is(errno, syscall.EACCES))
+}
+
+func (c *Collector) detectBulkWalkSupport(snmpClient gosnmp.Handler) (bool, error) {
+	if snmpClient.Version() == gosnmp.Version1 {
+		return false, nil
+	}
+
+	// Use a very small max-reps for the probe to be gentle
+	orig := snmpClient.MaxRepetitions()
+	defer snmpClient.SetMaxRepetitions(orig)
+	snmpClient.SetMaxRepetitions(5)
+
+	oids, err := snmpClient.BulkWalkAll(snmputils.RootOidMibSystem)
+	if err != nil {
+		return false, err
+	}
+	return len(oids) > 0, nil
+}

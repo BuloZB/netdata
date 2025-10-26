@@ -135,7 +135,7 @@ struct rrd_function_call_wait {
     bool free_with_signal;
     bool data_are_ready;
     netdata_mutex_t mutex;
-    pthread_cond_t cond;
+    netdata_cond_t cond;
     int code;
 };
 
@@ -148,7 +148,7 @@ static void rrd_function_call_wait_free(struct rrd_function_call_wait *tmp) {
     rrd_inflight_function_cleanup(tmp->host, tmp->transaction);
     freez(tmp->transaction);
 
-    pthread_cond_destroy(&tmp->cond);
+    netdata_cond_destroy(&tmp->cond);
     netdata_mutex_destroy(&tmp->mutex);
     freez(tmp);
 }
@@ -160,7 +160,7 @@ static void rrd_async_function_signal_when_ready(BUFFER *temp_wb __maybe_unused,
     netdata_mutex_lock(&tmp->mutex);
 
     // since we got the mutex,
-    // the waiting thread is either in pthread_cond_timedwait()
+    // the waiting thread is either in cond_timedwait()
     // or gave up and left.
 
     tmp->code = code;
@@ -169,7 +169,7 @@ static void rrd_async_function_signal_when_ready(BUFFER *temp_wb __maybe_unused,
     if(tmp->free_with_signal)
         we_should_free = true;
 
-    pthread_cond_signal(&tmp->cond);
+    netdata_cond_signal(&tmp->cond);
 
     netdata_mutex_unlock(&tmp->mutex);
 
@@ -236,7 +236,7 @@ static int rrd_call_function_async_and_wait(struct rrd_function_inflight *r) {
     tmp->host_function_acquired = r->host_function_acquired;
     tmp->transaction = strdupz(r->transaction);
     netdata_mutex_init(&tmp->mutex);
-    pthread_cond_init(&tmp->cond, NULL);
+    netdata_cond_init(&tmp->cond);
 
     // we need a temporary BUFFER, because we may time out and the caller supplied one may vanish,
     // so we create a new one we guarantee will survive until the collector finishes...
@@ -290,24 +290,16 @@ static int rrd_call_function_async_and_wait(struct rrd_function_inflight *r) {
             usec_t now_mono_ut = now_monotonic_usec();
             usec_t stop_mono_ut = __atomic_load_n(&r->stop_monotonic_ut, __ATOMIC_RELAXED) + RRDFUNCTIONS_TIMEOUT_EXTENSION_UT;
             if(now_mono_ut > stop_mono_ut) {
-                rc = ETIMEDOUT;
+                rc = UV_ETIMEDOUT;
                 break;
             }
 
             // wait for 10ms, and loop again...
-            struct timespec tp;
-            clock_gettime(CLOCK_REALTIME, &tp);
-            tp.tv_nsec += 10 * NSEC_PER_MSEC;
-            if(tp.tv_nsec > (long)(1 * NSEC_PER_SEC)) {
-                tp.tv_sec++;
-                tp.tv_nsec -= 1 * NSEC_PER_SEC;
-            }
-
-            // the mutex is unlocked within pthread_cond_timedwait()
-            rc = pthread_cond_timedwait(&tmp->cond, &tmp->mutex, &tp);
+            // the mutex is unlocked within cond_timedwait()
+            rc = netdata_cond_timedwait(&tmp->cond, &tmp->mutex, 10 * NSEC_PER_MSEC);
             // the mutex is again ours
 
-            if(rc == ETIMEDOUT) {
+            if(rc == UV_ETIMEDOUT) {
                 // 10ms have passed
 
                 rc = 0;
@@ -339,7 +331,7 @@ static int rrd_call_function_async_and_wait(struct rrd_function_inflight *r) {
             tmp->free_with_signal = false;
             we_should_free = true;
         }
-        else if (rc == ETIMEDOUT || cancelled) {
+        else if (rc == UV_ETIMEDOUT || cancelled) {
             // timeout
             // we will go away and let the callback free the structure
 
@@ -680,7 +672,7 @@ void rrd_function_progress(const char *transaction) {
     functions_stop_monotonic_update_on_progress(&r->stop_monotonic_ut);
 
     if(r->progresser.cb)
-        r->progresser.cb(r->progresser.data);
+        r->progresser.cb(transaction, r->progresser.data);
 
     rrd_collector_dispatcher_release(r->rdcf->collector);
 
@@ -689,6 +681,9 @@ cleanup:
 }
 
 void rrd_function_call_progresser(nd_uuid_t *transaction) {
+    if(uuid_is_null(*transaction))
+        return;
+
     char str[UUID_COMPACT_STR_LEN];
     uuid_unparse_lower_compact(*transaction, str);
     rrd_function_progress(str);

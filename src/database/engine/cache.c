@@ -638,6 +638,9 @@ static ALWAYS_INLINE void pgc_queue_add(PGC *cache __maybe_unused, struct pgc_qu
         int64_t mem_delta = 0;
 
         Pvoid_t *section_pages_pptr = JudyLIns(&q->sections_judy, page->section, PJE0);
+        if(section_pages_pptr == NULL || section_pages_pptr == PJERR)
+            fatal("DBENGINE CACHE: JudyLIns(q->sections_judy, 0x%lx) failed, q->sections_judy = %p, result = %p",
+                  (long unsigned)page->section, q->sections_judy, section_pages_pptr);
 
         struct section_pages *sp = *section_pages_pptr;
         if(!sp) {
@@ -714,7 +717,9 @@ static ALWAYS_INLINE void pgc_queue_del(PGC *cache __maybe_unused, struct pgc_qu
 
     if(q->linked_list_in_sections_judy) {
         Pvoid_t *section_pages_pptr = JudyLGet(q->sections_judy, page->section, PJE0);
-        internal_fatal(!section_pages_pptr, "DBENGINE CACHE: page should be in Judy LL, but it is not");
+        if(section_pages_pptr == NULL || section_pages_pptr == PJERR)
+            fatal("DBENGINE CACHE: JudyLGet(q->sections_judy, 0x%lx) failed, q->sections_judy = %p",
+                  (long unsigned)page->section, q->sections_judy);
 
         struct section_pages *sp = *section_pages_pptr;
         sp->entries--;
@@ -1004,37 +1009,37 @@ static void remove_this_page_from_index_unsafe(PGC *cache, PGC_PAGE *page, size_
 
     Pvoid_t *metrics_judy_pptr = JudyLGet(cache->index[partition].sections_judy, page->section, PJE0);
     if(unlikely(!metrics_judy_pptr))
-        fatal("DBENGINE CACHE: section '%lu' should exist, but it does not.", page->section);
+        fatal("DBENGINE CACHE: section '%p' should exist, but it does not.", (void *)page->section);
 
     Pvoid_t *pages_judy_pptr = JudyLGet(*metrics_judy_pptr, page->metric_id, PJE0);
     if(unlikely(!pages_judy_pptr))
-        fatal("DBENGINE CACHE: metric '%lu' in section '%lu' should exist, but it does not.",
-              page->metric_id, page->section);
+        fatal("DBENGINE CACHE: metric '%p' in section '%p' should exist, but it does not.",
+              (void *)page->metric_id, (void *)page->section);
 
     Pvoid_t *page_ptr = JudyLGet(*pages_judy_pptr, page->start_time_s, PJE0);
     if(unlikely(!page_ptr))
-        fatal("DBENGINE CACHE: page with start time '%ld' of metric '%lu' in section '%lu' should exist, but it does not.",
-              page->start_time_s, page->metric_id, page->section);
+        fatal("DBENGINE CACHE: page with start time '%ld' of metric '%p' in section '%p' should exist, but it does not.",
+              page->start_time_s, (void *)page->metric_id, (void *)page->section);
 
     PGC_PAGE *found_page = *page_ptr;
     if(unlikely(found_page != page))
-        fatal("DBENGINE CACHE: page with start time '%ld' of metric '%lu' in section '%lu' should exist, "
+        fatal("DBENGINE CACHE: page with start time '%ld' of metric '%p' in section '%p' should exist, "
               "but the index returned a different address (expected %p, got %p).",
-              page->start_time_s, page->metric_id, page->section,
+              page->start_time_s, (void *)page->metric_id, (void *)page->section,
               page, found_page);
 
     JudyAllocThreadPulseReset();
 
     if(unlikely(!JudyLDel(pages_judy_pptr, page->start_time_s, PJE0)))
-        fatal("DBENGINE CACHE: page with start time '%ld' of metric '%lu' in section '%lu' exists, but cannot be deleted.",
-              page->start_time_s, page->metric_id, page->section);
+        fatal("DBENGINE CACHE: page with start time '%ld' of metric '%p' in section '%p' exists, but cannot be deleted.",
+              page->start_time_s, (void *)page->metric_id, (void *)page->section);
 
     if(!*pages_judy_pptr && !JudyLDel(metrics_judy_pptr, page->metric_id, PJE0))
-        fatal("DBENGINE CACHE: metric '%lu' in section '%lu' exists and is empty, but cannot be deleted.",
-              page->metric_id, page->section);
+        fatal("DBENGINE CACHE: metric '%p' in section '%p' exists and is empty, but cannot be deleted.",
+              (void *)page->metric_id, (void *)page->section);
 
     if(!*metrics_judy_pptr && !JudyLDel(&cache->index[partition].sections_judy, page->section, PJE0))
-        fatal("DBENGINE CACHE: section '%lu' exists and is empty, but cannot be deleted.", page->section);
+        fatal("DBENGINE CACHE: section '%p' exists and is empty, but cannot be deleted.", (void *)page->section);
 
     pgc_stats_index_judy_change(cache, JudyAllocThreadPulseGetAndReset());
 
@@ -1418,15 +1423,18 @@ static PGC_PAGE *pgc_page_add(PGC *cache, PGC_ENTRY *entry, bool *added) {
 
         Pvoid_t *metrics_judy_pptr = JudyLIns(&cache->index[partition].sections_judy, entry->section, PJE0);
         if(unlikely(!metrics_judy_pptr || metrics_judy_pptr == PJERR))
-            fatal("DBENGINE CACHE: corrupted sections judy array");
+            fatal("DBENGINE CACHE: JudyLIns(sections_judy, 0x%lx) failed, sections_judy = %p, result = %p",
+                  (long unsigned)entry->section, cache->index[partition].sections_judy, metrics_judy_pptr);
 
         Pvoid_t *pages_judy_pptr = JudyLIns(metrics_judy_pptr, entry->metric_id, PJE0);
         if(unlikely(!pages_judy_pptr || pages_judy_pptr == PJERR))
-            fatal("DBENGINE CACHE: corrupted pages judy array");
+            fatal("DBENGINE CACHE: JudyLIns(metrics_judy, 0x%lx) failed, metrics_judy = %p, result = %p",
+                  (long unsigned)entry->metric_id, metrics_judy_pptr, pages_judy_pptr);
 
         Pvoid_t *page_ptr = JudyLIns(pages_judy_pptr, entry->start_time_s, PJE0);
         if(unlikely(!page_ptr || page_ptr == PJERR))
-            fatal("DBENGINE CACHE: corrupted page in judy array");
+            fatal("DBENGINE CACHE: JudyLIns(pages_judy, %ld) failed, pages_judy = %p, result = %p",
+                  (long)entry->start_time_s, pages_judy_pptr, page_ptr);
 
         pgc_stats_index_judy_change(cache, JudyAllocThreadPulseGetAndReset());
 
@@ -1918,7 +1926,7 @@ void free_all_unreferenced_clean_pages(PGC *cache) {
     evict_pages(cache, 0, 0, true, true);
 }
 
-static void *pgc_evict_thread(void *ptr) {
+static void pgc_evict_thread(void *ptr) {
     static usec_t last_malloc_release_ut = 0;
 
     PGC *cache = ptr;
@@ -1960,7 +1968,6 @@ static void *pgc_evict_thread(void *ptr) {
     }
 
     worker_unregister();
-    return NULL;
 }
 
 // ----------------------------------------------------------------------------
@@ -2077,7 +2084,7 @@ PGC *pgc_create(const char *name,
     // last create the eviction thread
     {
         completion_init(&cache->evictor.completion);
-        cache->evictor.thread = nd_thread_create(name, NETDATA_THREAD_OPTION_JOINABLE, pgc_evict_thread, cache);
+        cache->evictor.thread = nd_thread_create(name, NETDATA_THREAD_OPTION_DEFAULT, pgc_evict_thread, cache);
     }
 
     return cache;
@@ -2410,7 +2417,15 @@ size_t pgc_hot_and_dirty_entries(PGC *cache) {
     return entries;
 }
 
-void pgc_open_cache_to_journal_v2(PGC *cache, Word_t section, unsigned datafile_fileno, uint8_t type, migrate_to_v2_callback cb, void *data) {
+void pgc_open_cache_to_journal_v2(
+    PGC *cache,
+    Word_t section,
+    unsigned datafile_fileno,
+    uint8_t type,
+    migrate_to_v2_callback cb,
+    void *data,
+    bool startup)
+{
     __atomic_add_fetch(&rrdeng_cache_efficiency_stats.journal_v2_indexing_started, 1, __ATOMIC_RELAXED);
     p2_add_fetch(&cache->stats.p2_workers_jv2_flush, 1);
 
@@ -2462,6 +2477,8 @@ void pgc_open_cache_to_journal_v2(PGC *cache, Word_t section, unsigned datafile_
             continue;
         }
 
+        METRIC *metric = mrg_metric_dup(main_mrg, (METRIC *)page->metric_id);
+
         page_flag_set(page, PGC_PAGE_IS_BEING_MIGRATED_TO_V2);
 
         pgc_queue_unlock(cache, &cache->hot);
@@ -2469,14 +2486,15 @@ void pgc_open_cache_to_journal_v2(PGC *cache, Word_t section, unsigned datafile_
         // update the extents JudyL
 
         size_t current_extent_index_id;
-        Pvoid_t *PValue = JudyLIns(&JudyL_extents_pos, xio->pos, PJE0);
+        Pvoid_t *PValue = JudyLIns(&JudyL_extents_pos, xio->block, PJE0);
         if(!PValue || PValue == PJERR)
-            fatal("Corrupted JudyL extents pos");
+            fatal("CACHE: JudyLIns(JudyL_extents_pos, %" PRIu64 ") failed, JudyL_extents_pos = %p, result = %p",
+                  BLOCK_TO_OFFSET(xio->block), JudyL_extents_pos, PValue);
 
         struct jv2_extents_info *ei;
         if(!*PValue) {
             ei = aral_mallocz(ar_ei); // callocz(1, sizeof(struct jv2_extents_info));
-            ei->pos = xio->pos;
+            ei->block = xio->block;
             ei->bytes = xio->bytes;
             ei->number_of_pages = 1;
             ei->index = master_extent_index_id++;
@@ -2495,12 +2513,14 @@ void pgc_open_cache_to_journal_v2(PGC *cache, Word_t section, unsigned datafile_
 
         PValue = JudyLIns(&JudyL_metrics, page->metric_id, PJE0);
         if(!PValue || PValue == PJERR)
-            fatal("Corrupted JudyL metrics");
+            fatal("CACHE: JudyLIns(JudyL_metrics, 0x%lx) failed, JudyL_metrics = %p, result = %p",
+                  (long unsigned)page->metric_id, JudyL_metrics, PValue);
 
         struct jv2_metrics_info *mi;
         if(!*PValue) {
-            mi = aral_mallocz(ar_mi); // callocz(1, sizeof(struct jv2_metrics_info));
-            mi->uuid = mrg_metric_uuid(main_mrg, (METRIC *)page->metric_id);
+            mi = aral_mallocz(ar_mi);
+            mi->metric = metric;
+            mi->uuid = mrg_metric_uuid(main_mrg, metric);
             mi->first_time_s = page->start_time_s;
             mi->last_time_s = page->end_time_s;
             mi->number_of_pages = 1;
@@ -2513,6 +2533,7 @@ void pgc_open_cache_to_journal_v2(PGC *cache, Word_t section, unsigned datafile_
         else {
             mi = *PValue;
             mi->number_of_pages++;
+            mrg_metric_release(main_mrg, metric);
             if(page->start_time_s < mi->first_time_s)
                 mi->first_time_s = page->start_time_s;
             if(page->end_time_s > mi->last_time_s)
@@ -2521,10 +2542,11 @@ void pgc_open_cache_to_journal_v2(PGC *cache, Word_t section, unsigned datafile_
 
         PValue = JudyLIns(&mi->JudyL_pages_by_start_time, page->start_time_s, PJE0);
         if(!PValue || PValue == PJERR)
-            fatal("Corrupted JudyL metric pages");
+            fatal("CACHE: JudyLIns(JudyL_pages_by_start_time, %ld) failed, JudyL_pages_by_start_time = %p, result = %p",
+                  (long)page->start_time_s, mi->JudyL_pages_by_start_time, PValue);
 
         if(!*PValue) {
-            struct jv2_page_info *pi = aral_mallocz(ar_pi); // callocz(1, (sizeof(struct jv2_page_info)));
+            struct jv2_page_info *pi = aral_mallocz(ar_pi);
             pi->start_time_s = page->start_time_s;
             pi->end_time_s = page->end_time_s;
             pi->update_every_s = page->update_every_s;
@@ -2544,7 +2566,8 @@ void pgc_open_cache_to_journal_v2(PGC *cache, Word_t section, unsigned datafile_
             page_release(cache, page, false);
         }
 
-        yield_the_processor(); // do not lock too aggressively
+        if (likely(false == startup))
+            yield_the_processor(); // do not lock too aggressively
         pgc_queue_lock(cache, &cache->hot, PGC_QUEUE_LOCK_PRIO_LOW);
     }
 
@@ -2552,7 +2575,7 @@ void pgc_open_cache_to_journal_v2(PGC *cache, Word_t section, unsigned datafile_
     pgc_queue_unlock(cache, &cache->hot);
 
     // callback
-    cb(section, datafile_fileno, type, JudyL_metrics, JudyL_extents_pos, count_of_unique_extents, count_of_unique_metrics, count_of_unique_pages, data);
+    bool success = cb(section, datafile_fileno, type, JudyL_metrics, JudyL_extents_pos, count_of_unique_extents, count_of_unique_metrics, count_of_unique_pages, data);
 
     {
         Pvoid_t *PValue1;
@@ -2567,12 +2590,15 @@ void pgc_open_cache_to_journal_v2(PGC *cache, Word_t section, unsigned datafile_
             while ((PValue2 = JudyLFirstThenNext(mi->JudyL_pages_by_start_time, &start_time, &start_time_first))) {
                 struct jv2_page_info *pi = *PValue2;
 
-                // balance-parents: transition from hot to clean directly
-                yield_the_processor(); // do not lock too aggressively
-                page_set_clean(cache, pi->page, true, false, PGC_QUEUE_LOCK_PRIO_LOW);
-                page_transition_unlock(cache, pi->page);
-                page_release(cache, pi->page, true);
+                if (likely(false == startup))
+                    yield_the_processor(); // do not lock too aggressively
+                if (likely(success))
+                    page_set_clean(cache, pi->page, true, false, PGC_QUEUE_LOCK_PRIO_LOW);
+                else
+                    page_flag_clear(pi->page, PGC_PAGE_IS_BEING_MIGRATED_TO_V2);
 
+                page_transition_unlock(cache, pi->page);
+                page_release(cache, pi->page, success);
                 // before balance-parents:
                 // page_transition_unlock(cache, pi->page);
                 // pgc_page_hot_to_dirty_and_release(cache, pi->page, true);
@@ -2583,6 +2609,7 @@ void pgc_open_cache_to_journal_v2(PGC *cache, Word_t section, unsigned datafile_
             }
 
             JudyLFreeArray(&mi->JudyL_pages_by_start_time, PJE0);
+            mrg_metric_release(main_mrg, mi->metric);
             aral_freez(ar_mi, mi);
         }
         JudyLFreeArray(&JudyL_metrics, PJE0);
@@ -2859,7 +2886,7 @@ void unittest_stress_test(void) {
 
     pthread_t service_thread;
     nd_thread_create(&service_thread, "SERVICE",
-                          NETDATA_THREAD_OPTION_JOINABLE | NETDATA_THREAD_OPTION_DONT_LOG,
+                          NETDATA_THREAD_OPTION_DONT_LOG,
                           unittest_stress_test_service, NULL);
 
     pthread_t collect_threads[pgc_uts.collect_threads];
@@ -2869,7 +2896,7 @@ void unittest_stress_test(void) {
         char buffer[100 + 1];
         snprintfz(buffer, sizeof(buffer) - 1, "COLLECT_%zu", i);
         nd_thread_create(&collect_threads[i], buffer,
-                              NETDATA_THREAD_OPTION_JOINABLE | NETDATA_THREAD_OPTION_DONT_LOG,
+                              NETDATA_THREAD_OPTION_DONT_LOG,
                               unittest_stress_test_collector, &collect_thread_ids[i]);
     }
 
@@ -2882,7 +2909,7 @@ void unittest_stress_test(void) {
         snprintfz(buffer, sizeof(buffer) - 1, "QUERY_%zu", i);
         initstate_r(1, pgc_uts.rand_statebufs, 1024, &pgc_uts.random_data[i]);
         nd_thread_create(&queries_threads[i], buffer,
-                              NETDATA_THREAD_OPTION_JOINABLE | NETDATA_THREAD_OPTION_DONT_LOG,
+                              NETDATA_THREAD_OPTION_DONT_LOG,
                               unittest_stress_test_queries, &query_thread_ids[i]);
     }
 

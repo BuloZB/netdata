@@ -23,7 +23,7 @@ fi
 COMMON_CFLAGS="-Wa,-mbig-obj -pipe -D_FILE_OFFSET_BITS=64 -D__USE_MINGW_ANSI_STDIO=1"
 
 if [ "${CMAKE_BUILD_TYPE}" = "Debug" ]; then
-    BUILD_CFLAGS="-fstack-protector-all -O0 -ggdb -Wall -Wextra -Wno-char-subscripts -DNETDATA_INTERNAL_CHECKS=1 ${COMMON_CFLAGS} ${CFLAGS:-}"
+    BUILD_CFLAGS="-O0 -ggdb -Wall -Wextra -Wno-char-subscripts -DNETDATA_INTERNAL_CHECKS=1 ${COMMON_CFLAGS} ${CFLAGS:-}"
 else
     BUILD_CFLAGS="-O2 ${COMMON_CFLAGS} ${CFLAGS:-}"
 fi
@@ -39,18 +39,24 @@ CFLAGS="${BUILD_CFLAGS}" /usr/bin/cmake \
     -DNETDATA_USER="${USER}" \
     -DENABLE_ACLK=On \
     -DENABLE_CLOUD=On \
-    -DENABLE_H2O=Off \
     -DENABLE_ML=On \
     -DENABLE_PLUGIN_GO=On \
     -DENABLE_EXPORTER_PROMETHEUS_REMOTE_WRITE=Off \
+    -DENABLE_PLUGIN_OTEL=Off \
+    -DENABLE_PLUGIN_SYSTEMD_JOURNAL=Off \
     -DENABLE_BUNDLED_JSONC=On \
     -DENABLE_BUNDLED_PROTOBUF=Off \
+    -DRust_COMPILER=/ucrt64/bin/rustc \
     ${EXTRA_CMAKE_OPTIONS:-}
 ${GITHUB_ACTIONS+echo "::endgroup::"}
 
 ${GITHUB_ACTIONS+echo "::group::Building"}
 # shellcheck disable=SC2086
 cmake --build "${build}" -- ${build_args}
+${GITHUB_ACTIONS+echo "::endgroup::"}
+
+${GITHUB_ACTIONS+echo "::group::Netdata buildinfo"}
+"${build}/netdata.exe" -W buildinfo || true
 ${GITHUB_ACTIONS+echo "::endgroup::"}
 
 if [ -t 1 ]; then

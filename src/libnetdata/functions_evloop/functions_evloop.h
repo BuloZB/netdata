@@ -82,6 +82,9 @@
 #define PLUGINSD_KEYWORD_JSON_CMD_STREAM_PATH   "STREAM_PATH"
 #define PLUGINSD_KEYWORD_JSON_CMD_ML_MODEL      "ML_MODEL"
 
+// trust BEGIN timestamps from the plugin
+#define PLUGINSD_KEYWORD_TRUST_DURATIONS        "TRUST_DURATIONS"
+
 typedef void (*functions_evloop_worker_execute_t)(const char *transaction, char *function, usec_t *stop_monotonic_ut,
                                                   bool *cancelled, BUFFER *payload, HTTP_ACCESS access,
                                                   const char *source, void *data);
@@ -153,7 +156,7 @@ static inline void pluginsd_function_progress_to_stdout(const char *transaction,
     fflush(stdout);
 }
 
-static inline void send_newline_and_flush(pthread_mutex_t *mutex) {
+static inline void send_newline_and_flush(netdata_mutex_t *mutex) {
     netdata_mutex_lock(mutex);
     fprintf(stdout, "\n");
     fflush(stdout);

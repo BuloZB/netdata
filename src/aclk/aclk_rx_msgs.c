@@ -15,7 +15,8 @@
 #define ACLK_V_COMPRESSION 2
 
 struct aclk_request {
-    char *type_id;
+    bool has_type;
+    bool is_http;
     char *msg_id;
     char *callback_topic;
     char *payload;
@@ -35,15 +36,16 @@ static int cloud_to_agent_parse(JSON_ENTRY *e)
             break;
         case JSON_STRING:
             if (!strcmp(e->name, "msg-id")) {
-                data->msg_id = strdupz(e->data.string);
+                data->msg_id = e->data.string ? strdupz(e->data.string) : NULL;
                 break;
             }
             if (!strcmp(e->name, "type")) {
-                data->type_id = strdupz(e->data.string);
+                data->has_type = true;
+                data->is_http = (e->data.string && (strcmp(e->data.string, "http") == 0));
                 break;
             }
             if (!strcmp(e->name, "callback-topic")) {
-                data->callback_topic = strdupz(e->data.string);
+                data->callback_topic = e->data.string ? strdupz(e->data.string) : NULL;
                 break;
             }
             if (!strcmp(e->name, "payload")) {
@@ -125,8 +127,6 @@ static inline int aclk_v2_payload_get_query(const char *payload, char **query_ur
 
 static int aclk_handle_cloud_http_request_v2(struct aclk_request *cloud_to_agent, char *raw_payload)
 {
-    aclk_query_t query;
-
     errno_clear();
     if (cloud_to_agent->version < ACLK_V_COMPRESSION) {
         netdata_log_error(
@@ -136,7 +136,7 @@ static int aclk_handle_cloud_http_request_v2(struct aclk_request *cloud_to_agent
         return 1;
     }
 
-    query = aclk_query_new(HTTP_API_V2);
+    aclk_query_t *query = aclk_query_new(HTTP_API_V2);
 
     if (unlikely(aclk_extract_v2_data(raw_payload, &query->data.http_api_v2.payload))) {
         netdata_log_error("Error extracting payload expected after the JSON dictionary.");
@@ -192,14 +192,14 @@ int aclk_handle_cloud_cmd_message(char *payload)
         goto err_cleanup;
     }
 
-    if (!cloud_to_agent.type_id) {
+    if (!cloud_to_agent.has_type) {
         error_report("Cloud message is missing compulsory key \"type\"");
         goto err_cleanup;
     }
 
     // Originally we were expecting to have multiple types of 'cmd' message,
     // but after the new protocol was designed we will ever only have 'http'
-    if (strcmp(cloud_to_agent.type_id, "http") != 0) {
+    if (!cloud_to_agent.is_http) {
         error_report("Only 'http' cmd message is supported");
         goto err_cleanup;
     }
@@ -207,15 +207,12 @@ int aclk_handle_cloud_cmd_message(char *payload)
     if (likely(!aclk_handle_cloud_http_request_v2(&cloud_to_agent, payload))) {
         // aclk_handle_cloud_request takes ownership of the pointers
         // (to avoid copying) in case of success
-        freez(cloud_to_agent.type_id);
         return 0;
     }
 
 err_cleanup:
     if (cloud_to_agent.payload)
         freez(cloud_to_agent.payload);
-    if (cloud_to_agent.type_id)
-        freez(cloud_to_agent.type_id);
     if (cloud_to_agent.msg_id)
         freez(cloud_to_agent.msg_id);
     if (cloud_to_agent.callback_topic)
@@ -235,12 +232,9 @@ int handle_old_proto_cmd(const char *msg, size_t msg_len)
     char *str = mallocz(msg_len+1);
     memcpy(str, msg, msg_len);
     str[msg_len] = 0;
-    if (aclk_handle_cloud_cmd_message(str)) {
-        freez(str);
-        return 1;
-    }
+    int rc = aclk_handle_cloud_cmd_message(str);
     freez(str);
-    return 0;
+    return rc;
 }
 
 int create_node_instance_result(const char *msg, size_t msg_len)
@@ -255,7 +249,8 @@ int create_node_instance_result(const char *msg, size_t msg_len)
 
     netdata_log_debug(D_ACLK, "CreateNodeInstanceResult: guid:%s nodeid:%s", res.machine_guid, res.node_id);
 
-    aclk_query_t query = aclk_query_new(CREATE_NODE_INSTANCE);
+    aclk_query_t *query = aclk_query_new(CREATE_NODE_INSTANCE);
+
     query->data.node_id = res.node_id;          // Will be freed on query free
     query->machine_guid = res.machine_guid;     // Will be freed on query free
     aclk_add_job(query);
@@ -266,7 +261,7 @@ int send_node_instances(const char *msg, size_t msg_len)
 {
     UNUSED(msg);
     UNUSED(msg_len);
-    aclk_query_t query = aclk_query_new(SEND_NODE_INSTANCES);
+    aclk_query_t *query = aclk_query_new(SEND_NODE_INSTANCES);
     aclk_add_job(query);
     return 0;
 }
@@ -302,7 +297,7 @@ int start_alarm_streaming(const char *msg, size_t msg_len)
         netdata_log_error("Error parsing StartAlarmStreaming");
         return 1;
     }
-    aclk_query_t query = aclk_query_new(ALERT_START_STREAMING);
+    aclk_query_t *query = aclk_query_new(ALERT_START_STREAMING);
     query->data.node_id = res.node_id;      // Will be freed on query free
     query->version = res.version;
     aclk_add_job(query);
@@ -318,7 +313,7 @@ int send_alarm_checkpoint(const char *msg, size_t msg_len)
         freez(sac.claim_id);
         return 1;
     }
-    aclk_query_t query = aclk_query_new(ALERT_CHECKPOINT);
+    aclk_query_t *query = aclk_query_new(ALERT_CHECKPOINT);
     query->data.node_id = sac.node_id;  // Will be freed on query free
     query->claim_id = sac.claim_id;
     query->version = sac.version;
@@ -347,7 +342,7 @@ int send_alarm_snapshot(const char *msg, size_t msg_len)
         destroy_send_alarm_snapshot(sas);
         return 1;
     }
-    aclk_query_t query = aclk_query_new(ALERT_CHECKPOINT);
+    aclk_query_t *query = aclk_query_new(ALERT_CHECKPOINT);
     query->data.node_id = sas->node_id;     // Will be freed on query free
     query->claim_id = sas->claim_id;        // Will be freed on query free
     query->version = 0; // force snapshot
@@ -386,7 +381,7 @@ int contexts_checkpoint(const char *msg, size_t msg_len)
     if (!cmd)
         return 1;
 
-    aclk_query_t query = aclk_query_new(CTX_CHECKPOINT);
+    aclk_query_t *query = aclk_query_new(CTX_CHECKPOINT);
     query->data.payload = cmd;
     aclk_add_job(query);
     return 0;
@@ -403,7 +398,7 @@ int stop_streaming_contexts(const char *msg, size_t msg_len)
     if (!cmd)
         return 1;
 
-    aclk_query_t query = aclk_query_new(CTX_STOP_STREAMING);
+    aclk_query_t *query = aclk_query_new(CTX_STOP_STREAMING);
     query->data.payload = cmd;
     aclk_add_job(query);
     return 0;

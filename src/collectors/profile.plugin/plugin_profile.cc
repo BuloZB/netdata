@@ -174,10 +174,9 @@ private:
     std::vector<RRDDIM *> Dimensions;
 };
 
-static void *subprofile_main(void* Arg) {
+static void subprofile_main(void* Arg) {
     Profiler *P = reinterpret_cast<Profiler *>(Arg);
     P->run();
-    return nullptr;
 }
 
 static void profile_main_cleanup(void *pptr) {
@@ -217,7 +216,7 @@ extern "C" void *profile_main(void *ptr) {
         char Tag[NETDATA_THREAD_TAG_MAX + 1];
 
         snprintfz(Tag, NETDATA_THREAD_TAG_MAX, "PROFILER[%zu]", Idx);
-        Threads[Idx] = nd_thread_create(Tag, NETDATA_THREAD_OPTION_JOINABLE,
+        Threads[Idx] = nd_thread_create(Tag, NETDATA_THREAD_OPTION_DEFAULT,
                                         subprofile_main, static_cast<void *>(&Profilers[Idx]));
     }
 

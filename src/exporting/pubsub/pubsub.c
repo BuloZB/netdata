@@ -35,8 +35,8 @@ int init_pubsub_instance(struct instance *instance)
         netdata_log_error("EXPORTING: cannot create buffer for Pub/Sub exporting connector instance %s", instance->config.name);
         return 1;
     }
-    uv_mutex_init(&instance->mutex);
-    uv_cond_init(&instance->cond_var);
+    netdata_mutex_init(&instance->mutex);
+    netdata_cond_init(&instance->cond_var);
 
     struct pubsub_specific_data *connector_specific_data = callocz(1, sizeof(struct pubsub_specific_data));
     instance->connector_specific_data = (void *)connector_specific_data;
@@ -93,28 +93,24 @@ void clean_pubsub_instance(struct instance *instance)
  *
  * @param instance_p an instance data structure.
  */
-void pubsub_connector_worker(void *instance_p)
+void *pubsub_connector_worker(void *instance_p)
 {
     struct instance *instance = (struct instance *)instance_p;
     struct pubsub_specific_config *connector_specific_config = instance->config.connector_specific_config;
     struct pubsub_specific_data *connector_specific_data = instance->connector_specific_data;
 
-    char threadname[ND_THREAD_TAG_MAX + 1];
-    snprintfz(threadname, ND_THREAD_TAG_MAX, "EXPPBSB[%zu]", instance->index);
-    uv_thread_set_name_np(threadname);
-
     while (!instance->engine->exit) {
         struct stats *stats = &instance->stats;
         char error_message[ERROR_LINE_MAX + 1] = "";
 
-        uv_mutex_lock(&instance->mutex);
+        netdata_mutex_lock(&instance->mutex);
         while (!instance->data_is_ready)
-            uv_cond_wait(&instance->cond_var, &instance->mutex);
+            netdata_cond_wait(&instance->cond_var, &instance->mutex);
         instance->data_is_ready = 0;
 
 
         if (unlikely(instance->engine->exit)) {
-            uv_mutex_unlock(&instance->mutex);
+            netdata_mutex_unlock(&instance->mutex);
             break;
         }
 
@@ -188,7 +184,7 @@ void pubsub_connector_worker(void *instance_p)
         buffer_flush(buffer);
         stats->buffered_metrics = 0;
 
-        uv_mutex_unlock(&instance->mutex);
+        netdata_mutex_unlock(&instance->mutex);
 
 #ifdef UNIT_TESTING
         return;
@@ -196,4 +192,5 @@ void pubsub_connector_worker(void *instance_p)
     }
 
     clean_pubsub_instance(instance);
+    return NULL;
 }

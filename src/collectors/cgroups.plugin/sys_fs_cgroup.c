@@ -54,7 +54,7 @@ uint32_t throttled_usec_hash = 0;
 
 // *** WARNING *** The fields are not thread safe. Take care of safe usage.
 struct cgroup *cgroup_root = NULL;
-uv_mutex_t cgroup_root_mutex;
+netdata_mutex_t cgroup_root_mutex;
 
 struct cgroups_systemd_config_setting cgroups_systemd_options[] = {
         { .name = "legacy",  .setting = SYSTEMD_CGROUP_LEGACY  },
@@ -338,6 +338,9 @@ void read_cgroup_plugin_configuration() {
 
                        // ----------------------------------------------------------------
 
+                       " !/machine.slice/*/.control "
+                       " !/machine.slice/*/payload* "
+                       " !/machine.slice/*/supervisor "
                        " /machine.slice/*.service "           // #3367 systemd-nspawn
 
                        // ----------------------------------------------------------------
@@ -1021,20 +1024,19 @@ cpu_limits2_err:
 
 static inline int update_memory_limits(struct cgroup *cg) {
     char **filename = &cg->filename_memory_limit;
-    const RRDVAR_ACQUIRED **chart_var = &cg->chart_var_memory_limit;
     unsigned long long *value = &cg->memory_limit;
 
     if(*filename) {
-        if(unlikely(!*chart_var)) {
-            *chart_var = rrdvar_chart_variable_add_and_acquire(cg->st_mem_usage, "memory_limit");
-            if(!*chart_var) {
+        if(unlikely(!cg->chart_var_memory_limit)) {
+            cg->chart_var_memory_limit = rrdvar_chart_variable_add_and_acquire(cg->st_mem_usage, "memory_limit");
+            if(!cg->chart_var_memory_limit) {
                 collector_error("Cannot create cgroup %s chart variable '%s'. Will not update its limit anymore.", cg->id, "memory_limit");
                 freez(*filename);
                 *filename = NULL;
             }
         }
 
-        if(*filename && *chart_var) {
+        if(*filename && cg->chart_var_memory_limit) {
             if(!(cg->options & CGROUP_OPTIONS_IS_UNIFIED)) {
                 if(read_single_number_file(*filename, value)) {
                     collector_error("Cannot refresh cgroup %s memory limit by reading '%s'. Will not update its limit anymore.", cg->id, *filename);
@@ -1043,7 +1045,7 @@ static inline int update_memory_limits(struct cgroup *cg) {
                 }
                 else {
                     rrdvar_chart_variable_set(
-                        cg->st_mem_usage, *chart_var, (NETDATA_DOUBLE)(*value) / (1024.0 * 1024.0));
+                        cg->st_mem_usage, cg->chart_var_memory_limit, (NETDATA_DOUBLE)(*value) / (1024.0 * 1024.0));
                     return 1;
                 }
             } else {
@@ -1058,12 +1060,11 @@ static inline int update_memory_limits(struct cgroup *cg) {
                 char *s = "max\n\0";
                 if(strcmp(s, buffer) == 0){
                     *value = UINT64_MAX;
-                    rrdvar_chart_variable_set(
-                        cg->st_mem_usage, *chart_var, (NETDATA_DOUBLE)(*value) / (1024.0 * 1024.0));
+                    rrdvar_chart_variable_set(cg->st_mem_usage, cg->chart_var_memory_limit, (NETDATA_DOUBLE)(*value) / (1024.0 * 1024.0));
                     return 1;
                 }
                 *value = str2ull(buffer, NULL);
-                rrdvar_chart_variable_set(cg->st_mem_usage, *chart_var, (NETDATA_DOUBLE)(*value) / (1024.0 * 1024.0));
+                rrdvar_chart_variable_set(cg->st_mem_usage, cg->chart_var_memory_limit, (NETDATA_DOUBLE)(*value) / (1024.0 * 1024.0));
                 return 1;
             }
         }
@@ -1334,13 +1335,16 @@ static void cgroup_main_cleanup(void *pptr) {
     if (!__atomic_load_n(&discovery_thread.exited, __ATOMIC_RELAXED)) {
         collector_info("waiting for discovery thread to finish...");
         while (!__atomic_load_n(&discovery_thread.exited, __ATOMIC_RELAXED) && max > 0) {
-            uv_mutex_lock(&discovery_thread.mutex);
-            uv_cond_signal(&discovery_thread.cond_var);
-            uv_mutex_unlock(&discovery_thread.mutex);
+            netdata_mutex_lock(&discovery_thread.mutex);
+            netdata_cond_signal(&discovery_thread.cond_var);
+            netdata_mutex_unlock(&discovery_thread.mutex);
             max -= step;
             sleep_usec(step);
         }
     }
+    // We should be done, but just in case, avoid blocking shutdown
+    if (__atomic_load_n(&discovery_thread.exited, __ATOMIC_RELAXED))
+        (void) nd_thread_join(discovery_thread.thread);
 
     static_thread->enabled = NETDATA_MAIN_THREAD_EXITED;
 }
@@ -1360,7 +1364,7 @@ void cgroup_read_host_total_ram() {
     procfile_close(ff);
 }
 
-void *cgroups_main(void *ptr) {
+void cgroups_main(void *ptr) {
     CLEANUP_FUNCTION_REGISTER(cgroup_main_cleanup) cleanup_ptr = ptr;
 
     worker_register("CGROUPS");
@@ -1377,31 +1381,32 @@ void *cgroups_main(void *ptr) {
 
     cgroup_read_host_total_ram();
 
-    if (uv_mutex_init(&cgroup_root_mutex)) {
+    if (netdata_mutex_init(&cgroup_root_mutex)) {
         collector_error("CGROUP: cannot initialize mutex for the main cgroup list");
-        goto exit;
-    }
-
-    discovery_thread.exited = 0;
-
-    if (uv_mutex_init(&discovery_thread.mutex)) {
-        collector_error("CGROUP: cannot initialize mutex for discovery thread");
-        goto exit;
-    }
-    if (uv_cond_init(&discovery_thread.cond_var)) {
-        collector_error("CGROUP: cannot initialize conditional variable for discovery thread");
-        goto exit;
-    }
-
-    int error = uv_thread_create(&discovery_thread.thread, cgroup_discovery_worker, NULL);
-    if (error) {
-        collector_error("CGROUP: cannot create thread worker. uv_thread_create(): %s", uv_strerror(error));
-        goto exit;
+        return;
     }
 
     // we register this only on localhost
     // for the other nodes, the origin server should register it
     cgroup_netdev_link_init();
+
+    discovery_thread.exited = 0;
+
+    if (netdata_mutex_init(&discovery_thread.mutex)) {
+        collector_error("CGROUP: cannot initialize mutex for discovery thread");
+        return;
+    }
+    if (netdata_cond_init(&discovery_thread.cond_var)) {
+        collector_error("CGROUP: cannot initialize conditional variable for discovery thread");
+        return;
+    }
+
+    discovery_thread.thread = nd_thread_create("CGDISCOVER", NETDATA_THREAD_OPTION_DEFAULT, cgroup_discovery_worker, NULL);
+
+    if (!discovery_thread.thread) {
+        collector_error("CGROUP: cannot create thread worker");
+        return;
+    }
 
     rrd_function_add_inline(localhost, NULL, "containers-vms", 10,
                             RRDFUNCTIONS_PRIORITY_DEFAULT / 2, RRDFUNCTIONS_VERSION_DEFAULT,
@@ -1429,21 +1434,21 @@ void *cgroups_main(void *ptr) {
 
         find_dt += hb_dt;
         if (unlikely(find_dt >= find_every || (!is_inside_k8s && cgroups_check))) {
-            uv_mutex_lock(&discovery_thread.mutex);
-            uv_cond_signal(&discovery_thread.cond_var);
-            uv_mutex_unlock(&discovery_thread.mutex);
+            netdata_mutex_lock(&discovery_thread.mutex);
+            netdata_cond_signal(&discovery_thread.cond_var);
+            netdata_mutex_unlock(&discovery_thread.mutex);
             find_dt = 0;
             cgroups_check = 0;
         }
 
         worker_is_busy(WORKER_CGROUPS_LOCK);
-        uv_mutex_lock(&cgroup_root_mutex);
+        netdata_mutex_lock(&cgroup_root_mutex);
 
         worker_is_busy(WORKER_CGROUPS_READ);
         read_all_discovered_cgroups(cgroup_root);
 
         if (unlikely(!service_running(SERVICE_COLLECTORS))) {
-            uv_mutex_unlock(&cgroup_root_mutex);
+            netdata_mutex_unlock(&cgroup_root_mutex);
             break;
         }
 
@@ -1453,14 +1458,11 @@ void *cgroups_main(void *ptr) {
         update_cgroup_systemd_services_charts();
 
         if (unlikely(!service_running(SERVICE_COLLECTORS))) {
-           uv_mutex_unlock(&cgroup_root_mutex);
+            netdata_mutex_unlock(&cgroup_root_mutex);
            break;
         }
 
         worker_is_idle();
-        uv_mutex_unlock(&cgroup_root_mutex);
+        netdata_mutex_unlock(&cgroup_root_mutex);
     }
-
-exit:
-    return NULL;
 }

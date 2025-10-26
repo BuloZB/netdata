@@ -11,12 +11,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/confopt"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/prometheus"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/web"
-
 	"github.com/blang/semver/v4"
+
+	"github.com/netdata/netdata/go/plugins/pkg/confopt"
+	"github.com/netdata/netdata/go/plugins/pkg/prometheus"
+	"github.com/netdata/netdata/go/plugins/pkg/web"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
 )
 
 //go:embed "config_schema.json"
@@ -53,10 +53,11 @@ func New() *Collector {
 }
 
 type Config struct {
-	Vnode          string `yaml:"vnode,omitempty" json:"vnode"`
-	UpdateEvery    int    `yaml:"update_every,omitempty" json:"update_every"`
-	web.HTTPConfig `yaml:",inline" json:""`
-	ACLToken       string `yaml:"acl_token,omitempty" json:"acl_token"`
+	Vnode              string `yaml:"vnode,omitempty" json:"vnode"`
+	UpdateEvery        int    `yaml:"update_every,omitempty" json:"update_every"`
+	AutoDetectionRetry int    `yaml:"autodetection_retry,omitempty" json:"autodetection_retry"`
+	web.HTTPConfig     `yaml:",inline" json:""`
+	ACLToken           string `yaml:"acl_token,omitempty" json:"acl_token"`
 }
 
 type Collector struct {

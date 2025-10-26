@@ -32,6 +32,10 @@ It establishes a connection to the Oracle DB instance via a TCP or UNIX socket a
 - `v$system_wait_class`
 - `dba_data_files`
 - `dba_free_space`
+- `dba_segments`
+- `dba_temp_files`
+- `dba_tablespaces`
+- `v$temp_space_header`
 
 
 This collector is supported on all platforms.
@@ -58,7 +62,6 @@ The default configuration for this integration does not impose any limits on dat
 #### Performance Impact
 
 The default configuration for this integration is not expected to impose a significant performance impact on the system.
-
 
 ## Metrics
 
@@ -103,6 +106,7 @@ Labels:
 | Label      | Description     |
 |:-----------|:----------------|
 | tablespace | Tablespace name. |
+| autoextend_status | Autoextend status (enabled, disabled, mixed). |
 
 Metrics:
 
@@ -136,6 +140,21 @@ There are no alerts configured by default for this integration.
 
 ## Setup
 
+
+You can configure the **oracledb** collector in two ways:
+
+| Method                | Best for                                                                                 | How to                                                                                                                                 |
+|-----------------------|------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
+| [**UI**](#via-ui)     | Fast setup without editing files                                                         | Go to **Nodes → Configure this node → Collectors → Jobs**, search for **oracledb**, then click **+** to add a job. |
+| [**File**](#via-file) | If you prefer configuring via file, or need to automate deployments (e.g., with Ansible) | Edit `go.d/oracledb.conf` and add a job.                                                                        |
+
+:::important
+
+UI configuration requires paid Netdata Cloud plan.
+
+:::
+
+
 ### Prerequisites
 
 #### Create a read only user for netdata
@@ -155,18 +174,6 @@ GRANT SELECT_CATALOG_ROLE TO netdata;
 
 ### Configuration
 
-#### File
-
-The configuration file name for this integration is `go.d/oracledb.conf`.
-
-
-You can edit the configuration file using the [`edit-config`](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#edit-a-configuration-file-using-edit-config) script from the
-Netdata [config directory](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#the-netdata-config-directory).
-
-```bash
-cd /etc/netdata 2>/dev/null || cd /opt/netdata/etc/netdata
-sudo ./edit-config go.d/oracledb.conf
-```
 #### Options
 
 The following options can be defined globally: update_every, autodetection_retry.
@@ -174,18 +181,58 @@ The following options can be defined globally: update_every, autodetection_retry
 
 <details open><summary>Config options</summary>
 
-| Name | Description | Default | Required |
-|:----|:-----------|:-------|:--------:|
-| update_every | Data collection frequency. | 1 | no |
-| autodetection_retry | Recheck interval in seconds. Zero means no recheck will be scheduled. | 0 | no |
-| dsn | Oracle server DSN (Data Source Name). Format is `oracle://username:password@host:port/service?param1=value1&...&paramN=valueN`. |  | yes |
-| timeout | Query timeout in seconds. | 1 | no |
+
+
+| Group | Option | Description | Default | Required |
+|:------|:-----|:------------|:--------|:---------:|
+| **Collection** | update_every | Data collection interval (seconds). | 1 | no |
+|  | autodetection_retry | Autodetection retry interval (seconds). Set 0 to disable. | 0 | no |
+| **Target** | dsn | Oracle server DSN (Data Source Name). Format: `oracle://username:password@host:port/service?param1=value1&...&paramN=valueN`. |  | yes |
+|  | timeout | Query timeout (seconds). | 1 | no |
+| **Virtual Node** | vnode | Associates this data collection job with a [Virtual Node](https://learn.netdata.cloud/docs/netdata-agent/configuration/organize-systems-metrics-and-alerts#virtual-nodes). |  | no |
+
 
 </details>
 
-#### Examples
 
-##### TCP socket
+#### via UI
+
+Configure the **oracledb** collector from the Netdata web interface:
+
+1. Go to **Nodes**.
+2. Select the node **where you want the oracledb data-collection job to run** and click the :gear: (**Configure this node**). That node will run the data collection.
+3. The **Collectors → Jobs** view opens by default.
+4. In the Search box, type _oracledb_ (or scroll the list) to locate the **oracledb** collector.
+5. Click the **+** next to the **oracledb** collector to add a new job.
+6. Fill in the job fields, then click **Test** to verify the configuration and **Submit** to save.
+    - **Test** runs the job with the provided settings and shows whether data can be collected.
+    - If it fails, an error message appears with details (for example, connection refused, timeout, or command execution errors), so you can adjust and retest.
+
+
+#### via File
+
+The configuration file name for this integration is `go.d/oracledb.conf`.
+
+The file format is YAML. Generally, the structure is:
+
+```yaml
+update_every: 1
+autodetection_retry: 0
+jobs:
+  - name: some_name1
+  - name: some_name2
+```
+You can edit the configuration file using the [`edit-config`](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#edit-a-configuration-file-using-edit-config) script from the
+Netdata [config directory](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#the-netdata-config-directory).
+
+```bash
+cd /etc/netdata 2>/dev/null || cd /opt/netdata/etc/netdata
+sudo ./edit-config go.d/oracledb.conf
+```
+
+##### Examples
+
+###### TCP socket
 
 An example configuration.
 
@@ -199,7 +246,7 @@ jobs:
 ```
 </details>
 
-##### TLS connection (TCPS)
+###### TLS connection (TCPS)
 
 An example configuration for TLS connection.
 
@@ -213,7 +260,7 @@ jobs:
 ```
 </details>
 
-##### Multi-instance
+###### Multi-instance
 
 > **Note**: When you define multiple jobs, their names must be unique.
 
@@ -261,6 +308,12 @@ should give you clues as to why the collector isn't working.
 
   ```bash
   ./go.d.plugin -d -m oracledb
+  ```
+
+  To debug a specific job:
+
+  ```bash
+  ./go.d.plugin -d -m oracledb -j jobName
   ```
 
 ### Getting Logs

@@ -40,6 +40,7 @@ modules:
           
           - `SELECT VERSION();`
           - `SHOW GLOBAL STATUS;`
+          - `SHOW ENGINE INNODB STATUS;`
           - `SHOW GLOBAL VARIABLES;`
           - `SHOW SLAVE STATUS;` or `SHOW ALL SLAVES STATUS;` (MariaDBv10.2+) or `SHOW REPLICA STATUS;` (MySQL 8.0.22+)
           - `SHOW USER_STATISTICS;` (MariaDBv10.1.1+)
@@ -65,23 +66,34 @@ modules:
         list:
           - title: Create netdata user
             description: |
-              A user account should have the
-              following [permissions](https://dev.mysql.com/doc/refman/8.0/en/privileges-provided.html):
+              A user account should have the following [permissions](https://dev.mysql.com/doc/refman/8.0/en/privileges-provided.html):
               
               - [`USAGE`](https://dev.mysql.com/doc/refman/8.0/en/privileges-provided.html#priv_usage)
               - [`REPLICATION CLIENT`](https://dev.mysql.com/doc/refman/8.0/en/privileges-provided.html#priv_replication-client)
               - [`PROCESS`](https://dev.mysql.com/doc/refman/8.0/en/privileges-provided.html#priv_process)
-              
+
               To create the `netdata` user with these permissions, execute the following in the MySQL shell:
-              
-              ```mysql
-              CREATE USER 'netdata'@'localhost';
-              GRANT USAGE, REPLICATION CLIENT, PROCESS ON *.* TO 'netdata'@'localhost';
-              FLUSH PRIVILEGES;
-              ```
-              
-              The `netdata` user will have the ability to connect to the MySQL server on localhost without a password. It will only
-              be able to gather statistics without being able to alter or affect operations in any way.
+
+              - **MySQL and MariaDB < 10.5.9**
+
+                  ```mysql
+                  CREATE USER 'netdata'@'localhost';
+                  GRANT USAGE, REPLICATION CLIENT, PROCESS ON *.* TO 'netdata'@'localhost';
+                  FLUSH PRIVILEGES;
+                  ```
+
+              - **MariaDB >= 10.5.9**
+
+                  For MariaDB 10.5.9 and later, use the `SLAVE MONITOR` privilege instead of `REPLICATION CLIENT`:
+
+                  ```mysql
+                  CREATE USER 'netdata'@'localhost';
+                  GRANT USAGE, SLAVE MONITOR, PROCESS ON *.* TO 'netdata'@'localhost';
+                  FLUSH PRIVILEGES;
+                  ```
+
+              The `netdata` user will have the ability to connect to the MySQL server on localhost without a password. 
+              It will only be able to gather statistics without being able to alter or affect operations in any way.
       configuration:
         file:
           name: go.d/mysql.conf
@@ -93,25 +105,37 @@ modules:
             enabled: true
           list:
             - name: update_every
-              description: Data collection frequency.
+              description: Data collection interval (seconds).
               default_value: 5
               required: false
+              group: Collection
             - name: autodetection_retry
-              description: Recheck interval in seconds. Zero means no recheck will be scheduled.
+              description: Autodetection retry interval (seconds). Set 0 to disable.
               default_value: 0
               required: false
+              group: Collection
+
             - name: dsn
-              description: MySQL server DSN (Data Source Name). See [DSN syntax](https://github.com/go-sql-driver/mysql#dsn-data-source-name).
+              description: "MySQL server DSN (Data Source Name). See [DSN syntax](https://github.com/go-sql-driver/mysql#dsn-data-source-name)."
               default_value: root@tcp(localhost:3306)/
               required: true
+              group: Target
             - name: my.cnf
-              description: Specifies the my.cnf file to read the connection settings from the [client] section.
+              description: Path to a `my.cnf` file to read connection settings from the `[client]` section.
               default_value: ""
               required: false
+              group: Target
             - name: timeout
-              description: Query timeout in seconds.
+              description: Query timeout (seconds).
               default_value: 1
               required: false
+              group: Target
+
+            - name: vnode
+              description: Associates this data collection job with a [Virtual Node](https://learn.netdata.cloud/docs/netdata-agent/configuration/organize-systems-metrics-and-alerts#virtual-nodes).
+              default_value: ""
+              required: false
+              group: Virtual Node
         examples:
           folding:
             title: Config
@@ -368,6 +392,25 @@ modules:
                 - name: waits
                 - name: write_requests
                 - name: writes
+            - name: mysql.innodb_redo_log_activity
+              description: InnoDB Redo Log Activity
+              unit: B/s
+              chart_type: line
+              dimensions:
+                - name: redo_written
+                - name: checkpointed
+            - name: mysql.innodb_redo_log_occupancy
+              description: InnoDB Redo Log Occupancy
+              unit: percentage
+              chart_type: area
+              dimensions:
+                - name: occupancy
+            - name: mysql.innodb_redo_log_checkpoint_age
+              description: InnoDB Redo Log Checkpoint Age
+              unit: B
+              chart_type: line
+              dimensions:
+                - name: age
             - name: mysql.innodb_cur_row_lock
               description: InnoDB Current Row Locks
               unit: operations

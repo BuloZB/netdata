@@ -1214,7 +1214,7 @@ static int sensors_collect_data(void) {
 static bool libsensors_running = false;
 static int libsensors_update_every = 1;
 
-void *libsensors_thread(void *ptr __maybe_unused) {
+void libsensors_thread(void *ptr __maybe_unused) {
     int update_every = libsensors_update_every;
 
     FILE *fp = NULL;
@@ -1255,6 +1255,12 @@ void *libsensors_thread(void *ptr __maybe_unused) {
         }
         usec_t ended_ut = now_monotonic_usec();
         usec_t average_ut = (ended_ut - started_ut) / samples;
+
+        if(average_ut < 1)
+            average_ut = 1;
+
+        if(max_ut < 1)
+            max_ut = 1;
 
         // List of valid intervals in seconds (divisors and multiples of 60)
         static const int valid_update_every_intervals[] = {1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, 60, 120, 180, 240, 300, 600, 900, 1200, 1800, 3600};
@@ -1306,8 +1312,6 @@ cleanup:
 
     dictionary_destroy(sensors_dict);
     sensors_dict = NULL;
-
-    return NULL;
 }
 
 static ND_THREAD *libsensors = NULL;
@@ -1315,7 +1319,7 @@ int do_module_libsensors(int update_every, const char *name __maybe_unused) {
     if(!libsensors) {
         libsensors_update_every = update_every;
         libsensors_running = true;
-        libsensors = nd_thread_create("LIBSENSORS", NETDATA_THREAD_OPTION_JOINABLE, libsensors_thread, NULL);
+        libsensors = nd_thread_create("LIBSENSORS", NETDATA_THREAD_OPTION_DEFAULT, libsensors_thread, NULL);
     }
 
     return libsensors && libsensors_running ? 0 : 1;

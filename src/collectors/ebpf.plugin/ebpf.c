@@ -32,9 +32,9 @@ ND_THREAD *socket_ipc = NULL;
 static size_t global_iterations_counter = 1;
 bool publish_internal_metrics = true;
 
-pthread_mutex_t lock;
-pthread_mutex_t ebpf_exit_cleanup;
-pthread_mutex_t collect_data_mutex;
+netdata_mutex_t lock;
+netdata_mutex_t ebpf_exit_cleanup;
+netdata_mutex_t collect_data_mutex;
 
 struct netdata_static_thread cgroup_integration_thread = {
     .name = "EBPF CGROUP INT",
@@ -67,7 +67,7 @@ ebpf_module_t ebpf_modules[] = {
      .kernels =
          NETDATA_V3_10 | NETDATA_V4_14 | NETDATA_V4_16 | NETDATA_V4_18 | NETDATA_V5_4 | NETDATA_V5_10 | NETDATA_V5_14,
      .load = EBPF_LOAD_LEGACY,
-     .targets = NULL,
+     .targets = process_targets,
      .probe_links = NULL,
      .objects = NULL,
      .thread = NULL,
@@ -800,7 +800,7 @@ ebpf_sync_syscalls_t local_syscalls[] = {
 netdata_ebpf_cgroup_shm_t shm_ebpf_cgroup = {NULL, NULL};
 int shm_fd_ebpf_cgroup = -1;
 sem_t *shm_sem_ebpf_cgroup = SEM_FAILED;
-pthread_mutex_t mutex_cgroup_shm;
+netdata_mutex_t mutex_cgroup_shm;
 
 //Network viewer
 ebpf_network_viewer_options_t network_viewer_opt;
@@ -833,6 +833,7 @@ struct shm_bpf *shm_bpf_obj = NULL;
 struct socket_bpf *socket_bpf_obj = NULL;
 struct swap_bpf *bpf_obj = NULL;
 struct vfs_bpf *vfs_bpf_obj = NULL;
+struct process_bpf *process_bpf_obj = NULL;
 #else
 void *default_btf = NULL;
 #endif
@@ -939,12 +940,12 @@ static inline void ebpf_check_before2go()
         sleep_usec(step);
         i = 0;
         int j;
-        pthread_mutex_lock(&ebpf_exit_cleanup);
+        netdata_mutex_lock(&ebpf_exit_cleanup);
         for (j = 0; ebpf_modules[j].info.thread_name != NULL; j++) {
             if (ebpf_modules[j].enabled < NETDATA_THREAD_EBPF_STOPPING)
                 i++;
         }
-        pthread_mutex_unlock(&ebpf_exit_cleanup);
+        netdata_mutex_unlock(&ebpf_exit_cleanup);
     }
 
     if (i) {
@@ -958,12 +959,12 @@ static inline void ebpf_check_before2go()
 static void ebpf_exit()
 {
 #ifdef LIBBPF_MAJOR_VERSION
-    pthread_mutex_lock(&ebpf_exit_cleanup);
+    netdata_mutex_lock(&ebpf_exit_cleanup);
     if (default_btf) {
         btf__free(default_btf);
         default_btf = NULL;
     }
-    pthread_mutex_unlock(&ebpf_exit_cleanup);
+    netdata_mutex_unlock(&ebpf_exit_cleanup);
 #endif
 
     char filename[FILENAME_MAX + 1];
@@ -978,12 +979,12 @@ static void ebpf_exit()
     fflush(stdout);
 
     ebpf_check_before2go();
-    pthread_mutex_lock(&mutex_cgroup_shm);
+    netdata_mutex_lock(&mutex_cgroup_shm);
     if (shm_ebpf_cgroup.header) {
         ebpf_unmap_cgroup_shared_memory();
         shm_unlink(NETDATA_SHARED_MEMORY_EBPF_CGROUP_NAME);
     }
-    pthread_mutex_unlock(&mutex_cgroup_shm);
+    netdata_mutex_unlock(&mutex_cgroup_shm);
     netdata_integration_cleanup_shm();
 
     exit(0);
@@ -1103,9 +1104,9 @@ void ebpf_stop_threads(int sig)
     static int only_one = 0;
 
     // Child thread should be closed by itself.
-    pthread_mutex_lock(&ebpf_exit_cleanup);
+    netdata_mutex_lock(&ebpf_exit_cleanup);
     if (main_thread_id != gettid_cached() || only_one) {
-        pthread_mutex_unlock(&ebpf_exit_cleanup);
+        netdata_mutex_unlock(&ebpf_exit_cleanup);
         return;
     }
     only_one = 1;
@@ -1118,7 +1119,7 @@ void ebpf_stop_threads(int sig)
 #endif
         }
     }
-    pthread_mutex_unlock(&ebpf_exit_cleanup);
+    netdata_mutex_unlock(&ebpf_exit_cleanup);
 
     for (i = 0; ebpf_modules[i].info.thread_name != NULL; i++) {
         if (ebpf_threads[i].thread)
@@ -1127,20 +1128,20 @@ void ebpf_stop_threads(int sig)
 
     ebpf_plugin_exit = true;
 
-    pthread_mutex_lock(&mutex_cgroup_shm);
+    netdata_mutex_lock(&mutex_cgroup_shm);
     nd_thread_signal_cancel(cgroup_integration_thread.thread);
 #ifdef NETDATA_DEV_MODE
     netdata_log_info("Sending cancel for thread %s", cgroup_integration_thread.name);
 #endif
-    pthread_mutex_unlock(&mutex_cgroup_shm);
+    netdata_mutex_unlock(&mutex_cgroup_shm);
 
     ebpf_check_before2go();
 
-    pthread_mutex_lock(&ebpf_exit_cleanup);
+    netdata_mutex_lock(&ebpf_exit_cleanup);
     ebpf_unload_unique_maps();
     ebpf_unload_filesystems();
     ebpf_unload_sync();
-    pthread_mutex_unlock(&ebpf_exit_cleanup);
+    netdata_mutex_unlock(&ebpf_exit_cleanup);
 
     ebpf_exit();
 }
@@ -2423,9 +2424,9 @@ static inline void ebpf_disable_cgroups()
  */
 void ebpf_update_disabled_plugin_stats(ebpf_module_t *em)
 {
-    pthread_mutex_lock(&lock);
+    netdata_mutex_lock(&lock);
     ebpf_update_stats(&plugin_statistics, em);
-    pthread_mutex_unlock(&lock);
+    netdata_mutex_unlock(&lock);
 }
 
 /**
@@ -2885,14 +2886,14 @@ void ebpf_read_local_addresses_unsafe()
 /**
  * Start Pthread Variable
  *
- * This function starts all pthread variables.
+ * This function starts all
  */
-void ebpf_start_pthread_variables()
+static void ebpf_mutex_initialize()
 {
-    pthread_mutex_init(&lock, NULL);
-    pthread_mutex_init(&ebpf_exit_cleanup, NULL);
-    pthread_mutex_init(&collect_data_mutex, NULL);
-    pthread_mutex_init(&mutex_cgroup_shm, NULL);
+    netdata_mutex_init(&lock);
+    netdata_mutex_init(&ebpf_exit_cleanup);
+    netdata_mutex_init(&collect_data_mutex);
+    netdata_mutex_init(&mutex_cgroup_shm);
     rw_spinlock_init(&ebpf_judy_pid.index.rw_spinlock);
 }
 
@@ -4362,7 +4363,7 @@ int main(int argc, char **argv)
     signal(SIGTERM, ebpf_stop_threads);
     signal(SIGPIPE, ebpf_stop_threads);
 
-    ebpf_start_pthread_variables();
+    ebpf_mutex_initialize();
 
     netdata_configured_host_prefix = getenv("NETDATA_HOST_PREFIX");
     if (verify_netdata_host_prefix(true) == -1)
@@ -4407,7 +4408,7 @@ int main(int argc, char **argv)
             if (em->functions.apps_routine && (em->apps_charts || em->cgroup_charts)) {
                 collect_pids |= 1 << i;
             }
-            st->thread = nd_thread_create(st->name, NETDATA_THREAD_OPTION_JOINABLE, st->start_routine, em);
+            st->thread = nd_thread_create(st->name, NETDATA_THREAD_OPTION_DEFAULT, st->start_routine, em);
         } else {
             em->lifetime = EBPF_DEFAULT_LIFETIME;
         }
@@ -4422,24 +4423,24 @@ int main(int argc, char **argv)
         (void)heartbeat_next(&hb);
 
         if (global_iterations_counter % EBPF_DEFAULT_UPDATE_EVERY == 0) {
-            pthread_mutex_lock(&lock);
+            netdata_mutex_lock(&lock);
             ebpf_create_statistic_charts(EBPF_DEFAULT_UPDATE_EVERY);
 
             ebpf_send_statistic_data();
             fflush(stdout);
-            pthread_mutex_unlock(&lock);
+            netdata_mutex_unlock(&lock);
         }
 
         if (++update_apps_list == update_apps_every) {
             update_apps_list = 0;
-            pthread_mutex_lock(&lock);
+            netdata_mutex_lock(&lock);
             if (collect_pids) {
-                pthread_mutex_lock(&collect_data_mutex);
+                netdata_mutex_lock(&collect_data_mutex);
                 ebpf_parse_proc_files();
                 ebpf_create_apps_charts(apps_groups_root_target);
-                pthread_mutex_unlock(&collect_data_mutex);
+                netdata_mutex_unlock(&collect_data_mutex);
             }
-            pthread_mutex_unlock(&lock);
+            netdata_mutex_unlock(&lock);
         }
     }
 

@@ -5,10 +5,10 @@ package redis
 import (
 	"errors"
 
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/tlscfg"
-
 	"github.com/redis/go-redis/v9"
+
+	"github.com/netdata/netdata/go/plugins/pkg/tlscfg"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
 )
 
 func (c *Collector) validateConfig() error {
@@ -41,7 +41,9 @@ func (c *Collector) initRedisClient() (*redis.Client, error) {
 	}
 
 	opts.PoolSize = 1
-	opts.TLSConfig = tlsConfig
+	if tlsConfig != nil {
+		opts.TLSConfig = tlsConfig
+	}
 	opts.DialTimeout = c.Timeout.Duration()
 	opts.ReadTimeout = c.Timeout.Duration()
 	opts.WriteTimeout = c.Timeout.Duration()

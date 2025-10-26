@@ -1,67 +1,86 @@
 extends:
   - 3com.yaml
 
-sysobjectid:
-  - 1.3.6.1.4.1.43.45.1.2.*  # 3Com Huawei Products (a3Com.jv-mib.huawei.hwproducts)
+selector:
+  - sysobjectid:
+      include:
+        - 1.3.6.1.4.1.43.45.1.2.* # 3Com Huawei Products (a3Com.jv-mib.huawei.hwproducts)
+
+# - A3COM-HUAWEI-LswDEVM-MIB
+#   https://mibbrowser.online/mibdb_search.php?mib=A3COM-HUAWEI-LswDEVM-MIB
+#   https://github.com/librenms/librenms/blob/master/mibs/3com/A3COM-HUAWEI-LswDEVM-MIB
 
 metrics:
   - MIB: A3COM-HUAWEI-LswDEVM-MIB
     table:
-      name: hwCpuTable  # indexes: hwCpuIndex
+      name: hwCpuTable # indexes: hwCpuIndex
       OID: 1.3.6.1.4.1.43.45.1.6.1.1
     symbols:
-      - name: cpu.usage
+      - name: cpu.usage # hwCpuCostRatePer1Min
         OID: 1.3.6.1.4.1.43.45.1.6.1.1.1.3
+        chart_meta:
+          description: The current CPU utilization
+          family: 'System/CPU/Usage'
+          unit: "%"
     metric_tags:
-      - index: 1
-        tag: cpu
+      - tag: cpu_index
+        index: 1
+
   - MIB: A3COM-HUAWEI-LswDEVM-MIB
     table:
-      name: hwMemTable  # indexes: hwMemModuleIndex
+      name: hwMemTable # indexes: hwMemModuleIndex
       OID: 1.3.6.1.4.1.43.45.1.6.1.2.1
     symbols:
-      - name: memory.total
+      - name: hwMemSize
         OID: 1.3.6.1.4.1.43.45.1.6.1.2.1.1.2
-      - name: memory.free
+        chart_meta:
+          description: Total memory size
+          family: 'System/Memory/Total'
+          unit: "By"
+      - name: hwMemFree
         OID: 1.3.6.1.4.1.43.45.1.6.1.2.1.1.3
+        chart_meta:
+          description: Free memory size
+          family: 'System/Memory/Free'
+          unit: "By"
     metric_tags:
-      - index: 1
-        tag: mem
+      - tag: mem_index
+        index: 1
   - MIB: A3COM-HUAWEI-LswDEVM-MIB
     table:
-      name: hwdevMFanStatusTable  # indexes: hwDevMFanNum
+      name: hwdevMFanStatusTable # indexes: hwDevMFanNum
       OID: 1.3.6.1.4.1.43.45.1.2.23.1.9.1.1
     symbols:
-      - name: hwdevMFanStatus
-        constant_value_one: true
-    metric_tags:
-      - index: 1
-        tag: fan_num
-      - symbol:
-          OID: 1.3.6.1.4.1.43.45.1.2.23.1.9.1.1.1.2
-          name: hwDevMFanStatus
-        tag: fan_status
+      - OID: 1.3.6.1.4.1.43.45.1.2.23.1.9.1.1.1.2
+        name: hwDevMFanStatus
+        chart_meta:
+          description: Fan status
+          family: 'Hardware/Fan/Status'
+          unit: "{status}"
         mapping:
           1: active
           2: deactive
           3: not_installed
           4: unsupported
+    metric_tags:
+      - tag: fan_index
+        index: 1
   - MIB: A3COM-HUAWEI-LswDEVM-MIB
     table:
-      name: hwdevMPowerStatusTable  # indexes: hwDevMPowerNum
+      name: hwdevMPowerStatusTable # indexes: hwDevMPowerNum
       OID: 1.3.6.1.4.1.43.45.1.2.23.1.9.1.2
     symbols:
-      - name: hwdevMPowerStatus
-        constant_value_one: true
-    metric_tags:
-      - index: 1
-        tag: power_num
-      - symbol:
-          OID: 1.3.6.1.4.1.43.45.1.2.23.1.9.1.2.1.2
-          name: hwDevMPowerStatus
-        tag: power_status
+      - OID: 1.3.6.1.4.1.43.45.1.2.23.1.9.1.2.1.2
+        name: hwDevMPowerStatus
+        chart_meta:
+          description: Power status
+          family: 'Hardware/PowerSupply/Status'
+          unit: "{status}"
         mapping:
           1: active
           2: deactive
           3: not_installed
           4: unsupported
+    metric_tags:
+      - tag: power_index
+        index: 1

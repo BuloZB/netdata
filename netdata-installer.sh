@@ -215,6 +215,11 @@ USAGE: ${PROGRAM} [options]
   --disable-plugin-xenstat   Explicitly disable the xenstat plugin.
   --enable-plugin-systemd-journal Enable the systemd journal plugin. Default: enable it when libsystemd is available.
   --disable-plugin-systemd-journal Explicitly disable the systemd journal plugin.
+  --internal-systemd-journal Enable the internal journal file reader instead of using libsystemd
+  --enable-plugin-otel Enable the Netdata OpenTelemetry plugin. Default: disabled
+  --disable-plugin-otel Explicitly disable the Netdata OpenTelemetry plugin.
+  --enable-plugin-ibm        Enable the IBM ecosystem monitoring plugin. Default: disabled
+  --disable-plugin-ibm       Explicitly disable the IBM ecosystem monitoring plugin.
   --enable-exporting-kinesis Enable AWS Kinesis exporting connector. Default: enable it when libaws_cpp_sdk_kinesis
                              and its dependencies are available.
   --disable-exporting-kinesis Explicitly disable AWS Kinesis exporting connector.
@@ -256,6 +261,8 @@ ENABLE_DBENGINE=1
 ENABLE_GO=1
 ENABLE_PYTHON=1
 ENABLE_CHARTS=1
+ENABLE_OTEL=0
+ENABLE_IBM=0
 FORCE_LEGACY_CXX=0
 NETDATA_CMAKE_OPTIONS="${NETDATA_CMAKE_OPTIONS-}"
 REMOVE_BUILD=1
@@ -294,6 +301,11 @@ while [ -n "${1}" ]; do
     "--disable-plugin-xenstat") ENABLE_XENSTAT=0 ;;
     "--enable-plugin-systemd-journal") ENABLE_SYSTEMD_JOURNAL=1 ;;
     "--disable-plugin-systemd-journal") ENABLE_SYSTEMD_JOURNAL=0 ;;
+    "--internal-systemd-journal") USE_RUST_JOURNAL_FILE=1 ;;
+    "--enable-plugin-otel") ENABLE_OTEL=1 ;;
+    "--disable-plugin-otel") ENABLE_OTEL=0 ;;
+    "--enable-plugin-ibm") ENABLE_IBM=1 ;;
+    "--disable-plugin-ibm") ENABLE_IBM=0 ;;
     "--enable-exporting-kinesis" | "--enable-backend-kinesis")
       # TODO: Needs CMake Support
       ;;
@@ -549,6 +561,21 @@ if [ "${ENABLE_GO}" -eq 1 ]; then
 fi
 
 # -----------------------------------------------------------------------------
+# If we're installing the IBM plugin, ensure CGO is available
+if [ "${ENABLE_IBM}" -eq 1 ]; then
+  if [ "${ENABLE_GO}" -eq 0 ]; then
+    warning "IBM plugin requires Go plugin to be enabled. Disabling IBM plugin."
+    ENABLE_IBM=0
+  else
+    # Check for a C compiler for CGO
+    if ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+      warning "IBM plugin requires a C compiler (gcc or clang) for CGO. Disabling IBM plugin."
+      ENABLE_IBM=0
+    fi
+  fi
+fi
+
+# -----------------------------------------------------------------------------
 # If we have the dashboard switching logic, make sure we're on the classic
 # dashboard during the install (updates don't work correctly otherwise).
 if [ -x "${NETDATA_PREFIX}/usr/libexec/netdata-switch-dashboard.sh" ]; then
@@ -794,8 +821,8 @@ if [ "$(id -u)" -eq 0 ]; then
   run find "${NETDATA_PREFIX}/usr/libexec/netdata" -type d -exec chmod 0755 {} \;
   run find "${NETDATA_PREFIX}/usr/libexec/netdata" -type f -exec chmod 0644 {} \;
   # shellcheck disable=SC2086
-  run find "${NETDATA_PREFIX}/usr/libexec/netdata" -type f -a -name \*.plugin -exec chown :${NETDATA_GROUP} {} \;
-  run find "${NETDATA_PREFIX}/usr/libexec/netdata" -type f -a -name \*.plugin -exec chmod 0750 {} \;
+  run find "${NETDATA_PREFIX}/usr/libexec/netdata" -type f -a -name \*plugin -exec chown :${NETDATA_GROUP} {} \;
+  run find "${NETDATA_PREFIX}/usr/libexec/netdata" -type f -a -name \*plugin -exec chmod 0750 {} \;
   run find "${NETDATA_PREFIX}/usr/libexec/netdata" -type f -a -name \*.sh -exec chmod 0755 {} \;
 
   if [ -f "${NETDATA_PREFIX}/usr/libexec/netdata/plugins.d/apps.plugin" ]; then
@@ -940,6 +967,13 @@ if [ "$(id -u)" -eq 0 ]; then
     if [ $capabilities -eq 0 ]; then
       # fix go.d.plugin to be setuid to root
       run chmod 4750 "${NETDATA_PREFIX}/usr/libexec/netdata/plugins.d/go.d.plugin"
+    fi
+  fi
+
+  if [ -f "${NETDATA_PREFIX}/usr/libexec/netdata/plugins.d/otel-plugin" ]; then
+    run chown "root:${NETDATA_GROUP}" "${NETDATA_PREFIX}/usr/libexec/netdata/plugins.d/otel-plugin"
+    if ! iscontainer && command -v setcap 1>/dev/null 2>&1; then
+      run chmod 0750 "${NETDATA_PREFIX}/usr/libexec/netdata/plugins.d/otel-plugin"
     fi
   fi
 

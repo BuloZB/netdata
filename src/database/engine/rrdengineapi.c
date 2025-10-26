@@ -44,7 +44,7 @@ size_t page_type_size[256] = {
 
 static inline void initialize_single_ctx(struct rrdengine_instance *ctx) {
     memset(ctx, 0, sizeof(*ctx));
-    uv_rwlock_init(&ctx->datafiles.rwlock);
+    netdata_rwlock_init(&ctx->datafiles.rwlock);
     rw_spinlock_init(&ctx->njfv2idx.spinlock);
 }
 
@@ -1106,66 +1106,30 @@ void rrdeng_get_37_statistics(struct rrdengine_instance *ctx, unsigned long long
     fatal_assert(RRDENG_NR_STATS == 38);
 }
 
-static void rrdeng_populate_mrg(struct rrdengine_instance *ctx) {
-    uv_rwlock_rdlock(&ctx->datafiles.rwlock);
-    size_t datafiles = 0;
-    for(struct rrdengine_datafile *df = ctx->datafiles.first; df ;df = df->next)
-        datafiles++;
-    uv_rwlock_rdunlock(&ctx->datafiles.rwlock);
+static void rrdeng_populate_mrg(struct rrdengine_instance *ctx)
+{
+    size_t datafiles = datafile_count(ctx, false);
 
-    ssize_t cpus = (ssize_t)netdata_conf_cpus() / (ssize_t)nd_profile.storage_tiers;
-    if(cpus > (ssize_t)datafiles)
-        cpus = (ssize_t)datafiles;
-
-    if(cpus > (ssize_t)libuv_worker_threads)
-        cpus = (ssize_t)libuv_worker_threads;
-
-    if(cpus >= (ssize_t)netdata_conf_cpus() / 2)
-        cpus = (ssize_t)(netdata_conf_cpus() / 2 - 1);
-
+    ssize_t cpus = (ssize_t)netdata_conf_cpus();
     if(cpus < 1)
         cpus = 1;
 
-    netdata_log_info("DBENGINE: populating retention to MRG from %zu journal files of tier %d, using %zd threads...", datafiles, ctx->config.tier, cpus);
+    netdata_log_info("DBENGINE: populating retention to MRG from %zu journal files of tier %d, using a shared pool of %zd threads...", datafiles, ctx->config.tier, cpus);
 
-    if(datafiles > 2) {
-        struct rrdengine_datafile *datafile;
-
-        datafile = ctx->datafiles.first->prev;
-        if(!(datafile->journalfile->v2.flags & JOURNALFILE_FLAG_IS_AVAILABLE))
-            datafile = datafile->prev;
-
-        if(datafile->journalfile->v2.flags & JOURNALFILE_FLAG_IS_AVAILABLE) {
-            journalfile_v2_populate_retention_to_mrg(ctx, datafile->journalfile);
-            datafile->populate_mrg.populated = true;
-        }
-
-        datafile = ctx->datafiles.first;
-        if(datafile->journalfile->v2.flags & JOURNALFILE_FLAG_IS_AVAILABLE) {
-            journalfile_v2_populate_retention_to_mrg(ctx, datafile->journalfile);
-            datafile->populate_mrg.populated = true;
-        }
-    }
-
-    ctx->loading.populate_mrg.size = cpus;
-    ctx->loading.populate_mrg.array = callocz(ctx->loading.populate_mrg.size, sizeof(struct completion));
-
-    for (size_t i = 0; i < ctx->loading.populate_mrg.size; i++) {
-        completion_init(&ctx->loading.populate_mrg.array[i]);
-        rrdeng_enq_cmd(ctx, RRDENG_OPCODE_CTX_POPULATE_MRG, NULL, &ctx->loading.populate_mrg.array[i],
-                       STORAGE_PRIORITY_INTERNAL_DBENGINE, NULL, NULL);
-    }
+    completion_init(&ctx->loading.load_mrg);
+    rrdeng_enq_cmd(
+        ctx,
+        RRDENG_OPCODE_CTX_POPULATE_MRG,
+        NULL,
+        &ctx->loading.load_mrg,
+        STORAGE_PRIORITY_INTERNAL_DBENGINE,
+        NULL,
+        NULL);
 }
 
 void rrdeng_readiness_wait(struct rrdengine_instance *ctx) {
-    for (size_t i = 0; i < ctx->loading.populate_mrg.size; i++) {
-        completion_wait_for(&ctx->loading.populate_mrg.array[i]);
-        completion_destroy(&ctx->loading.populate_mrg.array[i]);
-    }
-
-    freez(ctx->loading.populate_mrg.array);
-    ctx->loading.populate_mrg.array = NULL;
-    ctx->loading.populate_mrg.size = 0;
+    completion_wait_for(&ctx->loading.load_mrg);
+    completion_destroy(&ctx->loading.load_mrg);
 
     if(__atomic_load_n(&ctx->atomic.first_time_s, __ATOMIC_RELAXED) == LONG_MAX)
         __atomic_store_n(&ctx->atomic.first_time_s, now_realtime_sec(), __ATOMIC_RELAXED);
@@ -1282,28 +1246,35 @@ int rrdeng_exit(struct rrdengine_instance *ctx) {
     completion_wait_for(&completion);
     completion_destroy(&completion);
 
-    // No need to release the datafiles list
-    //finalize_rrd_files(ctx);
-
-    if (unittest_running) //(ctx->config.unittest)
+    if(unittest_running)
         freez(ctx);
 
     rrd_stat_atomic_add(&global_stats.rrdeng_reserved_file_descriptors, -RRDENG_FD_BUDGET_PER_INSTANCE);
     return 0;
 }
 
-void rrdeng_quiesce(struct rrdengine_instance *ctx, bool dirty_only)
+void rrdeng_flush_dirty(struct rrdengine_instance *ctx)
 {
     if (NULL == ctx)
         return;
 
-    // FIXME - ktsaou - properly cleanup ctx
-    // 1. make sure all collectors are stopped
+    rrdeng_enq_cmd(ctx, RRDENG_OPCODE_CTX_FLUSH_DIRTY, NULL, NULL, STORAGE_PRIORITY_INTERNAL_DBENGINE, NULL, NULL);
+}
 
-    if (dirty_only)
-        rrdeng_enq_cmd(ctx, RRDENG_OPCODE_CTX_FLUSH_DIRTY, NULL, NULL, STORAGE_PRIORITY_INTERNAL_DBENGINE, NULL, NULL);
-    else
-        rrdeng_enq_cmd(ctx, RRDENG_OPCODE_CTX_QUIESCE, NULL, NULL, STORAGE_PRIORITY_INTERNAL_DBENGINE, NULL, NULL);
+void rrdeng_flush_all(struct rrdengine_instance *ctx)
+{
+    if (NULL == ctx)
+        return;
+
+    rrdeng_enq_cmd(ctx, RRDENG_OPCODE_CTX_FLUSH_HOT_DIRTY, NULL, NULL, STORAGE_PRIORITY_INTERNAL_DBENGINE, NULL, NULL);
+}
+
+void rrdeng_quiesce(struct rrdengine_instance *ctx)
+{
+    if (NULL == ctx)
+        return;
+
+    rrdeng_enq_cmd(ctx, RRDENG_OPCODE_CTX_QUIESCE, NULL, NULL, STORAGE_PRIORITY_INTERNAL_DBENGINE, NULL, NULL);
 }
 
 static void populate_v2_statistics(struct rrdengine_datafile *datafile, RRDENG_SIZE_STATS *stats)
@@ -1377,12 +1348,14 @@ static void populate_v2_statistics(struct rrdengine_datafile *datafile, RRDENG_S
 RRDENG_SIZE_STATS rrdeng_size_statistics(struct rrdengine_instance *ctx) {
     RRDENG_SIZE_STATS stats = { 0 };
 
-    uv_rwlock_rdlock(&ctx->datafiles.rwlock);
-    for(struct rrdengine_datafile *df = ctx->datafiles.first; df ;df = df->next) {
+    netdata_rwlock_rdlock(&ctx->datafiles.rwlock);
+    struct rrdengine_datafile *df = NULL;
+
+    while ((df = get_next_datafile(df, ctx, true))) {
         stats.datafiles++;
         populate_v2_statistics(df, &stats);
     }
-    uv_rwlock_rdunlock(&ctx->datafiles.rwlock);
+    netdata_rwlock_rdunlock(&ctx->datafiles.rwlock);
 
     stats.currently_collected_metrics = __atomic_load_n(&ctx->atomic.collectors_running, __ATOMIC_RELAXED);
 

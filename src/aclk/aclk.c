@@ -21,6 +21,8 @@
 #include <fcntl.h>
 #endif
 
+#define MQTT_DEFAULT_MAX_BUF_SIZE  (25 * 1024 * 1024)
+
 int aclk_pubacks_per_conn = 0; // How many PubAcks we got since MQTT conn est.
 int aclk_rcvd_cloud_msgs = 0;
 int aclk_connection_counter = 0;
@@ -645,9 +647,6 @@ static int aclk_attempt_to_connect(mqtt_wss_client client)
             continue;
         }
 
-        struct mqtt_wss_proxy proxy_conf = { .host = NULL, .port = 0, .username = NULL, .password = NULL, .type = MQTT_WSS_DIRECT };
-        aclk_set_proxy((char**)&proxy_conf.host, &proxy_conf.port, (char**)&proxy_conf.username, (char**)&proxy_conf.password, &proxy_conf.type);
-
         struct mqtt_connect_params mqtt_conn_params = {
             .clientid   = "anon",
             .username   = "anon",
@@ -670,6 +669,9 @@ static int aclk_attempt_to_connect(mqtt_wss_client client)
         url_t_destroy(&base_url);
         if (rc != HTTPS_CLIENT_RESP_OK) {
             aclk_status_set((ACLK_STATUS)rc);
+            aclk_env_t_destroy(aclk_env);
+            freez(aclk_env);
+            aclk_env = NULL;
             continue;
         }
 
@@ -728,9 +730,9 @@ static int aclk_attempt_to_connect(mqtt_wss_client client)
         }
 
         memset(&mqtt_url, 0, sizeof(url_t));
-        if (url_parse(aclk_env->transports[rc]->endpoint, &mqtt_url)){
+        if (url_parse(aclk_env->transports[trp]->endpoint, &mqtt_url)){
             aclk_status_set(ACLK_STATUS_INVALID_ENV_TRANSPORT_URL);
-            error_report("ACLK: failed to parse target URL for /env trp idx %d \"%s\"", trp, aclk_env->transports[rc]->endpoint);
+            error_report("ACLK: failed to parse target URL for /env trp idx %d \"%s\"", trp, aclk_env->transports[trp]->endpoint);
             url_t_destroy(&mqtt_url);
             continue;
         }
@@ -743,6 +745,15 @@ static int aclk_attempt_to_connect(mqtt_wss_client client)
         mqtt_conn_params.will_msg = aclk_generate_lwt(&mqtt_conn_params.will_msg_len);
 
         int ssl_flags = cloud_config_insecure_get() ? MQTT_WSS_SSL_ALLOW_SELF_SIGNED : MQTT_WSS_SSL_CERT_CHECK_FULL;
+
+        struct mqtt_wss_proxy proxy_conf = { .host = NULL, .port = 0, .username = NULL, .password = NULL, .proxy_destination = NULL, .type = MQTT_WSS_DIRECT };
+        aclk_set_proxy(
+            (char **)&proxy_conf.host,
+            &proxy_conf.port,
+            (char **)&proxy_conf.username,
+            (char **)&proxy_conf.password,
+            (char **)&proxy_conf.proxy_destination,
+            &proxy_conf.type);
 
 #ifdef ACLK_DISABLE_CHALLENGE
         int mqtt_rc = mqtt_wss_connect(client, base_url.host, base_url.port, &mqtt_conn_params, ssl_flags, &proxy_conf);
@@ -788,7 +799,7 @@ static int aclk_attempt_to_connect(mqtt_wss_client client)
  *
  * @return It always returns NULL
  */
-void *aclk_main(void *ptr)
+void aclk_main(void *ptr)
 {
     struct netdata_static_thread *static_thread = ptr;
 
@@ -828,13 +839,15 @@ void *aclk_main(void *ptr)
     worker_register_job_name(WORKER_ACLK_SEND_FRAGMENT, "send fragment");
     worker_register_job_name(WORKER_ACLK_MSG_CALLBACK, "msg callback");
     worker_register_job_name(WORKER_ACLK_WAITING_TO_CONNECT, "conn wait");
+    worker_register_job_name(WORKER_ACLK_RECLAIM_MEMORY, "reclaim");
+    worker_register_job_name(WORKER_ACLK_BUFFER_COMPACT, "compact");
 
     ACLK_PROXY_TYPE proxy_type;
-    aclk_get_proxy(&proxy_type);
+    aclk_get_proxy(&proxy_type, false);
     if (proxy_type == PROXY_TYPE_SOCKS5) {
         netdata_log_error("ACLK: SOCKS5 proxy is not supported by ACLK-NG yet.");
         static_thread->enabled = NETDATA_MAIN_THREAD_EXITED;
-        return NULL;
+        return;
     }
 
     aclk_init_rx_msg_handlers();
@@ -861,14 +874,14 @@ void *aclk_main(void *ptr)
 #endif
 
     // Enable MQTT buffer growth if necessary
-    // e.g. old cloud architecture clients with huge nodes
-    // that send JSON payloads of 10 MB as single messages
-    mqtt_wss_set_max_buf_size(mqttwss_client, 25*1024*1024);
+    size_t max_buf_size = MQTT_DEFAULT_MAX_BUF_SIZE;
+    mqtt_wss_set_max_buf_size(mqttwss_client, max_buf_size);
 
     // Keep reconnecting and talking until our time has come
     // and the Grim Reaper (exit_initiated) calls
     netdata_log_info("ACLK: Starting ACLK query event loop");
-    aclk_query_init(mqttwss_client);
+    aclk_mqtt_client_set(mqttwss_client);
+    bool client_to_reset = true;
     do {
         worker_is_busy(WORKER_ACLK_CONNECT);
         if (aclk_attempt_to_connect(mqttwss_client))
@@ -888,7 +901,9 @@ void *aclk_main(void *ptr)
             nd_log(NDLS_ACCESS, NDLP_WARNING, "ACLK DISCONNECTED");
         }
     } while (service_running(SERVICE_ACLK));
-
+    aclk_mqtt_client_reset();
+    // No need to reset the client again when exiting
+    client_to_reset = false;
     worker_is_busy(WORKER_ACLK_DISCONNECTED);
     aclk_graceful_disconnect(mqttwss_client);
 
@@ -899,6 +914,8 @@ void *aclk_main(void *ptr)
 
 exit_full:
     free_topic_cache();
+    if (client_to_reset)
+        aclk_mqtt_client_reset();
     mqtt_wss_destroy(mqttwss_client);
 exit:
     if (aclk_env) {
@@ -906,7 +923,6 @@ exit:
         freez(aclk_env);
     }
     static_thread->enabled = NETDATA_MAIN_THREAD_EXITED;
-    return NULL;
 }
 
 bool aclk_host_state_update_auto(RRDHOST *host) {
@@ -942,7 +958,7 @@ void aclk_create_node_instance_job(RRDHOST *host)
     if (!claim_id_is_set(claim_id))
         return;
 
-    aclk_query_t query = aclk_query_new(REGISTER_NODE);
+    aclk_query_t *query = aclk_query_new(REGISTER_NODE);
     int32_t hops =  rrdhost_ingestion_hops(host);
     node_instance_creation_t node_instance_creation = {
         .hops = hops,
@@ -969,7 +985,7 @@ void aclk_update_node_instance_job(RRDHOST *host, int live, int queryable)
     if (!claim_id_is_set(claim_id))
         return;
 
-    aclk_query_t query = aclk_query_new(NODE_STATE_UPDATE);
+    aclk_query_t *query = aclk_query_new(NODE_STATE_UPDATE);
 
     int32_t hops = rrdhost_ingestion_hops(host);
     node_instance_connection_t node_state_update = {
@@ -1030,21 +1046,24 @@ void aclk_send_bin_msg(char *msg, size_t msg_len, enum aclk_topics subtopic, con
 
 static void fill_alert_status_for_host(BUFFER *wb, RRDHOST *host)
 {
-    struct aclk_sync_cfg_t *wc = host->aclk_config;
-    if (!wc)
+    struct aclk_sync_cfg_t *aclk_host_config = __atomic_load_n(&host->aclk_host_config, __ATOMIC_RELAXED);
+    if (!aclk_host_config)
         return;
 
-    buffer_sprintf(wb,
+    buffer_sprintf(
+        wb,
         "\n\t\tUpdates: %d"
         "\n\t\tCheckpoints: %d"
         "\n\t\tAlert count: %d"
         "\n\t\tAlert snapshot count: %d",
-        wc->stream_alerts,
-        wc->checkpoint_count,
-        wc->alert_count,
-        wc->snapshot_count
-    );
+        aclk_host_config->stream_alerts,
+        aclk_host_config->checkpoint_count,
+        aclk_host_config->alert_count,
+        aclk_host_config->snapshot_count);
 }
+
+
+extern usec_t publish_latency;
 
 char *aclk_state(void)
 {
@@ -1064,10 +1083,20 @@ char *aclk_state(void)
         buffer_strcat(wb, "No\n");
     else {
         const char *cloud_base_url = cloud_config_url_get();
-        buffer_sprintf(wb, "Yes\nClaimed Id: %s\nCloud URL: %s\n", claim_id.str, cloud_base_url ? cloud_base_url : "null");
+        char *aclk_proxy = (char *)aclk_get_proxy(NULL, true);
+        usec_t latency = __atomic_load_n(&publish_latency, __ATOMIC_RELAXED);
+        char latency_str[64];
+        duration_snprintf(latency_str, sizeof(latency_str), (int64_t) latency, "us", true);
+        buffer_sprintf(wb, "Yes\nClaimed Id: %s\nCloud URL: %s\nACLK Proxy: %s\nPublish Latency: %s\n", claim_id.str, cloud_base_url ? cloud_base_url : "null", aclk_proxy ? aclk_proxy : "none", latency_str);
     }
 
-    buffer_sprintf(wb, "Online: %s\nReconnect count: %d\nBanned By Cloud: %s\n", aclk_online() ? "Yes" : "No", aclk_connection_counter > 0 ? (aclk_connection_counter - 1) : 0, aclk_disable_runtime ? "Yes" : "No");
+    bool aclk_is_online = aclk_online();
+
+    struct mqtt_wss_stats aclk_stats;
+    if (aclk_is_online)
+        aclk_stats = aclk_statistics();
+
+    buffer_sprintf(wb, "Online: %s\nReconnect count: %d\nBanned By Cloud: %s\n", aclk_is_online ? "Yes" : "No", aclk_connection_counter > 0 ? (aclk_connection_counter - 1) : 0, aclk_disable_runtime ? "Yes" : "No");
     if (last_conn_time_mqtt && ((tmptr = localtime_r(&last_conn_time_mqtt, &tmbuf))) ) {
         char timebuf[26];
         strftime(timebuf, 26, "%Y-%m-%d %H:%M:%S", tmptr);
@@ -1089,8 +1118,9 @@ char *aclk_state(void)
         buffer_sprintf(wb, "Next Connection Attempt At: %s\nLast Backoff: %.3f", timebuf, last_backoff_value);
     }
 
-    if (aclk_online()) {
-        buffer_sprintf(wb, "Received Cloud MQTT Messages: %d\nMQTT Messages Confirmed by Remote Broker (PUBACKs): %d", aclk_rcvd_cloud_msgs, aclk_pubacks_per_conn);
+    if (aclk_is_online) {
+        buffer_sprintf(wb, "Received Cloud MQTT Messages: %d\nMQTT Messages Confirmed by Remote Broker (PUBACKs): %d\nPending PUBACKS: %d\n",
+                       aclk_rcvd_cloud_msgs, aclk_pubacks_per_conn, aclk_stats.mqtt.packets_waiting_puback);
 
         RRDHOST *host;
         rrd_rdlock();
@@ -1132,22 +1162,22 @@ char *aclk_state(void)
 
 static void fill_alert_status_for_host_json(json_object *obj, RRDHOST *host)
 {
-    struct aclk_sync_cfg_t *wc = host->aclk_config;
-    if (!wc)
+    struct aclk_sync_cfg_t *aclk_host_config = __atomic_load_n(&host->aclk_host_config, __ATOMIC_RELAXED);
+    if (!aclk_host_config)
         return;
 
-    json_object *tmp = json_object_new_int(wc->stream_alerts);
+    json_object *tmp = json_object_new_int(aclk_host_config->stream_alerts);
     json_object_object_add(obj, "updates", tmp);
 
-    tmp = json_object_new_int(wc->checkpoint_count);
+    tmp = json_object_new_int(aclk_host_config->checkpoint_count);
     json_object_object_add(obj, "checkpoint-count", tmp);
 
-    tmp = json_object_new_int(wc->alert_count);
+    tmp = json_object_new_int(aclk_host_config->alert_count);
     json_object_object_add(obj, "alert-count", tmp);
 
-    tmp = json_object_new_int(wc->snapshot_count);
+    tmp = json_object_new_int(aclk_host_config->snapshot_count);
     json_object_object_add(obj, "alert-snapshot-count", tmp);
-    tmp = json_object_new_int64(calculate_node_alert_version(wc->host));
+    tmp = json_object_new_int64(calculate_node_alert_version(aclk_host_config->host));
     json_object_object_add(obj, "alert-version", tmp);
 }
 
@@ -1164,6 +1194,16 @@ static json_object *timestamp_to_json(const time_t *t)
 
 char *aclk_state_json(void)
 {
+
+    bool aclk_is_online = aclk_online();
+
+    struct mqtt_wss_stats aclk_stats;
+
+    if (aclk_is_online)
+        aclk_stats = aclk_statistics();
+    else
+        memset(&aclk_stats, 0, sizeof(aclk_stats));
+
     json_object *tmp, *grp, *msg = json_object_new_object();
 
     tmp = json_object_new_boolean(1);
@@ -1191,7 +1231,15 @@ char *aclk_state_json(void)
     tmp = cloud_base_url ? json_object_new_string(cloud_base_url) : NULL;
     json_object_object_add(msg, "cloud-url", tmp);
 
-    tmp = json_object_new_boolean(aclk_online());
+    char *aclk_proxy = (char *)aclk_get_proxy(NULL, true);
+    tmp = aclk_proxy ? json_object_new_string(aclk_proxy) : NULL;
+    json_object_object_add(msg, "aclk_proxy", tmp);
+
+    usec_t latency = __atomic_load_n(&publish_latency, __ATOMIC_RELAXED);
+    tmp =json_object_new_int64((int64_t) latency);
+    json_object_object_add(msg, "publish_latency_us", tmp);
+
+    tmp = json_object_new_boolean(aclk_is_online);
     json_object_object_add(msg, "online", tmp);
 
     tmp = json_object_new_string("Protobuf");
@@ -1206,13 +1254,16 @@ char *aclk_state_json(void)
     tmp = json_object_new_int(aclk_pubacks_per_conn);
     json_object_object_add(msg, "received-mqtt-pubacks", tmp);
 
+    tmp = json_object_new_int((int32_t) aclk_stats.mqtt.packets_waiting_puback);
+    json_object_object_add(msg, "pending-mqtt-pubacks", tmp);
+
     tmp = json_object_new_int(aclk_connection_counter > 0 ? (aclk_connection_counter - 1) : 0);
     json_object_object_add(msg, "reconnect-count", tmp);
 
     json_object_object_add(msg, "last-connect-time-utc", timestamp_to_json(&last_conn_time_mqtt));
     json_object_object_add(msg, "last-connect-time-puback-utc", timestamp_to_json(&last_conn_time_appl));
     json_object_object_add(msg, "last-disconnect-time-utc", timestamp_to_json(&last_disconnect_time));
-    json_object_object_add(msg, "next-connection-attempt-utc", !aclk_online() ? timestamp_to_json(&next_connection_attempt) : NULL);
+    json_object_object_add(msg, "next-connection-attempt-utc", !aclk_is_online ? timestamp_to_json(&next_connection_attempt) : NULL);
     tmp = NULL;
     if (!aclk_online() && last_backoff_value)
         tmp = json_object_new_double(last_backoff_value);
@@ -1279,7 +1330,7 @@ void add_aclk_host_labels(void) {
     rrdlabels_add(labels, "_aclk_available", "true", RRDLABEL_SRC_AUTO|RRDLABEL_SRC_ACLK);
     ACLK_PROXY_TYPE aclk_proxy;
     char *proxy_str;
-    aclk_get_proxy(&aclk_proxy);
+    aclk_get_proxy(&aclk_proxy, false);
 
     switch(aclk_proxy) {
         case PROXY_TYPE_SOCKS5:
@@ -1296,11 +1347,4 @@ void add_aclk_host_labels(void) {
     rrdlabels_add(labels, "_mqtt_version", "5", RRDLABEL_SRC_AUTO);
     rrdlabels_add(labels, "_aclk_proxy", proxy_str, RRDLABEL_SRC_AUTO);
     rrdlabels_add(labels, "_aclk_ng_new_cloud_protocol", "true", RRDLABEL_SRC_AUTO|RRDLABEL_SRC_ACLK);
-}
-
-void aclk_queue_node_info(RRDHOST *host, bool immediate)
-{
-    struct aclk_sync_cfg_t *wc = host->aclk_config;
-    if (wc)
-        wc->node_info_send_time = (host == localhost || immediate) ? 1 : now_realtime_sec();
 }

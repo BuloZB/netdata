@@ -153,6 +153,7 @@ static struct worker_utilization all_workers_utilization[] = {
     { .name = "PROFILER",    .family = "workers profile",                 .priority = 1000000 },
     { .name = "PGCEVICT",    .family = "workers dbengine eviction",       .priority = 1000000 },
     { .name = "BACKFILL",    .family = "workers backfill",                .priority = 1000000 },
+    { .name = "WEBSOCKET",   .family = "workers websocket",               .priority = 1000000 },
 
     // has to be terminated with a NULL
     { .name = NULL,          .family = NULL       }
@@ -184,7 +185,7 @@ static void workers_total_spinlock_contention_chart(void) {
              wusp;
              wusp = SPINLOCKS_NEXT(&ALL_SPINLOCKS, &idx)) {
             const char *func = (const char *)idx;
-            RRDDIM *rd = rrddim_find(st, func);
+            RRDDIM *rd = rrddim_find(st, func, false);
             if(!rd) rd = rrddim_add(st, func, NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
             rrddim_set_by_pointer(st, rd, (collected_number)wusp->locks);
         }
@@ -216,7 +217,7 @@ static void workers_total_spinlock_contention_chart(void) {
              wusp;
              wusp = SPINLOCKS_NEXT(&ALL_SPINLOCKS, &idx)) {
             const char *func = (const char *)idx;
-            RRDDIM *rd = rrddim_find(st, func);
+            RRDDIM *rd = rrddim_find(st, func, false);
             if(!rd) rd = rrddim_add(st, func, NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
             rrddim_set_by_pointer(st, rd, (collected_number)wusp->spins);
         }
@@ -248,7 +249,7 @@ static void workers_total_spinlock_contention_chart(void) {
              wusp;
              wusp = SPINLOCKS_NEXT(&ALL_SPINLOCKS, &idx)) {
             const char *func = (const char *)idx;
-            RRDDIM *rd = rrddim_find(st, func);
+            RRDDIM *rd = rrddim_find(st, func, false);
             if(!rd) rd = rrddim_add(st, func, NULL, 1, 10000, RRD_ALGORITHM_ABSOLUTE);
             if(!wusp->locks)
                 rrddim_set_by_pointer(st, rd, 0);
@@ -1117,6 +1118,10 @@ static void worker_utilization_charts_callback(void *ptr
         wu->memory_calls[i] += memory_calls[i];
 }
 
+static void spinlocks_free_callback(Word_t key __maybe_unused, struct worker_spinlocks *wusp, void *data __maybe_unused) {
+    freez(wusp);
+}
+
 void pulse_workers_cleanup(void) {
     int i, j;
     for(i = 0; all_workers_utilization[i].name ;i++) {
@@ -1135,6 +1140,9 @@ void pulse_workers_cleanup(void) {
             wu->per_job_type[j].units = NULL;
         }
 
+        // Free the spinlocks Judy array for this worker
+        SPINLOCKS_FREE(&wu->spinlocks, spinlocks_free_callback, NULL);
+
         // mark all threads as not enabled
         struct worker_thread *t;
         for(t = wu->threads; t ; t = t->next)
@@ -1143,6 +1151,9 @@ void pulse_workers_cleanup(void) {
         // let the cleanup job free them
         workers_threads_cleanup(wu);
     }
+    
+    // Clean up the global spinlocks array
+    SPINLOCKS_FREE(&ALL_SPINLOCKS, spinlocks_free_callback, NULL);
 }
 
 void pulse_workers_do(bool extended) {

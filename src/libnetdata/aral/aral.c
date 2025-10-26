@@ -851,7 +851,7 @@ static ALWAYS_INLINE void *aral_get_free_slot___no_lock_required(ARAL *ar, ARAL_
     aral_page_available_lock(ar, page);
 
     while(!page->available.list) {
-        uint32_t bitmap = __atomic_load_n(&page->incoming_partition_bitmap, __ATOMIC_RELAXED);
+        uint32_t bitmap = __atomic_load_n(&page->incoming_partition_bitmap, __ATOMIC_ACQUIRE);
         if (!bitmap)
             fatal("ARAL: bitmap of incoming free elements cannot be empty at this point");
 
@@ -868,7 +868,7 @@ static ALWAYS_INLINE void *aral_get_free_slot___no_lock_required(ARAL *ar, ARAL_
             if (aral_page_incoming_trylock(ar, page, partition)) {
                 page->available.list = page->incoming[partition].list;
                 page->incoming[partition].list = NULL;
-                __atomic_fetch_and(&page->incoming_partition_bitmap, ~(1U << partition), __ATOMIC_RELAXED);
+                __atomic_fetch_and(&page->incoming_partition_bitmap, ~(1U << partition), __ATOMIC_RELEASE);
                 aral_page_incoming_unlock(ar, page, partition);
                 break;
             }
@@ -903,7 +903,7 @@ static inline void aral_add_free_slot___no_lock_required(ARAL *ar, ARAL_PAGE *pa
             if (aral_page_incoming_trylock(ar, page, partition)) {
                 fr->next = page->incoming[partition].list;
                 page->incoming[partition].list = fr;
-                __atomic_fetch_or(&page->incoming_partition_bitmap, 1U << partition, __ATOMIC_RELAXED);
+                __atomic_fetch_or(&page->incoming_partition_bitmap, 1U << partition, __ATOMIC_RELEASE);
                 aral_page_incoming_unlock(ar, page, partition);
                 return;
             }
@@ -921,6 +921,11 @@ ALWAYS_INLINE void *aral_callocz_internal(ARAL *ar, bool marked TRACE_ALLOCATION
 
 void *aral_mallocz_internal(ARAL *ar, bool marked TRACE_ALLOCATIONS_FUNCTION_DEFINITION_PARAMS) {
 #if defined(FSANITIZE_ADDRESS)
+    if(ar->stats) {
+        __atomic_add_fetch(&ar->stats->malloc.allocations, 1, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&ar->stats->malloc.allocated_bytes, ar->config.requested_element_size, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&ar->stats->malloc.used_bytes, ar->config.requested_element_size, __ATOMIC_RELAXED);
+    }
     return mallocz(ar->config.requested_element_size);
 #endif
 
@@ -978,6 +983,11 @@ void aral_unmark_allocation(ARAL *ar, void *ptr) {
 
 void aral_freez_internal(ARAL *ar, void *ptr TRACE_ALLOCATIONS_FUNCTION_DEFINITION_PARAMS) {
 #if defined(FSANITIZE_ADDRESS)
+    if(ptr && ar->stats) {
+        __atomic_sub_fetch(&ar->stats->malloc.allocations, 1, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&ar->stats->malloc.allocated_bytes, ar->config.requested_element_size, __ATOMIC_RELAXED);
+        __atomic_sub_fetch(&ar->stats->malloc.used_bytes, ar->config.requested_element_size, __ATOMIC_RELAXED);
+    }
     freez(ptr);
     return;
 #endif
@@ -1396,7 +1406,7 @@ static inline struct aral_unittest_entry *unittest_aral_malloc(ARAL *ar, bool ma
     return t;
 }
 
-static void *aral_test_thread(void *ptr) {
+static void aral_test_thread(void *ptr) {
     struct aral_unittest_config *auc = ptr;
     ARAL *ar = auc->ar;
     size_t elements = auc->elements;
@@ -1494,8 +1504,6 @@ static void *aral_test_thread(void *ptr) {
     } while(!auc->single_threaded && !__atomic_load_n(&auc->stop, __ATOMIC_RELAXED));
 
     freez(pointers);
-
-    return ptr;
 }
 
 int aral_stress_test(size_t threads, size_t elements, size_t seconds) {
@@ -1522,11 +1530,7 @@ int aral_stress_test(size_t threads, size_t elements, size_t seconds) {
     for(size_t i = 0; i < threads ; i++) {
         char tag[ND_THREAD_TAG_MAX + 1];
         snprintfz(tag, ND_THREAD_TAG_MAX, "TH[%zu]", i);
-        thread_ptrs[i] = nd_thread_create(
-            tag,
-            NETDATA_THREAD_OPTION_JOINABLE | NETDATA_THREAD_OPTION_DONT_LOG,
-            aral_test_thread,
-            &auc);
+        thread_ptrs[i] = nd_thread_create(tag, NETDATA_THREAD_OPTION_DONT_LOG, aral_test_thread, &auc);
     }
 
     size_t malloc_done = 0;

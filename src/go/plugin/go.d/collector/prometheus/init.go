@@ -5,11 +5,10 @@ package prometheus
 import (
 	"errors"
 	"fmt"
-	"os"
 
 	"github.com/netdata/netdata/go/plugins/pkg/matcher"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/prometheus"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/web"
+	"github.com/netdata/netdata/go/plugins/pkg/prometheus"
+	"github.com/netdata/netdata/go/plugins/pkg/web"
 )
 
 func (c *Collector) validateConfig() error {
@@ -26,13 +25,6 @@ func (c *Collector) initPrometheusClient() (prometheus.Prometheus, error) {
 	}
 
 	req := c.RequestConfig.Copy()
-	if c.BearerTokenFile != "" {
-		token, err := os.ReadFile(c.BearerTokenFile)
-		if err != nil {
-			return nil, fmt.Errorf("bearer token file: %v", err)
-		}
-		req.Headers["Authorization"] = "Bearer " + string(token)
-	}
 
 	sr, err := c.Selector.Parse()
 	if err != nil {

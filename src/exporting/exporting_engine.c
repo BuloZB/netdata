@@ -106,6 +106,7 @@ static void exporting_clean_engine()
         instance = instance->next;
 
         clean_instance(current_instance);
+        freez(current_instance);
     }
 
     freez((void *)engine->config.hostname);
@@ -131,33 +132,46 @@ static void exporting_main_cleanup(void *pptr)
 
     engine->exit = 1;
 
-    int found = 0;
-    usec_t max = 2 * USEC_PER_SEC, step = 50000;
+    size_t all = 0, exited = 0;
 
     for (struct instance *instance = engine->instance_root; instance; instance = instance->next) {
+        all++;
+
         if (!instance->exited) {
-            found++;
-            netdata_log_info("stopping worker for instance %s", instance->config.name);
-            uv_mutex_unlock(&instance->mutex);
+            netdata_log_info("EXPORTING: signaling worker '%s' to stop...", instance->config.name);
+            // Lock the mutex before signaling the condition variable
+            netdata_mutex_lock(&instance->mutex);
             instance->data_is_ready = 1;
-            uv_cond_signal(&instance->cond_var);
-        } else
-            netdata_log_info("found stopped worker for instance %s", instance->config.name);
+            netdata_cond_signal(&instance->cond_var);
+            netdata_mutex_unlock(&instance->mutex);
+        }
+        else
+            netdata_log_info("EXPORTING: found worker '%s' already stopped", instance->config.name);
     }
 
-    while (found && max > 0) {
-        max -= step;
-        netdata_log_info("Waiting %d exporting connectors to finish...", found);
-        sleep_usec(step);
-        found = 0;
+    size_t iterations = 0;
+    while (exited < all) {
+        iterations++;
+        microsleep(10 * USEC_PER_MS);
 
+        exited = 0;
         for (struct instance *instance = engine->instance_root; instance; instance = instance->next) {
-            if (!instance->exited)
-                found++;
+            if (instance->exited) {
+                exited++;
+
+                if(instance->thread) {
+                    nd_thread_join(instance->thread);
+                    instance->thread = NULL;
+                }
+            }
+            else if(iterations % 100 == 0)
+                netdata_log_info("EXPORTING: still waiting for worker '%s' to exit...", instance->config.name);
         }
     }
 
+    // this must be called once all the worker thread have exited
     exporting_clean_engine();
+
     static_thread->enabled = NETDATA_MAIN_THREAD_EXITED;
 }
 
@@ -170,22 +184,19 @@ static void exporting_main_cleanup(void *pptr)
  *
  * @return It always returns NULL.
  */
-void *exporting_main(void *ptr)
+void exporting_main(void *ptr)
 {
     CLEANUP_FUNCTION_REGISTER(exporting_main_cleanup) cleanup_ptr = ptr;
 
     engine = read_exporting_config();
     if (!engine) {
         netdata_log_info("EXPORTING: no exporting connectors configured");
-        goto cleanup;
+        return;
     }
 
     if (init_connectors(engine) != 0) {
         netdata_log_error("EXPORTING: cannot initialize exporting connectors");
-
-        analytics_statistic_t statistic = { "EXPORTING_START", "FAIL", "-" };
-        analytics_statistic_send(&statistic);
-        goto cleanup;
+        return;
     }
 
     RRDSET *st_main_rusage = NULL;
@@ -209,7 +220,5 @@ void *exporting_main(void *ptr)
         return NULL;
 #endif
     }
-
-cleanup:
-    return NULL;
+    service_exits();
 }

@@ -57,9 +57,9 @@ func (m *Manager) dyncfgConfig(fn functions.Function) {
 	//m.Infof("QQ FN: '%s'", fn)
 
 	switch id := fn.Args[0]; true {
-	case strings.HasPrefix(id, dyncfgCollectorIDPrefix):
+	case strings.HasPrefix(id, m.dyncfgCollectorPrefixValue()):
 		m.dyncfgCollectorExec(fn)
-	case strings.HasPrefix(id, dyncfgVnodeID):
+	case strings.HasPrefix(id, m.dyncfgVnodePrefixValue()):
 		m.dyncfgVnodeExec(fn)
 	default:
 		m.dyncfgRespf(fn, 503, "unknown function '%s' (%s).", fn.Name, id)

@@ -32,11 +32,11 @@ static struct web_client *web_client_create_on_fd(POLLINFO *pi) {
     w = web_client_get_from_cache();
     w->fd = pi->fd;
 
-    strncpyz(w->client_ip,   pi->client_ip,   sizeof(w->client_ip) - 1);
+    strncpyz(w->user_auth.client_ip,   pi->client_ip,   sizeof(w->user_auth.client_ip) - 1);
     strncpyz(w->client_port, pi->client_port, sizeof(w->client_port) - 1);
     strncpyz(w->client_host, pi->client_host, sizeof(w->client_host) - 1);
 
-    if(unlikely(!*w->client_ip))   strcpy(w->client_ip,   "-");
+    if(unlikely(!*w->user_auth.client_ip))   strcpy(w->user_auth.client_ip,   "-");
     if(unlikely(!*w->client_port)) strcpy(w->client_port, "-");
 	w->port_acl = pi->port_acl;
 
@@ -64,7 +64,8 @@ struct web_server_static_threaded_worker {
     ND_THREAD *thread;
 
     int id;
-    int running;
+    bool initializing;
+    SPINLOCK spinlock;
 
     size_t max_sockets;
 
@@ -166,6 +167,13 @@ static void web_server_del_callback(POLLINFO *pi) {
     worker_is_idle();
 }
 
+static __thread POLLINFO *current_thread_pollinfo = NULL;
+
+void web_server_remove_current_socket_from_poll(void) {
+    if(!current_thread_pollinfo) return;
+    poll_process_remove_from_poll(current_thread_pollinfo);
+}
+
 static int web_server_rcv_callback(POLLINFO *pi, nd_poll_event_t *events) {
     int ret = -1;
     worker_is_busy(WORKER_JOB_RCV_DATA);
@@ -184,7 +192,9 @@ static int web_server_rcv_callback(POLLINFO *pi, nd_poll_event_t *events) {
         netdata_log_debug(D_WEB_CLIENT, "%llu: processing received data on fd %d.", w->id, fd);
         worker_is_idle();
         worker_is_busy(WORKER_JOB_PROCESS);
+        current_thread_pollinfo = pi;
         web_client_process_request_from_web_server(w);
+        current_thread_pollinfo = NULL;
 
         if (unlikely(w->mode == HTTP_REQUEST_MODE_STREAM)) {
             ssize_t rc = web_client_send(w);
@@ -226,7 +236,9 @@ static int web_server_snd_callback(POLLINFO *pi, nd_poll_event_t *events) {
 
     netdata_log_debug(D_WEB_CLIENT, "%llu: sending data on fd %d.", w->id, fd);
 
+    current_thread_pollinfo = pi;
     ssize_t ret = web_client_send(w);
+    current_thread_pollinfo = NULL;
 
     if(unlikely(ret < 0)) {
         retval = -1;
@@ -263,7 +275,6 @@ static void socket_listen_main_static_threaded_worker_cleanup(void *pptr) {
             worker_private->sends
     );
 
-    worker_private->running = 0;
     worker_unregister();
 }
 
@@ -271,9 +282,11 @@ static bool web_server_should_stop(void) {
     return !service_running(SERVICE_WEB_SERVER);
 }
 
-void *socket_listen_main_static_threaded_worker(void *ptr) {
+void socket_listen_main_static_threaded_worker(void *ptr) {
     worker_private = ptr;
-    worker_private->running = 1;
+    spinlock_lock(&worker_private->spinlock);
+    worker_private->initializing = false;
+    spinlock_unlock(&worker_private->spinlock);
     worker_register("WEB");
     worker_register_job_name(WORKER_JOB_ADD_CONNECTION, "connect");
     worker_register_job_name(WORKER_JOB_DEL_COLLECTION, "disconnect");
@@ -298,13 +311,10 @@ void *socket_listen_main_static_threaded_worker(void *ptr) {
                 , NULL
                 , web_client_first_request_timeout
                 , web_client_timeout
-                ,
-        nd_profile.update_every * 1000 // timer_milliseconds
+                , nd_profile.update_every * 1000 // timer_milliseconds
                 , ptr // timer_data
                 , worker_private->max_sockets
     );
-
-    return NULL;
 }
 
 
@@ -317,44 +327,28 @@ static void socket_listen_main_static_threaded_cleanup(void *pptr) {
 
     static_thread->enabled = NETDATA_MAIN_THREAD_EXITING;
 
-//    int i, found = 0;
-//    usec_t max = 2 * USEC_PER_SEC, step = 50000;
-//
-//    // we start from 1, - 0 is self
-//    for(i = 1; i < static_threaded_workers_count; i++) {
-//        if(static_workers_private_data[i].running) {
-//            found++;
-//            netdata_log_info("stopping worker %d", i + 1);
-//            nd_thread_signal_cancel(static_workers_private_data[i].thread);
-//        }
-//        else
-//            netdata_log_info("found stopped worker %d", i + 1);
-//    }
-//
-//    while(found && max > 0) {
-//        max -= step;
-//        netdata_log_info("Waiting %d static web threads to finish...", found);
-//        sleep_usec(step);
-//        found = 0;
-//
-//        // we start from 1, - 0 is self
-//        for(i = 1; i < static_threaded_workers_count; i++) {
-//            if (static_workers_private_data[i].running)
-//                found++;
-//        }
-//    }
-//
-//    if(found)
-//        netdata_log_error("%d static web threads are taking too long to finish. Giving up.", found);
-
     netdata_log_info("closing all web server sockets...");
     listen_sockets_close(&api_sockets);
 
     netdata_log_info("all static web threads stopped.");
+
+    // Lets join all threads
+    for (int i = 1; i < static_threaded_workers_count; i++) {
+        bool initializing;
+        do {
+            spinlock_lock(&static_workers_private_data[i].spinlock);
+            initializing = static_workers_private_data[i].initializing;
+            spinlock_unlock(&static_workers_private_data[i].spinlock);
+            if (unlikely(initializing))
+                sleep_usec(1000);
+        } while(initializing);
+        (void) nd_thread_join(static_workers_private_data[i].thread);
+    }
+
     static_thread->enabled = NETDATA_MAIN_THREAD_EXITED;
 }
 
-void *socket_listen_main_static_threaded(void *ptr) {
+void socket_listen_main_static_threaded(void *ptr) {
     CLEANUP_FUNCTION_REGISTER(socket_listen_main_static_threaded_cleanup) cleanup_ptr = ptr;
     web_server_mode = WEB_SERVER_MODE_STATIC_THREADED;
 
@@ -377,6 +371,8 @@ void *socket_listen_main_static_threaded(void *ptr) {
                                           sizeof(struct web_server_static_threaded_worker));
 
     int i;
+    spinlock_init(&static_workers_private_data[0].spinlock);
+    static_workers_private_data[0].initializing = true;
     for (i = 1; i < static_threaded_workers_count; i++) {
         static_workers_private_data[i].id = i;
         static_workers_private_data[i].max_sockets = max_sockets / static_threaded_workers_count;
@@ -384,6 +380,8 @@ void *socket_listen_main_static_threaded(void *ptr) {
         char tag[50 + 1];
         snprintfz(tag, sizeof(tag) - 1, "WEB[%d]", i+1);
 
+        spinlock_init(&static_workers_private_data[i].spinlock);
+        static_workers_private_data[i].initializing = true;
         static_workers_private_data[i].thread = nd_thread_create(tag, NETDATA_THREAD_OPTION_DEFAULT,
                                                                  socket_listen_main_static_threaded_worker,
                                                                  (void *)&static_workers_private_data[i]);
@@ -392,6 +390,4 @@ void *socket_listen_main_static_threaded(void *ptr) {
     // and the main one
     static_workers_private_data[0].max_sockets = max_sockets / static_threaded_workers_count;
     socket_listen_main_static_threaded_worker((void *)&static_workers_private_data[0]);
-
-    return NULL;
 }

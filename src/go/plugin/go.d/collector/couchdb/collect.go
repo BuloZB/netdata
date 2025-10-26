@@ -13,8 +13,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/stm"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/web"
+	"github.com/netdata/netdata/go/plugins/pkg/stm"
+	"github.com/netdata/netdata/go/plugins/pkg/web"
 )
 
 const (
@@ -201,7 +201,10 @@ func findMaxMQSize(MessageQueues map[string]any) int64 {
 }
 
 func (c *Collector) pingCouchDB() error {
-	req, _ := web.NewHTTPRequest(c.RequestConfig)
+	req, err := web.NewHTTPRequest(c.RequestConfig)
+	if err != nil {
+		return err
+	}
 
 	var info struct{ Couchdb string }
 

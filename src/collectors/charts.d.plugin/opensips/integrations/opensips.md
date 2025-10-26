@@ -44,7 +44,6 @@ The default configuration for this integration does not impose any limits on dat
 
 The default configuration for this integration is not expected to impose a significant performance impact on the system.
 
-
 ## Metrics
 
 Metrics grouped by *scope*.
@@ -92,6 +91,7 @@ There are no alerts configured by default for this integration.
 
 ## Setup
 
+
 ### Prerequisites
 
 #### Install charts.d plugin
@@ -106,18 +106,6 @@ The collector requires the `opensipsctl` to be installed.
 
 ### Configuration
 
-#### File
-
-The configuration file name for this integration is `charts.d/opensips.conf`.
-
-
-You can edit the configuration file using the [`edit-config`](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#edit-a-configuration-file-using-edit-config) script from the
-Netdata [config directory](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#the-netdata-config-directory).
-
-```bash
-cd /etc/netdata 2>/dev/null || cd /opt/netdata/etc/netdata
-sudo ./edit-config charts.d/opensips.conf
-```
 #### Options
 
 The config file is sourced by the charts.d plugin. It's a standard bash file.
@@ -127,8 +115,10 @@ The following collapsed table contains all the options that can be configured fo
 
 <details open><summary>Config options</summary>
 
-| Name | Description | Default | Required |
-|:----|:-----------|:-------|:--------:|
+
+
+| Option | Description | Default | Required |
+|:-----|:------------|:--------|:---------:|
 | opensips_opts | Specify parameters to the `opensipsctl` command. If the default value fails to get global status, set here whatever options are needed to connect to the opensips server. | fifo get_statistics all | no |
 | opensips_cmd | If `opensipsctl` is not in $PATH, specify it's full path here. |  | no |
 | opensips_timeout | How long to wait for `opensipsctl` to respond. | 2 | no |
@@ -136,11 +126,32 @@ The following collapsed table contains all the options that can be configured fo
 | opensips_priority | The charts priority on the dashboard. | 80000 | no |
 | opensips_retries | The number of retries to do in case of failure before disabling the collector. | 10 | no |
 
+
 </details>
 
-#### Examples
 
-##### Custom `opensipsctl` command
+
+#### via File
+
+The configuration file name for this integration is `charts.d/opensips.conf`.
+
+The file format is POSIX shell script. Generally, the structure is:
+
+```sh
+OPTION_1="some value"
+OPTION_2="some other value"
+```
+You can edit the configuration file using the [`edit-config`](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#edit-a-configuration-file-using-edit-config) script from the
+Netdata [config directory](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#the-netdata-config-directory).
+
+```bash
+cd /etc/netdata 2>/dev/null || cd /opt/netdata/etc/netdata
+sudo ./edit-config charts.d/opensips.conf
+```
+
+##### Examples
+
+###### Custom `opensipsctl` command
 
 Set a custom path to the `opensipsctl` command
 

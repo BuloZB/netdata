@@ -165,7 +165,7 @@ static int dyncfg_unittest_action(struct dyncfg_unittest_action *a) {
     return rc;
 }
 
-static void *dyncfg_unittest_thread_action(void *ptr) {
+static void dyncfg_unittest_thread_action(void *ptr __maybe_unused) {
     while(!nd_thread_signaled_to_cancel()) {
         struct dyncfg_unittest_action *a = NULL;
         spinlock_lock(&dyncfg_unittest_data.spinlock);
@@ -179,8 +179,6 @@ static void *dyncfg_unittest_thread_action(void *ptr) {
         else
             sleep_usec(10 * USEC_PER_MS);
     }
-
-    return ptr;
 }
 
 static int dyncfg_unittest_execute_cb(struct rrd_function_execute *rfe, void *data) {
@@ -580,7 +578,7 @@ int dyncfg_unittest(void) {
     // ------------------------------------------------------------------------
     // create the thread for testing async communication
 
-    ND_THREAD *thread = nd_thread_create("unittest", NETDATA_THREAD_OPTION_JOINABLE, dyncfg_unittest_thread_action, NULL);
+    ND_THREAD *thread = nd_thread_create("unittest", NETDATA_THREAD_OPTION_DEFAULT, dyncfg_unittest_thread_action, NULL);
 
     // ------------------------------------------------------------------------
     // single

@@ -18,6 +18,13 @@
         "default": "http://127.0.0.1:8888/metrics",
         "format": "uri"
       },
+      "autodetection_retry": {
+        "title": "Detection retry",
+        "description": "Recheck interval in seconds. Zero means no recheck will be scheduled.",
+        "type": "integer",
+        "minimum": 0,
+        "default": 60
+      },
       "timeout": {
         "title": "Timeout",
         "description": "The timeout in seconds for the HTTP request.",
@@ -46,6 +53,16 @@
         "description": "The password for basic authentication.",
         "type": "string",
         "sensitive": true
+      },
+      "bearer_token_file": {
+        "title": "Bearer Token File",
+        "description": "Path to a file containing a bearer token for HTTP authentication.",
+        "type": "string"
+      },
+      "force_http2": {
+        "title": "Force HTTP2",
+        "description": "If set, forces the use of HTTP/2 protocol for all requests, even over plain TCP (h2c).",
+        "type": "boolean"
       },
       "proxy_url": {
         "title": "Proxy URL",
@@ -109,10 +126,7 @@
     },
     "required": [
       "url"
-    ],
-    "patternProperties": {
-      "^name$": {}
-    }
+    ]
   },
   "uiSchema": {
     "ui:flavour": "tabs",
@@ -122,6 +136,7 @@
           "title": "Base",
           "fields": [
             "update_every",
+            "autodetection_retry",
             "url",
             "timeout",
             "not_follow_redirects",
@@ -168,6 +183,16 @@
     },
     "method": {
       "ui:widget": "hidden"
+    },
+    "bearer_token_file": {
+      "ui:help": "The token is sent in the Authorization header as `Bearer <token>`. **Takes priority over basic authentication**.",
+      "ui:widget": "hidden"
+    },
+    "force_http2": {
+      "ui:widget": "hidden"
+    },
+    "autodetection_retry": {
+      "ui:help": "This option determines how frequently (in seconds) Netdata will retry data collection jobs that failed initially, with the value of 60 meaning it retries to start data collection jobs every 60 seconds, while setting it to 0 disables this retry mechanism entirely."
     },
     "vnode": {
       "ui:placeholder": "To use this option, first create a Virtual Node and then reference its name here."

@@ -49,7 +49,6 @@ The default configuration for this integration does not impose any limits on dat
 
 The default configuration for this integration is not expected to impose a significant performance impact on the system.
 
-
 ## Metrics
 
 Metrics grouped by *scope*.
@@ -108,6 +107,34 @@ Metrics:
 | iis.application_pool_recycles | recycles | recycles/s |
 | iis.application_pool_uptime | uptime | seconds |
 
+### Per IIS W3SCV W3MP
+
+These metrics refer to the World Wide Web Publishing Service, the service responsible for hosting and serving web content.
+
+Labels:
+
+| Label      | Description     |
+|:-----------|:----------------|
+| app | Application name. |
+
+Metrics:
+
+| Metric | Dimensions | Unit |
+|:------|:----------|:----|
+| iis.w3svc_w3wp_active_threads | threads | threads |
+| iis.w3svc_w3wp_requests_total | requests | requests/s |
+| iis.w3svc_w3wp_requests_active | requests | requests |
+| iis.w3svc_w3wp_file_cache_mem_usage | used | bytes |
+| iis.w3svc_w3wp_files_cache_total | cached_files | files/s |
+| iis.w3svc_w3wp_files_flushed_total | file_handles | flushes/s |
+| iis.w3svc_w3wp_uri_cache_flushed | cached_uris | flushes/s |
+| iis.w3svc_w3wp_total_uri_cached | uri_cache_blocks | blocks/s |
+| iis.w3svc_w3wp_total_metadata_cached | metadata_blocks | blocks/s |
+| iis.w3svc_w3wp_total_metadata_flushed | metadata_blocks | flushes/s |
+| iis.w3svc_w3wp_output_cache_active_flushed_items | used | items |
+| iis.w3svc_w3wp_output_cache_memory_usage | used | bytes |
+| iis.w3svc_w3wp_output_cache_flushed_total | output_cache_entries | flushes |
+
 
 
 ## Alerts
@@ -117,16 +144,30 @@ There are no alerts configured by default for this integration.
 
 ## Setup
 
+
 ### Prerequisites
 
 No action required.
 
 ### Configuration
 
-#### File
+#### Options
+
+
+
+
+
+| Option | Description | Default | Required |
+|:-----|:------------|:--------|:---------:|
+| update every | Data collection frequency. | 1 | no |
+
+
+
+
+#### via File
 
 The configuration file name for this integration is `netdata.conf`.
-Configuration for this specific integration is located in the `[plugin:windows]` section within that file.
+Configuration for this specific integration is located in the `[plugin:windows:PerflibWebService]` section within that file.
 
 The file format is a modified INI syntax. The general structure is:
 
@@ -145,15 +186,8 @@ Netdata [config directory](https://github.com/netdata/netdata/blob/master/docs/n
 cd /etc/netdata 2>/dev/null || cd /opt/netdata/etc/netdata
 sudo ./edit-config netdata.conf
 ```
-#### Options
 
-
-
-| Name | Description | Default | Required |
-|:----|:-----------|:-------|:--------:|
-| PerflibWebService | An option to enable or disable the data collection. | yes | no |
-
-#### Examples
+##### Examples
 There are no configuration examples.
 
 

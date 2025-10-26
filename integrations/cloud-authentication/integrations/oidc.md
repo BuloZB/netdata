@@ -15,10 +15,10 @@ endmeta-->
 
 Integrate your organization's Authorization Servers with Netdata to better manage your team's access controls to Netdata Cloud.
 
-
 <img src="https://img.shields.io/badge/maintained%20by-Netdata-%2300ab44" />
 
 ## Setup
+
 
 ### Prerequisites
 - Authorization Server with OIDC protocol supported
@@ -33,8 +33,8 @@ The access settings for your client are the following:
 
 | field                    | value                                                 |
 | :--                      | :--                                                   |
-| Root URL                 | `https://app.netdata.cloud/``                           |
-| Home/Initiate login URL  | `https://app.netdata.cloud/api/v2/auth/account/auth-server?iss={your-server-issuer-url}&redirect_uri=https://app.netdata.cloud/sign-in&register_uri=https://app.netdata.cloud/sign-up/verify`  |
+| Root URL                 | `https://app.netdata.cloud/`                          |
+| Home/Initiate login URL  | `https://app.netdata.cloud/api/v2/auth/account/auth-server?id={netdata-space-id}&redirect_uri=https://app.netdata.cloud/sign-in&register_uri=https://app.netdata.cloud/sign-up/verify`  |
 | Redirect URL             | `https://app.netdata.cloud/api/v2/auth/account/auth-server/callback`  |
 
 ### Netdata Configuration Steps
@@ -45,9 +45,6 @@ The access settings for your client are the following:
     - **Issuer URL** the Authorization Server Issuer URL, e.g. `https://my-auth-server.com/`
     - **Client ID** the Client ID from the created client
     - **Client Secret** the Client Secret from the created client
-    - **Authorization URL** the Authorization Server authorization URL, e.g. `https://my-auth-server.com/openid-connect/auth`
-    - **Token URL** the Authorization Server token URL, e.g. `https://my-auth-server.com/openid-connect/token`
-    - **User URL** the Authorization Server user info URL, e.g. `https://my-auth-server.com/openid-connect/userinfo`
 
 ### Supported features
 * SP-initiated SSO (Single Sign-On)

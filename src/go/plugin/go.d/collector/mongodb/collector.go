@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/netdata/netdata/go/plugins/pkg/confopt"
 	"github.com/netdata/netdata/go/plugins/pkg/matcher"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/confopt"
 )
 
 //go:embed "config_schema.json"
@@ -50,11 +50,12 @@ func New() *Collector {
 }
 
 type Config struct {
-	Vnode       string             `yaml:"vnode,omitempty" json:"vnode"`
-	UpdateEvery int                `yaml:"update_every,omitempty" json:"update_every"`
-	URI         string             `yaml:"uri" json:"uri"`
-	Timeout     confopt.Duration   `yaml:"timeout,omitempty" json:"timeout"`
-	Databases   matcher.SimpleExpr `yaml:"databases,omitempty" json:"databases"`
+	Vnode              string             `yaml:"vnode,omitempty" json:"vnode"`
+	UpdateEvery        int                `yaml:"update_every,omitempty" json:"update_every"`
+	AutoDetectionRetry int                `yaml:"autodetection_retry,omitempty" json:"autodetection_retry"`
+	URI                string             `yaml:"uri" json:"uri"`
+	Timeout            confopt.Duration   `yaml:"timeout,omitempty" json:"timeout"`
+	Databases          matcher.SimpleExpr `yaml:"databases,omitempty" json:"databases"`
 }
 
 type Collector struct {

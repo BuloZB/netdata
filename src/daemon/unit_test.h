@@ -13,6 +13,7 @@ int unit_test_buffer(void);
 int unit_test_static_threads(void);
 int test_sqlite(void);
 int unit_test_bitmaps(void);
+int stacktrace_unittest(void);
 #ifdef ENABLE_DBENGINE
 int test_dbengine(void);
 void generate_dbengine_dataset(unsigned history_seconds);
@@ -22,5 +23,9 @@ void dbengine_stress_test(unsigned TEST_DURATION_SEC, unsigned DSET_CHARTS, unsi
 #endif
 
 bool command_argument_sanitization_tests();
+
+#ifdef OS_WINDOWS
+int perflibnamestest_main(void);
+#endif
 
 #endif /* NETDATA_UNIT_TEST_H */

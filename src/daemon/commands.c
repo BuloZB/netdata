@@ -14,7 +14,7 @@ char cmd_prefix_by_status[] = {
         CMD_PREFIX_ERROR
 };
 
-static int command_server_initialized = 0;
+static cmd_init_status_t command_server_initialized = CMD_INIT_STATUS_OFF;
 static int command_thread_error;
 static int command_thread_shutdown;
 static unsigned clients = 0;
@@ -49,31 +49,33 @@ static cmd_status_t cmd_version(char *args, char **message);
 static cmd_status_t cmd_dumpconfig(char *args, char **message);
 static cmd_status_t cmd_remove_stale_node(char *args, char **message);
 static cmd_status_t cmd_mark_stale_nodes_ephemeral(char *args, char **message);
+static cmd_status_t cmd_update_node_info(char *args, char **message);
 
 static command_info_t command_info_array[] = {
-    {"help", "", "Show this help menu.", cmd_help_execute, CMD_TYPE_HIGH_PRIORITY},                // show help menu
-    {"reload-health", "", "Reload health configuration.", cmd_reload_health_execute, CMD_TYPE_ORTHOGONAL}, // reload health configuration
-    {"reopen-logs", "", "Close and reopen log files.", cmd_reopen_logs_execute, CMD_TYPE_ORTHOGONAL},     // Close and reopen log files
-    {"shutdown-agent", "", "Cleanup and exit the netdata agent.", cmd_exit_execute, CMD_TYPE_EXCLUSIVE},          // exit cleanly
-    {"fatal-agent", "", "Log the state and halt the netdata agent.", cmd_fatal_execute, CMD_TYPE_HIGH_PRIORITY},        // exit with fatal error
-    {"reload-claiming-state", "", "Reload agent claiming state from disk.", cmd_reload_claiming_state_execute, CMD_TYPE_ORTHOGONAL}, // reload claiming state
-    {"reload-labels", "", "Reload all localhost labels.", cmd_reload_labels_execute, CMD_TYPE_ORTHOGONAL},                 // reload the labels
-    {"read-config", "", "", cmd_read_config_execute, CMD_TYPE_CONCURRENT},
-    {"write-config", "", "", cmd_write_config_execute, CMD_TYPE_ORTHOGONAL},
-    {"ping", "", "Return with 'pong' if agent is alive.", cmd_ping_execute, CMD_TYPE_ORTHOGONAL},
-    {"aclk-state", "[json]",  "Returns current state of ACLK and Netdata Cloud connection. (optionally in json).", cmd_aclk_state, CMD_TYPE_ORTHOGONAL},
-    {"version", "", "Returns the netdata version.", cmd_version, CMD_TYPE_ORTHOGONAL},
-    {"dumpconfig", "", "Returns the current netdata.conf on stdout.", cmd_dumpconfig, CMD_TYPE_ORTHOGONAL},
-    {"remove-stale-node", "<node_id | machine_guid | hostname | ALL_NODES>",
-     "Marks one or all disconnected nodes as ephemeral, and removes them\n      so that they are no longer available for queries, from both this\n      Netdata Agent dashboard and Netdata Cloud.", cmd_remove_stale_node, CMD_TYPE_ORTHOGONAL},
+    {"help", "", "Show this help menu.", cmd_help_execute, CMD_TYPE_HIGH_PRIORITY, CMD_INIT_STATUS_INIT},                // show help menu
+    {"reload-health", "", "Reload health configuration.", cmd_reload_health_execute, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_FULL}, // reload health configuration
+    {"reopen-logs", "", "Close and reopen log files.", cmd_reopen_logs_execute, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_FULL},     // Close and reopen log files
+    {"shutdown-agent", "", "Cleanup and exit the netdata agent.", cmd_exit_execute, CMD_TYPE_EXCLUSIVE, CMD_INIT_STATUS_FULL},          // exit cleanly
+    {"fatal-agent", "", "Log the state and halt the netdata agent.", cmd_fatal_execute, CMD_TYPE_HIGH_PRIORITY, CMD_INIT_STATUS_FULL},        // exit with fatal error
+    {"reload-claiming-state", "", "Reload agent claiming state from disk.", cmd_reload_claiming_state_execute, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_FULL}, // reload claiming state
+    {"reload-labels", "", "Reload all localhost labels.", cmd_reload_labels_execute, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_FULL},                 // reload the labels
+    {"read-config", "", "", cmd_read_config_execute, CMD_TYPE_CONCURRENT, CMD_INIT_STATUS_FULL},
+    {"write-config", "", "", cmd_write_config_execute, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_FULL},
+    {"ping", "", "Return with 'pong' if agent is alive.", cmd_ping_execute, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_INIT},                       // ping command
+    {"aclk-state", "[json]",  "Returns current state of ACLK and Netdata Cloud connection. (optionally in json).", cmd_aclk_state, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_FULL},
+    {"version", "", "Returns the netdata version.", cmd_version, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_INIT},
+    {"dumpconfig", "", "Returns the current netdata.conf on stdout.", cmd_dumpconfig, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_FULL},
     {"mark-stale-nodes-ephemeral", "<node_id | machine_guid | hostname | ALL_NODES>",
-     "Marks one or all disconnected nodes as ephemeral, while keeping their retention\n      available for queries on both this Netdata Agent dashboard and Netdata Cloud", cmd_mark_stale_nodes_ephemeral, CMD_TYPE_ORTHOGONAL},
+        "Marks one or all disconnected nodes as ephemeral, while keeping their retention\n      available for queries on both this Netdata Agent dashboard and Netdata Cloud", cmd_mark_stale_nodes_ephemeral, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_FULL},
+    {"remove-stale-node", "<node_id | machine_guid | hostname | ALL_NODES>",
+     "Marks one or all disconnected nodes as ephemeral, and removes them\n      so that they are no longer available for queries, from both this\n      Netdata Agent dashboard and Netdata Cloud.", cmd_remove_stale_node, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_FULL},
+    {"update-node-info", "", "Schedules an node update message for localhost to Netdata Cloud.", cmd_update_node_info, CMD_TYPE_ORTHOGONAL, CMD_INIT_STATUS_FULL},
 };
 
 /* Mutexes for commands of type CMD_TYPE_ORTHOGONAL */
-static uv_mutex_t command_lock_array[CMD_TOTAL_COMMANDS];
+static netdata_mutex_t command_lock_array[CMD_TOTAL_COMMANDS];
 /* Commands of type CMD_TYPE_EXCLUSIVE are writers */
-static uv_rwlock_t exclusive_rwlock;
+static netdata_rwlock_t exclusive_rwlock;
 /*
  * Locking order:
  * 1. exclusive_rwlock
@@ -456,6 +458,19 @@ done:
     return CMD_STATUS_SUCCESS;
 }
 
+static cmd_status_t cmd_update_node_info(char *args __maybe_unused, char **message)
+{
+    if (aclk_online()) {
+        schedule_node_state_update(localhost, 1000);
+        CLEAN_BUFFER *wb = buffer_create(1024, NULL);
+        buffer_sprintf(wb, "Node info update scheduled for \"%s\"", rrdhost_hostname(localhost));
+        *message = strdupz(buffer_tostring(wb));
+    }
+    else
+        *message = strdupz("Agent is not connected to Netdata Cloud");
+    return CMD_STATUS_SUCCESS;
+}
+
 static cmd_status_t cmd_remove_stale_node(char *args, char **message)
 {
     return cmd_remove_stale_node_internal(args, message, true);
@@ -470,20 +485,20 @@ static void cmd_lock_exclusive(unsigned index)
 {
     (void)index;
 
-    uv_rwlock_wrlock(&exclusive_rwlock);
+    netdata_rwlock_wrlock(&exclusive_rwlock);
 }
 
 static void cmd_lock_orthogonal(unsigned index)
 {
-    uv_rwlock_rdlock(&exclusive_rwlock);
-    uv_mutex_lock(&command_lock_array[index]);
+    netdata_rwlock_rdlock(&exclusive_rwlock);
+    netdata_mutex_lock(&command_lock_array[index]);
 }
 
 static void cmd_lock_idempotent(unsigned index)
 {
     (void)index;
 
-    uv_rwlock_rdlock(&exclusive_rwlock);
+    netdata_rwlock_rdlock(&exclusive_rwlock);
 }
 
 static void cmd_lock_high_priority(unsigned index)
@@ -495,20 +510,20 @@ static void cmd_unlock_exclusive(unsigned index)
 {
     (void)index;
 
-    uv_rwlock_wrunlock(&exclusive_rwlock);
+    netdata_rwlock_wrunlock(&exclusive_rwlock);
 }
 
 static void cmd_unlock_orthogonal(unsigned index)
 {
-    uv_rwlock_rdunlock(&exclusive_rwlock);
-    uv_mutex_unlock(&command_lock_array[index]);
+    netdata_rwlock_rdunlock(&exclusive_rwlock);
+    netdata_mutex_unlock(&command_lock_array[index]);
 }
 
 static void cmd_unlock_idempotent(unsigned index)
 {
     (void)index;
 
-    uv_rwlock_rdunlock(&exclusive_rwlock);
+    netdata_rwlock_rdunlock(&exclusive_rwlock);
 }
 
 static void cmd_unlock_high_priority(unsigned index)
@@ -584,7 +599,12 @@ cmd_status_t execute_command(cmd_t idx, char *args, char **message)
     cmd_type_t type = command_info_array[idx].type;
 
     cmd_lock_by_type[type](idx);
-    status = command_info_array[idx].func(args, message);
+    if (command_server_initialized >= command_info_array[idx].init_status)
+        status = command_info_array[idx].func(args, message);
+    else {
+        *message = strdupz("Agent is initializing");
+        status = CMD_STATUS_SUCCESS;
+    }
     cmd_unlock_by_type[type](idx);
 
     return status;
@@ -657,7 +677,6 @@ static void pipe_read_cb(uv_stream_t *client, ssize_t nread, const uv_buf_t *buf
     if (0 == nread) {
         netdata_log_info("%s: Zero bytes read by command pipe.", __func__);
     } else if (UV_EOF == nread) {
-        netdata_log_info("EOF found in command pipe.");
         parse_commands(cmd_ctx);
     } else if (nread < 0) {
         netdata_log_error("%s: %s", __func__, uv_strerror(nread));
@@ -837,14 +856,23 @@ void commands_init(void)
     int error;
 
     sanity_check();
-    if (command_server_initialized)
+    if (command_server_initialized == CMD_INIT_STATUS_FULL)
         return;
 
-    netdata_log_info("Initializing command server.");
-    for (i = 0 ; i < CMD_TOTAL_COMMANDS ; ++i) {
-        fatal_assert(0 == uv_mutex_init(&command_lock_array[i]));
+    if (command_server_initialized == CMD_INIT_STATUS_OFF) {
+        netdata_log_info("Initializing command server for liveness CHECK");
+        command_server_initialized = CMD_INIT_STATUS_INIT;
     }
-    fatal_assert(0 == uv_rwlock_init(&exclusive_rwlock));
+    else {
+        netdata_log_info("Initializing full command server.");
+        command_server_initialized = CMD_INIT_STATUS_FULL;
+        return;
+    }
+
+    for (i = 0 ; i < CMD_TOTAL_COMMANDS ; ++i) {
+        fatal_assert(0 == netdata_mutex_init(&command_lock_array[i]));
+    }
+    fatal_assert(0 == netdata_rwlock_init(&exclusive_rwlock));
 
     completion_init(&completion);
     error = uv_thread_create(&thread, command_thread, NULL);
@@ -864,7 +892,6 @@ void commands_init(void)
         goto after_error;
     }
 
-    command_server_initialized = 1;
     return;
 
 after_error:
@@ -875,7 +902,7 @@ void commands_exit(void)
 {
     cmd_t i;
 
-    if (!command_server_initialized)
+    if (command_server_initialized == CMD_INIT_STATUS_OFF)
         return;
 
     command_thread_shutdown = 1;
@@ -885,9 +912,9 @@ void commands_exit(void)
     fatal_assert(0 == uv_thread_join(&thread));
 
     for (i = 0 ; i < CMD_TOTAL_COMMANDS ; ++i) {
-        uv_mutex_destroy(&command_lock_array[i]);
+        netdata_mutex_destroy(&command_lock_array[i]);
     }
-    uv_rwlock_destroy(&exclusive_rwlock);
+    netdata_rwlock_destroy(&exclusive_rwlock);
     netdata_log_info("Command server has stopped.");
-    command_server_initialized = 0;
+    command_server_initialized = CMD_INIT_STATUS_OFF;
 }

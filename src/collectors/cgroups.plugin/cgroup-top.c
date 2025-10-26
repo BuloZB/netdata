@@ -10,8 +10,17 @@ struct cgroup_netdev_link {
 
 static DICTIONARY *cgroup_netdev_link_dict = NULL;
 
+void netdev_renames_destroy(void);
+
 void cgroup_netdev_link_init(void) {
     cgroup_netdev_link_dict = dictionary_create_advanced(DICT_OPTION_FIXED_SIZE|DICT_OPTION_DONT_OVERWRITE_VALUE, NULL, sizeof(struct cgroup_netdev_link));
+}
+
+void cgroup_netdev_link_destroy(void) {
+    dictionary_destroy(cgroup_netdev_link_dict);
+    cgroup_netdev_link_dict = NULL;
+
+    netdev_renames_destroy();
 }
 
 const DICTIONARY_ITEM *cgroup_netdev_get(struct cgroup *cg) {
@@ -122,7 +131,7 @@ int cgroup_function_cgroup_top(BUFFER *wb, const char *function __maybe_unused, 
 
     RRDDIM *rd = NULL;
 
-    uv_mutex_lock(&cgroup_root_mutex);
+    netdata_mutex_lock(&cgroup_root_mutex);
 
     for(struct cgroup *cg = cgroup_root; cg ; cg = cg->next) {
         if(unlikely(!cg->enabled || cg->pending_renames || !cg->function_ready || is_cgroup_systemd_service(cg)))
@@ -176,7 +185,7 @@ int cgroup_function_cgroup_top(BUFFER *wb, const char *function __maybe_unused, 
         buffer_json_array_close(wb);
     }
 
-    uv_mutex_unlock(&cgroup_root_mutex);
+    netdata_mutex_unlock(&cgroup_root_mutex);
 
     buffer_json_array_close(wb); // data
     buffer_json_member_add_object(wb, "columns");
@@ -362,7 +371,7 @@ int cgroup_function_systemd_top(BUFFER *wb, const char *function __maybe_unused,
 
     RRDDIM *rd = NULL;
 
-    uv_mutex_lock(&cgroup_root_mutex);
+    netdata_mutex_lock(&cgroup_root_mutex);
 
     for(struct cgroup *cg = cgroup_root; cg ; cg = cg->next) {
         if(unlikely(!cg->enabled || cg->pending_renames || !cg->function_ready || !is_cgroup_systemd_service(cg)))
@@ -396,7 +405,7 @@ int cgroup_function_systemd_top(BUFFER *wb, const char *function __maybe_unused,
         buffer_json_array_close(wb);
     }
 
-    uv_mutex_unlock(&cgroup_root_mutex);
+    netdata_mutex_unlock(&cgroup_root_mutex);
 
     buffer_json_array_close(wb); // data
     buffer_json_member_add_object(wb, "columns");

@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "daemon/status-file.h"
+#include "protected-access.h"
 
 #ifdef ENABLE_SENTRY
 #include "sentry-native/sentry-native.h"
@@ -47,7 +48,9 @@ static struct {
 static void (*original_handlers[NSIG])(int) = {0};
 static void (*original_sigactions[NSIG])(int, siginfo_t *, void *) = {0};
 
+NEVER_INLINE
 void nd_signal_handler(int signo, siginfo_t *info, void *context __maybe_unused) {
+    signal_protected_access_check(signo, info, context);
 
     for(size_t i = 0; i < _countof(signals_waiting) ; i++) {
         if(signals_waiting[i].signo != signo)
@@ -83,20 +86,20 @@ void nd_signal_handler(int signo, siginfo_t *info, void *context __maybe_unused)
             // log it
             char b[1024];
             size_t len = 0;
-            len = strcatz(b, len, sizeof(b), "SIGNAL HANDLER: received deadly signal: ");
-            len = strcatz(b, len, sizeof(b), signals_waiting[i].name);
+            len = strcatz(b, len, "SIGNAL HANDLER: received deadly signal: ", sizeof(b));
+            len = strcatz(b, len, signals_waiting[i].name, sizeof(b));
             if(sc) {
                 char buf[128];
                 SIGNAL_CODE_2str_h(sc, buf, sizeof(buf));
-                len = strcatz(b, len, sizeof(b), " (");
-                len = strcatz(b, len, sizeof(b), buf);
-                len = strcatz(b, len, sizeof(b), ")");
+                len = strcatz(b, len, " (", sizeof(b));
+                len = strcatz(b, len, buf, sizeof(b));
+                len = strcatz(b, len, ")", sizeof(b));
             }
-            len = strcatz(b, len, sizeof(b), " in thread ");
+            len = strcatz(b, len, " in thread ", sizeof(b));
             print_uint64(&b[len], gettid_cached());
-            len = strcatz(b, len, sizeof(b), " ");
-            len = strcatz(b, len, sizeof(b), nd_thread_tag_async_safe());
-            len = strcatz(b, len, sizeof(b), "!\n");
+            len = strcatz(b, len, " ", sizeof(b));
+            len = strcatz(b, len, nd_thread_tag_async_safe(), sizeof(b));
+            len = strcatz(b, len, "!\n", sizeof(b));
 
             if(write(STDERR_FILENO, b, strlen(b)) == -1) {
                 // nothing to do - we cannot write but there is no way to complain about it
@@ -168,6 +171,11 @@ void nd_cleanup_deadly_signals(void) {
 
 void nd_initialize_signals(bool chain_existing) {
     signals_block_all_except_deadly();
+    
+    // Set the signal handler name for stack trace filtering
+#ifdef HAVE_LIBBACKTRACE
+    stacktrace_set_signal_handler_function("nd_signal_handler");
+#endif
 
     struct sigaction act;
     memset(&act, 0, sizeof(struct sigaction));
@@ -206,6 +214,7 @@ void nd_initialize_signals(bool chain_existing) {
     }
 }
 
+NEVER_INLINE
 static void process_triggered_signals(void) {
     size_t found;
     do {
@@ -220,17 +229,25 @@ static void process_triggered_signals(void) {
 
             switch (signals_waiting[i].action) {
                 case NETDATA_SIGNAL_RELOAD_HEALTH:
-                    nd_log_limits_unlimited();
-                    netdata_log_info("SIGNAL: Received %s. Reloading HEALTH configuration...", name);
-                    nd_log_limits_reset();
-                    execute_command(CMD_RELOAD_HEALTH, NULL, NULL);
+                    if(exit_initiated_get())
+                        netdata_log_info("SIGNAL: Received %s. Ignoring it, as we are exiting...", name);
+                    else {
+                        nd_log_limits_unlimited();
+                        netdata_log_info("SIGNAL: Received %s. Reloading HEALTH configuration...", name);
+                        nd_log_limits_reset();
+                        execute_command(CMD_RELOAD_HEALTH, NULL, NULL);
+                    }
                     break;
 
                 case NETDATA_SIGNAL_REOPEN_LOGS:
-                    nd_log_limits_unlimited();
-                    netdata_log_info("SIGNAL: Received %s. Reopening all log files...", name);
-                    nd_log_limits_reset();
-                    execute_command(CMD_REOPEN_LOGS, NULL, NULL);
+                    if(exit_initiated_get())
+                        netdata_log_info("SIGNAL: Received %s. Ignoring it, as we are exiting...", name);
+                    else {
+                        nd_log_limits_unlimited();
+                        netdata_log_info("SIGNAL: Received %s. Reopening all log files...", name);
+                        nd_log_limits_reset();
+                        execute_command(CMD_REOPEN_LOGS, NULL, NULL);
+                    }
                     break;
 
                 case NETDATA_SIGNAL_EXIT_CLEANLY:
@@ -264,6 +281,7 @@ static inline bool threshold_trigger_smaller(bool *last, double threshold, doubl
     return !triggered && *last;
 }
 
+NEVER_INLINE
 void nd_process_signals(void) {
     posix_unmask_my_signals();
     const usec_t save_every_ut = 15 * 60 * USEC_PER_SEC;

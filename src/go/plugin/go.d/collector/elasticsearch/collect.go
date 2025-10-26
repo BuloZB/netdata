@@ -5,15 +5,14 @@ package elasticsearch
 import (
 	"errors"
 	"fmt"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/metrix"
-	"math"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/stm"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/web"
+	"github.com/netdata/netdata/go/plugins/pkg/stm"
+	"github.com/netdata/netdata/go/plugins/pkg/web"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/metrix"
 )
 
 const (
@@ -213,7 +212,10 @@ func (c *Collector) scrapeLocalIndicesStats(ms *esMetrics) {
 }
 
 func (c *Collector) getClusterName() (string, error) {
-	req, _ := web.NewHTTPRequest(c.RequestConfig)
+	req, err := web.NewHTTPRequest(c.RequestConfig)
+	if err != nil {
+		return "", err
+	}
 
 	var info struct {
 		ClusterName string `json:"cluster_name"`
@@ -234,16 +236,16 @@ func convertIndexStoreSizeToBytes(size string) int64 {
 	switch {
 	case strings.HasSuffix(size, "kb"):
 		num, _ = strconv.ParseFloat(size[:len(size)-2], 64)
-		num *= math.Pow(1024, 1)
+		num *= 1024
 	case strings.HasSuffix(size, "mb"):
 		num, _ = strconv.ParseFloat(size[:len(size)-2], 64)
-		num *= math.Pow(1024, 2)
+		num *= 1024 * 1024
 	case strings.HasSuffix(size, "gb"):
 		num, _ = strconv.ParseFloat(size[:len(size)-2], 64)
-		num *= math.Pow(1024, 3)
+		num *= 1024 * 1024 * 1024
 	case strings.HasSuffix(size, "tb"):
 		num, _ = strconv.ParseFloat(size[:len(size)-2], 64)
-		num *= math.Pow(1024, 4)
+		num *= 1024 * 1024 * 1024 * 1024
 	case strings.HasSuffix(size, "b"):
 		num, _ = strconv.ParseFloat(size[:len(size)-1], 64)
 	}

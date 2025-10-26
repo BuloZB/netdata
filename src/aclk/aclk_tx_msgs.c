@@ -33,7 +33,7 @@ uint16_t aclk_send_bin_message_subtopic_pid(mqtt_wss_client client, char *msg, s
         return 0;
     }
 
-    mqtt_wss_publish5(client, (char*)topic, NULL, msg, &freez_aclk_publish5a, msg_len, MQTT_WSS_PUB_QOS1, &packet_id);
+    mqtt_wss_publish5(client, (char *)topic, NULL, msg, &freez_aclk_publish5a, msg_len, MQTT_WSS_PUB_QOS1, &packet_id);
 
     if (aclklog_enabled) {
         char *json = protomsg_to_json(msg, msg_len, msgname);
@@ -204,7 +204,7 @@ uint16_t aclk_send_agent_connection_update(mqtt_wss_client client, int reachable
         .reachable = (reachable ? 1 : 0),
         .lwt = 0,
         .session_id = aclk_session_newarch,
-        .capabilities = aclk_get_agent_capas()
+        .capabilities = aclk_get_agent_capas(),
     };
 
     CLAIM_ID claim_id = claim_id_get();

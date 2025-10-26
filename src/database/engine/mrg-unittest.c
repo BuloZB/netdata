@@ -16,7 +16,7 @@ struct mrg_stress {
     size_t updates;
 };
 
-static void *mrg_stress(void *ptr) {
+static void mrg_stress(void *ptr) {
     struct mrg_stress *t = ptr;
     MRG *mrg = t->mrg;
 
@@ -48,8 +48,6 @@ static void *mrg_stress(void *ptr) {
             __atomic_add_fetch(&t->updates, 1, __ATOMIC_RELAXED);
         }
     }
-
-    return ptr;
 }
 
 int mrg_unittest(void) {
@@ -173,7 +171,7 @@ int mrg_unittest(void) {
     for(size_t i = 0; i < threads ; i++) {
         char buf[15 + 1];
         snprintfz(buf, sizeof(buf) - 1, "TH[%zu]", i);
-        th[i] = nd_thread_create(buf, NETDATA_THREAD_OPTION_JOINABLE | NETDATA_THREAD_OPTION_DONT_LOG, mrg_stress, &t);
+        th[i] = nd_thread_create(buf, NETDATA_THREAD_OPTION_DONT_LOG, mrg_stress, &t);
     }
 
     sleep_usec(run_for_secs * USEC_PER_SEC);

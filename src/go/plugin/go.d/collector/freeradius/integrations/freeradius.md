@@ -48,7 +48,6 @@ The default configuration for this integration does not impose any limits on dat
 
 The default configuration for this integration is not expected to impose a significant performance impact on the system.
 
-
 ## Metrics
 
 Metrics grouped by *scope*.
@@ -87,6 +86,21 @@ There are no alerts configured by default for this integration.
 
 ## Setup
 
+
+You can configure the **freeradius** collector in two ways:
+
+| Method                | Best for                                                                                 | How to                                                                                                                                 |
+|-----------------------|------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------|
+| [**UI**](#via-ui)     | Fast setup without editing files                                                         | Go to **Nodes → Configure this node → Collectors → Jobs**, search for **freeradius**, then click **+** to add a job. |
+| [**File**](#via-file) | If you prefer configuring via file, or need to automate deployments (e.g., with Ansible) | Edit `go.d/freeradius.conf` and add a job.                                                                        |
+
+:::important
+
+UI configuration requires paid Netdata Cloud plan.
+
+:::
+
+
 ### Prerequisites
 
 #### Enable status server
@@ -97,18 +111,6 @@ To enable status server, follow the [official documentation](https://wiki.freera
 
 ### Configuration
 
-#### File
-
-The configuration file name for this integration is `go.d/freeradius.conf`.
-
-
-You can edit the configuration file using the [`edit-config`](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#edit-a-configuration-file-using-edit-config) script from the
-Netdata [config directory](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#the-netdata-config-directory).
-
-```bash
-cd /etc/netdata 2>/dev/null || cd /opt/netdata/etc/netdata
-sudo ./edit-config go.d/freeradius.conf
-```
 #### Options
 
 The following options can be defined globally: update_every, autodetection_retry.
@@ -116,19 +118,60 @@ The following options can be defined globally: update_every, autodetection_retry
 
 <details open><summary>Config options</summary>
 
-| Name | Description | Default | Required |
-|:----|:-----------|:-------|:--------:|
-| update_every | Data collection frequency. | 1 | no |
-| autodetection_retry | Recheck interval in seconds. Zero means no recheck will be scheduled. | 0 | no |
-| address | Server address. | 127.0.0.1 | yes |
-| port | Server port. | 18121 | no |
-| secret | FreeRADIUS secret. | adminsecret | no |
+
+
+| Group | Option | Description | Default | Required |
+|:------|:-----|:------------|:--------|:---------:|
+| **Collection** | update_every | Data collection interval (seconds). | 1 | no |
+|  | autodetection_retry | Autodetection retry interval (seconds). Set 0 to disable. | 0 | no |
+| **Target** | address | FreeRADIUS server address. | 127.0.0.1 | yes |
+|  | timeout | Connection, read, and write timeout (seconds). | 1 | no |
+|  | port | FreeRADIUS server port. | 18121 | no |
+| **Auth** | secret | FreeRADIUS shared secret. | adminsecret | no |
+| **Virtual Node** | vnode | Associates this data collection job with a [Virtual Node](https://learn.netdata.cloud/docs/netdata-agent/configuration/organize-systems-metrics-and-alerts#virtual-nodes). |  | no |
+
 
 </details>
 
-#### Examples
 
-##### Basic
+#### via UI
+
+Configure the **freeradius** collector from the Netdata web interface:
+
+1. Go to **Nodes**.
+2. Select the node **where you want the freeradius data-collection job to run** and click the :gear: (**Configure this node**). That node will run the data collection.
+3. The **Collectors → Jobs** view opens by default.
+4. In the Search box, type _freeradius_ (or scroll the list) to locate the **freeradius** collector.
+5. Click the **+** next to the **freeradius** collector to add a new job.
+6. Fill in the job fields, then click **Test** to verify the configuration and **Submit** to save.
+    - **Test** runs the job with the provided settings and shows whether data can be collected.
+    - If it fails, an error message appears with details (for example, connection refused, timeout, or command execution errors), so you can adjust and retest.
+
+
+#### via File
+
+The configuration file name for this integration is `go.d/freeradius.conf`.
+
+The file format is YAML. Generally, the structure is:
+
+```yaml
+update_every: 1
+autodetection_retry: 0
+jobs:
+  - name: some_name1
+  - name: some_name2
+```
+You can edit the configuration file using the [`edit-config`](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#edit-a-configuration-file-using-edit-config) script from the
+Netdata [config directory](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#the-netdata-config-directory).
+
+```bash
+cd /etc/netdata 2>/dev/null || cd /opt/netdata/etc/netdata
+sudo ./edit-config go.d/freeradius.conf
+```
+
+##### Examples
+
+###### Basic
 
 A basic example configuration.
 
@@ -144,7 +187,7 @@ jobs:
 ```
 </details>
 
-##### Multi-instance
+###### Multi-instance
 
 > **Note**: When you define multiple jobs, their names must be unique.
 
@@ -196,6 +239,12 @@ should give you clues as to why the collector isn't working.
 
   ```bash
   ./go.d.plugin -d -m freeradius
+  ```
+
+  To debug a specific job:
+
+  ```bash
+  ./go.d.plugin -d -m freeradius -j jobName
   ```
 
 ### Getting Logs

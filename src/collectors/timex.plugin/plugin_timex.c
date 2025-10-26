@@ -2,6 +2,12 @@
 
 #include "database/rrd.h"
 
+#ifdef OS_MACOS
+#include <AvailabilityMacros.h>
+#endif
+
+#if !defined(OS_MACOS) || (MAC_OS_X_VERSION_MIN_REQUIRED >= 101300)
+
 #define PLUGIN_TIMEX_NAME "timex.plugin"
 
 #define CONFIG_SECTION_TIMEX "plugin:timex"
@@ -41,7 +47,7 @@ static void timex_main_cleanup(void *pptr)
     static_thread->enabled = NETDATA_MAIN_THREAD_EXITED;
 }
 
-void *timex_main(void *ptr)
+void timex_main(void *ptr)
 {
     CLEANUP_FUNCTION_REGISTER(timex_main_cleanup) cleanup_ptr = ptr;
 
@@ -59,7 +65,7 @@ void *timex_main(void *ptr)
 
     if (unlikely(do_sync == CONFIG_BOOLEAN_NO && do_offset == CONFIG_BOOLEAN_NO)) {
         netdata_log_info("No charts to show");
-        goto exit;
+        return;
     }
 
     usec_t step = update_every * USEC_PER_SEC;
@@ -178,7 +184,6 @@ void *timex_main(void *ptr)
             rrdset_done(st_offset);
         }
     }
-
-exit:
-    return NULL;
 }
+
+#endif // !defined(OS_MACOS) || (MAC_OS_X_VERSION_MIN_REQUIRED >= 101300)

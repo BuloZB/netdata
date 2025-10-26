@@ -50,7 +50,6 @@ The default configuration for this integration does not impose any limits on dat
 
 The default configuration for this integration is not expected to impose a significant performance impact on the system.
 
-
 ## Metrics
 
 Metrics grouped by *scope*.
@@ -83,6 +82,7 @@ There are no alerts configured by default for this integration.
 
 ## Setup
 
+
 ### Prerequisites
 
 #### Python Requirements
@@ -103,18 +103,6 @@ sudo pip install 'sqlalchemy<2.0' psycopg2-binary
 
 ### Configuration
 
-#### File
-
-The configuration file name for this integration is `python.d/pandas.conf`.
-
-
-You can edit the configuration file using the [`edit-config`](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#edit-a-configuration-file-using-edit-config) script from the
-Netdata [config directory](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#the-netdata-config-directory).
-
-```bash
-cd /etc/netdata 2>/dev/null || cd /opt/netdata/etc/netdata
-sudo ./edit-config python.d/pandas.conf
-```
 #### Options
 
 There are 2 sections:
@@ -131,8 +119,10 @@ Every configuration JOB starts with a `job_name` value which will appear in the 
 
 <details open><summary>Config options</summary>
 
-| Name | Description | Default | Required |
-|:----|:-----------|:-------|:--------:|
+
+
+| Option | Description | Default | Required |
+|:-----|:------------|:--------|:---------:|
 | chart_configs | an array of chart configuration dictionaries | [] | yes |
 | chart_configs.name | name of the chart to be displayed in the dashboard. | None | yes |
 | chart_configs.title | title of the chart to be displayed in the dashboard. | None | yes |
@@ -147,11 +137,36 @@ Every configuration JOB starts with a `job_name` value which will appear in the 
 | penalty | Indicates whether to apply penalty to update_every in case of failures. | yes | no |
 | name | Job name. This value will overwrite the `job_name` value. JOBS with the same name are mutually exclusive. Only one of them will be allowed running at any time. This allows autodetection to try several alternatives and pick the one that works. |  | no |
 
+
 </details>
 
-#### Examples
 
-##### Temperature API Example
+
+#### via File
+
+The configuration file name for this integration is `python.d/pandas.conf`.
+
+The file format is YAML. Generally, the structure is:
+
+```yaml
+update_every: 1
+autodetection_retry: 0
+
+job_name:
+  job_option1: some_value
+  job_option2: some_other_vlaue
+```
+You can edit the configuration file using the [`edit-config`](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#edit-a-configuration-file-using-edit-config) script from the
+Netdata [config directory](https://github.com/netdata/netdata/blob/master/docs/netdata-agent/configuration/README.md#the-netdata-config-directory).
+
+```bash
+cd /etc/netdata 2>/dev/null || cd /opt/netdata/etc/netdata
+sudo ./edit-config python.d/pandas.conf
+```
+
+##### Examples
+
+###### Temperature API Example
 
 example pulling some hourly temperature data, a chart for today forecast (mean,min,max) and another chart for current.
 
@@ -223,7 +238,7 @@ temperature:
 ```
 </details>
 
-##### API CSV Example
+###### API CSV Example
 
 example showing a read_csv from a url and some light pandas data wrangling.
 
@@ -251,7 +266,7 @@ example_csv:
 ```
 </details>
 
-##### API JSON Example
+###### API JSON Example
 
 example showing a read_json from a url and some light pandas data wrangling.
 
@@ -278,7 +293,7 @@ example_json:
 ```
 </details>
 
-##### XML Example
+###### XML Example
 
 example showing a read_xml from a url and some light pandas data wrangling.
 
@@ -304,7 +319,7 @@ example_xml:
 ```
 </details>
 
-##### SQL Example
+###### SQL Example
 
 example showing a read_sql from a postgres database using sqlalchemy.
 

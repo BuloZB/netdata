@@ -2,7 +2,15 @@
 
 #include "ml_kmeans.h"
 #include "libnetdata/libnetdata.h"
-#include "dlib/dlib/clustering.h"
+#include <dlib/clustering.h>
+
+// gcc with libstdc++ may require this,
+// but with libc++ it does not work correctly.
+#if !defined(_LIBCPP_VERSION)
+#include <cmath>
+using std::isinf;
+using std::isnan;
+#endif
 
 void
 ml_kmeans_init(ml_kmeans_t *kmeans)
@@ -23,6 +31,17 @@ ml_kmeans_train(ml_kmeans_t *kmeans, const ml_features_t *features, unsigned max
     kmeans->max_dist  = std::numeric_limits<calculated_number_t>::min();
 
     kmeans->cluster_centers.clear();
+
+    if (features->preprocessed_features.size() < 2) {
+        netdata_log_error("ml_kmeans_train: not enough features to train kmeans (size=%zu)", features->preprocessed_features.size());
+        return;
+    }
+
+    // Reserve capacity for cluster centers BEFORE calling dlib functions to prevent
+    // reallocation during lazy evaluation. dlib uses expression templates that hold
+    // references to vector elements, and reallocation would invalidate those references,
+    // causing heap-use-after-free when multiple threads train models concurrently.
+    //kmeans->cluster_centers.reserve(2);
 
     dlib::pick_initial_centers(2, kmeans->cluster_centers, features->preprocessed_features);
     dlib::find_clusters_using_kmeans(features->preprocessed_features, kmeans->cluster_centers, max_iters);

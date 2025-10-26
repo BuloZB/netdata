@@ -6,7 +6,7 @@ import (
 	"errors"
 	"strconv"
 
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/web"
+	"github.com/netdata/netdata/go/plugins/pkg/web"
 )
 
 const querySystemMetrics = `
@@ -18,14 +18,17 @@ FROM
 `
 
 func (c *Collector) collectSystemMetrics(mx map[string]int64) error {
-	req, _ := web.NewHTTPRequest(c.RequestConfig)
+	req, err := web.NewHTTPRequest(c.RequestConfig)
+	if err != nil {
+		return err
+	}
 	req.URL.RawQuery = makeURLQuery(querySystemMetrics)
 
 	px := "metrics_"
 	var metric string
 	var n int
 
-	err := c.doHTTP(req, func(column, value string, lineEnd bool) {
+	err = c.doHTTP(req, func(column, value string, lineEnd bool) {
 		switch column {
 		case "metric":
 			metric = value

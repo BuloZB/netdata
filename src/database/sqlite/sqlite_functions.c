@@ -2,10 +2,26 @@
 
 #include "sqlite_functions.h"
 
-#define MAX_PREPARED_STATEMENTS (32)
-pthread_key_t key_pool[MAX_PREPARED_STATEMENTS];
+#define MAX_PREPARED_THREAD_STATEMENTS (32)
+
+static SPINLOCK JudyL_thread_stmt_lock = SPINLOCK_INITIALIZER;
+static Pvoid_t JudyL_thread_stmt_pool = NULL;
+
+struct stmt_pool_s {
+    int count;
+    pid_t thread_id;
+    char *name;
+    void *stmt[MAX_PREPARED_THREAD_STATEMENTS];
+};
+
+__thread struct stmt_pool_s *thread_stmt_pool = NULL;
 
 long long def_journal_size_limit = 16777216;
+
+SPINLOCK sqlite_spinlock = SPINLOCK_INITIALIZER;
+
+bool sqlite_library_initialized;
+bool sqlite_databases_closed;
 
 SQLITE_API int sqlite3_exec_monitored(
     sqlite3 *db,                               /* An open database */
@@ -153,60 +169,100 @@ int configure_sqlite_database(sqlite3 *database, int target_version, const char 
     return 0;
 }
 
-#define MAX_OPEN_STATEMENTS (512)
-
-static void add_stmt_to_list(sqlite3_stmt *res)
+static void finalize_and_free_stmt_list(struct stmt_pool_s *stmt_list)
 {
-    static int idx = 0;
-    static sqlite3_stmt *statements[MAX_OPEN_STATEMENTS];
-
-    if (unlikely(!res)) {
-        if (idx)
-            netdata_log_info("Finilizing %d statements", idx);
-        else
-            netdata_log_info("No statements pending to finalize");
-        while (idx > 0) {
-            int rc;
-            rc = sqlite3_finalize(statements[--idx]);
-            if (unlikely(rc != SQLITE_OK))
-                error_report("Failed to finalize statement during shutdown, rc = %d", rc);
-        }
+    if (!stmt_list)
         return;
+
+    int max_keys = stmt_list->count;
+    for (int i = 0; i < max_keys; i++) {
+        if (!stmt_list->stmt[i])
+            continue;
+        int rc = sqlite3_finalize((sqlite3_stmt *)stmt_list->stmt[i]);
+        if (unlikely(rc != SQLITE_OK))
+            error_report("Failed to finalize statement, rc = %d", rc);
+        stmt_list->stmt[i] = NULL;
     }
+    freez(stmt_list->name);
+    freez(stmt_list);
+}
 
-    if (unlikely(idx == MAX_OPEN_STATEMENTS))
+// This must be called when the thread terminates
+void finalize_self_prepared_sql_statements()
+{
+    if (__atomic_load_n(&sqlite_databases_closed, __ATOMIC_ACQUIRE))
         return;
+
+    spinlock_lock(&sqlite_spinlock);
+
+    spinlock_lock(&JudyL_thread_stmt_lock);
+    if (thread_stmt_pool) {
+        Word_t thread_id = thread_stmt_pool->thread_id;
+        finalize_and_free_stmt_list(thread_stmt_pool);
+        thread_stmt_pool = NULL;
+        (void)JudyLDel(&JudyL_thread_stmt_pool, thread_id, PJE0);
+    }
+    spinlock_unlock(&JudyL_thread_stmt_lock);
+
+    spinlock_unlock(&sqlite_spinlock);
 }
 
-static void release_statement(void *statement)
+void finalize_all_prepared_sql_statements()
 {
-    int rc;
-    if (unlikely(rc = sqlite3_finalize((sqlite3_stmt *) statement) != SQLITE_OK))
-        error_report("Failed to finalize statement, rc = %d", rc);
+    spinlock_lock(&JudyL_thread_stmt_lock);
+    bool first_then_next = true;
+    Pvoid_t *Pvalue = NULL;
+    Word_t thread_id = 0;
+    if (JudyL_thread_stmt_pool) {
+        while ((Pvalue = JudyLFirstThenNext(JudyL_thread_stmt_pool, &thread_id, &first_then_next))) {
+            struct stmt_pool_s *local_stmt_pool = (struct stmt_pool_s *) *Pvalue;
+            if (!local_stmt_pool)
+                continue;
+            nd_log_daemon(
+                NDLP_WARNING,
+                "SQL: Pending SQL statements for thread %lu (%s), make sure thread does a proper cleanup",
+                thread_id,
+                local_stmt_pool->name);
+            finalize_and_free_stmt_list(local_stmt_pool);
+        }
+        (void)JudyLFreeArray(&JudyL_thread_stmt_pool, PJE0);
+    }
+    spinlock_unlock(&JudyL_thread_stmt_lock);
 }
 
-static void initialize_thread_key_pool(void)
-{
-    for (int i = 0; i < MAX_PREPARED_STATEMENTS; i++)
-        (void)pthread_key_create(&key_pool[i], release_statement);
+static void init_thread_stmt_pool(void) {
+    thread_stmt_pool = (struct stmt_pool_s *)mallocz(sizeof(struct stmt_pool_s));
+    if (!thread_stmt_pool)
+        fatal("Failed to allocate memory for statement pool");
+
+    thread_stmt_pool->count = 0;
+    thread_stmt_pool->thread_id = gettid_cached();
+    thread_stmt_pool->name = strdupz(nd_thread_tag());
+    memset(thread_stmt_pool->stmt, 0, sizeof(void *) * MAX_PREPARED_THREAD_STATEMENTS);
+
+    // Add it to the JudyL array
+    spinlock_lock(&JudyL_thread_stmt_lock);
+    Pvoid_t *Pvalue = JudyLIns(&JudyL_thread_stmt_pool, (Word_t)thread_stmt_pool->thread_id, PJE0);
+    if (!Pvalue || Pvalue == PJERR)
+        fatal("Failed to allocate memory for JudyL thread statement pool");
+    struct stmt_pool_s *old_pool = *Pvalue;
+    fatal_assert(old_pool == NULL);
+    *Pvalue = thread_stmt_pool;
+    spinlock_unlock(&JudyL_thread_stmt_lock);
 }
 
 int prepare_statement(sqlite3 *database, const char *query, sqlite3_stmt **statement)
 {
-    static __thread uint32_t keys_used = 0;
-
-    pthread_key_t *key = NULL;
-    int ret = 1;
-
-    if (likely(keys_used < MAX_PREPARED_STATEMENTS))
-        key = &key_pool[keys_used++];
+    if (__atomic_load_n(&sqlite_databases_closed, __ATOMIC_ACQUIRE))
+        return SQLITE_MISUSE;
 
     int rc = sqlite3_prepare_v2(database, query, -1, statement, 0);
     if (rc == SQLITE_OK) {
-        if (key)
-            ret = pthread_setspecific(*key, *statement);
-        if (ret)
-            add_stmt_to_list(*statement);
+        if (!thread_stmt_pool)
+            init_thread_stmt_pool();
+        int stmt_key = __atomic_fetch_add(&thread_stmt_pool->count, 1, __ATOMIC_RELAXED);
+        if (stmt_key < MAX_PREPARED_THREAD_STATEMENTS)
+            thread_stmt_pool->stmt[stmt_key] = *statement;
     }
     return rc;
 }
@@ -252,10 +308,14 @@ int init_database_batch(sqlite3 *database, const char *batch[], const char *desc
 
 // Return 0 OK
 // Return 1 Failed
-int db_execute(sqlite3 *db, const char *cmd)
+// sqlite_rc - if not NULL, it will be set to the return code of the sqlite3_exec_monitored call
+int db_execute(sqlite3 *db, const char *cmd, int *sqlite_rc)
 {
     int rc;
     int cnt = 0;
+
+    if (unlikely(!db))
+        return 1;
 
     while (cnt < SQL_MAX_RETRY) {
         char *err_msg = NULL;
@@ -264,7 +324,7 @@ int db_execute(sqlite3 *db, const char *cmd)
             break;
 
         ++cnt;
-        error_report("Failed to execute '%s', rc = %d (%s) -- attempt %d", cmd, rc, err_msg ? err_msg : "unknown", cnt);
+        nd_log_daemon(NDLP_WARNING, "Failed to execute '%s', rc = %d (%s) -- attempt %d", cmd, rc, err_msg ? err_msg : "unknown", cnt);
         if (err_msg) {
             sqlite3_free(err_msg);
         }
@@ -278,6 +338,9 @@ int db_execute(sqlite3 *db, const char *cmd)
             mark_database_to_recover(NULL, db, rc);
         break;
     }
+    if (sqlite_rc)
+        *sqlite_rc = rc;
+
     return (rc != SQLITE_OK);
 }
 
@@ -350,7 +413,7 @@ void sql_close_database(sqlite3 *database, const char *database_name)
     if (unlikely(!database))
         return;
 
-    (void) db_execute(database, "PRAGMA optimize");
+    (void)db_execute(database, "PRAGMA optimize", NULL);
 
     netdata_log_info("%s: Closing sqlite database", database_name);
 
@@ -377,10 +440,20 @@ extern sqlite3 *db_context_meta;
 
 void sqlite_close_databases(void)
 {
-    add_stmt_to_list(NULL);
+    // In case we have statements in the main thread (we should not)
+    finalize_self_prepared_sql_statements();
+
+    __atomic_store_n(&sqlite_databases_closed, true, __ATOMIC_RELEASE);
+
+    spinlock_lock(&sqlite_spinlock);
+
+    // Finalize pending statements and report any thread that failed
+    // to do it properly
+    finalize_all_prepared_sql_statements();
 
     sql_close_database(db_context_meta, "CONTEXT");
     sql_close_database(db_meta, "METADATA");
+    spinlock_unlock(&sqlite_spinlock);
 }
 
 uint64_t get_total_database_space(void)
@@ -404,7 +477,7 @@ uint64_t get_total_database_space(void)
 
 int sqlite_library_init(void)
 {
-    initialize_thread_key_pool();
+    spinlock_lock(&sqlite_spinlock);
 
     int rc = sqlite3_initialize();
     if (rc == SQLITE_OK) {
@@ -424,11 +497,12 @@ int sqlite_library_init(void)
         nd_log_daemon(
             NDLP_INFO, "SQLITE: heap memory hard limit %s, soft limit %s", sqlite_hard_limit_mb, sqlite_soft_limit_mb);
     }
+    __atomic_store_n(&sqlite_databases_closed, false, __ATOMIC_RELEASE);
+    sqlite_library_initialized = true;
+    spinlock_unlock(&sqlite_spinlock);
 
     return (SQLITE_OK != rc);
 }
-
-SPINLOCK sqlite_spinlock = SPINLOCK_INITIALIZER;
 
 int sqlite_release_memory(int bytes)
 {
@@ -445,6 +519,11 @@ void sqlite_library_shutdown(void)
     } while (bytes);
 #endif
     spinlock_lock(&sqlite_spinlock);
+    if (!sqlite_library_initialized) {
+        spinlock_unlock(&sqlite_spinlock);
+        return;
+    }
+    sqlite_library_initialized = false;
     (void) sqlite3_shutdown();
     spinlock_unlock(&sqlite_spinlock);
 }

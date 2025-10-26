@@ -428,7 +428,9 @@ int become_daemon(int dont_fork, const char *user) {
         // the child
         gettid_uncached();
         nd_initialize_signals(false);
-        capture_stack_trace_flush();
+#ifdef HAVE_LIBBACKTRACE
+        stacktrace_flush();
+#endif
 
         // become session leader
         if (setsid() < 0) {
@@ -451,7 +453,9 @@ int become_daemon(int dont_fork, const char *user) {
         // the child
         gettid_uncached();
         nd_initialize_signals(false);
-        capture_stack_trace_flush();
+#ifdef HAVE_LIBBACKTRACE
+        stacktrace_flush();
+#endif
     }
 
     // generate our pid file
@@ -488,10 +492,10 @@ int become_daemon(int dont_fork, const char *user) {
     if(user && *user) {
         daemon_status_file_startup_step("startup(become daemon - user)");
         if(become_user(user, pidfd) != 0) {
-            netdata_log_error("Cannot become user '%s'. Continuing as we are.", user);
+            netdata_log_error("Cannot switch to user '%s'. Continuing with current privileges.", user);
         }
         else
-            netdata_log_debug(D_SYSTEM, "Successfully became user '%s'.", user);
+            netdata_log_info("Successfully switched to user '%s'.", user);
     }
     else {
         daemon_status_file_startup_step("startup(become daemon - dirs)");

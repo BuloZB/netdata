@@ -7,8 +7,10 @@ extends:
   - _hp-compaq-health.yaml
   - _hp-driver-stats.yaml
 
-sysobjectid:
-  - 1.3.6.1.4.1.232.9.4.*     # HP iLO
+selector:
+  - sysobjectid:
+      include:
+        - 1.3.6.1.4.1.232.9.4.*     # HP iLO
 
 metadata:
   device:
@@ -16,157 +18,256 @@ metadata:
       product_name:
         value: Integrated Lights-Out
       type:
-        value: "server"
+        value: "Server"
+
+# - CPQSM2-MIB
+#   https://mibbrowser.online/mibdb_search.php?mib=CPQSM2-MIB
+#   https://github.com/DanielleHuisman/observium-community-edition/blob/main/mibs/hp/CPQSM2-MIB
+# - CPQNIC-MIB
+#   https://mibbrowser.online/mibdb_search.php?mib=CPQNIC-MIB
+#   https://github.com/DanielleHuisman/observium-community-edition/blob/main/mibs/hp/CPQSM2-MIB
 
 metrics:
-  # iLO controller metrics.
-
-  - # Power state.
-    # NOTE: unknown(1), poweredOff(2), poweredOn(3), insufficientPowerOrPowerOnDenied(4)
-    MIB: CPQSM2-MIB
+  - MIB: CPQSM2-MIB
     symbol:
       OID: 1.3.6.1.4.1.232.9.2.2.32.0
       name: cpqSm2CntlrServerPowerState
+      chart_meta:
+        description: Power state of the server
+        family: 'Hardware/Server/Power/Status'
+        unit: "{status}"
+      mapping:
+        1: unknown
+        2: poweredOff
+        3: poweredOn
+        4: insufficientPowerOrPowerOnDenied
 
-  - # Status of battery.
-    # NOTE: other(1), batteryOk(2), batteryFailed(3), batteryDisconnected(4)
-    MIB: CPQSM2-MIB
+  - MIB: CPQSM2-MIB
     symbol:
       OID: 1.3.6.1.4.1.232.9.2.2.5.0
       name: cpqSm2CntlrBatteryStatus
+      chart_meta:
+        description: Status of the battery
+        family: 'Hardware/Battery/Status'
+        unit: "{status}"
+      mapping:
+        1: other
+        2: batteryOk
+        3: batteryFailed
+        4: batteryDisconnected
 
-  - # Charge level of battery.
-    MIB: CPQSM2-MIB
+  - MIB: CPQSM2-MIB
     symbol:
       OID: 1.3.6.1.4.1.232.9.2.2.6.0
       name: cpqSm2CntlrBatteryPercentCharged
+      chart_meta:
+        description: Charge level of the battery
+        family: 'Hardware/Battery/Charge'
+        unit: "%"
 
-  - # A bitmap of self-test errors.
-    # NOTE: 0 indicates that no errors have occurred.
-    MIB: CPQSM2-MIB
-    symbol:
-      OID: 1.3.6.1.4.1.232.9.2.2.9.0
-      name: cpqSm2CntlrSelfTestErrors
-
-  - # Whether a remote session is active.
+    # Whether a remote session is active.
     # NOTE: other(1), active(2), inactive(3)
-    MIB: CPQSM2-MIB
+  - MIB: CPQSM2-MIB
     symbol:
       OID: 1.3.6.1.4.1.232.9.2.2.16.0
       name: cpqSm2CntlrRemoteSessionStatus
+      chart_meta:
+        description: Status of remote session activity
+        family: 'System/RemoteSession/Status'
+        unit: "{status}"
+      mapping:
+        1: other
+        2: active
+        3: inactive
 
-  - # Status of the remote interface.
-    # NOTE: other(1), ok(2), notResponding(3)
-    MIB: CPQSM2-MIB
+  - MIB: CPQSM2-MIB
     symbol:
       OID: 1.3.6.1.4.1.232.9.2.2.17.0
       name: cpqSm2CntlrInterfaceStatus
+      chart_meta:
+        description: Status of the remote interface
+        family: 'System/RemoteInterface/Status'
+        unit: "{status}"
+      mapping:
+        1: other
+        2: ok
+        3: notResponding
 
-  # Event log.
+    # Event log.
 
-  - # Number of entries in the event log.
-    MIB: CPQSM2-MIB
+  - MIB: CPQSM2-MIB
     symbol:
       OID: 1.3.6.1.4.1.232.9.2.3.1.0
       name: cpqSm2EventTotalEntries
+      chart_meta:
+        description: Number of entries in the event log
+        family: 'System/EventLog/Entry/Count'
+        unit: "{entry}"
 
-  # Network interfaces and traffic.
+    # Network interfaces and traffic.
 
-  - # Network interface card statistics.
-    MIB: CPQSM2-MIB
+    # Network interface card statistics.
+  - MIB: CPQSM2-MIB
     table:
       OID: 1.3.6.1.4.1.232.9.2.5.2
       name: cpqSm2NicStatsTable
     symbols:
       - OID: 1.3.6.1.4.1.232.9.2.5.2.1.2
         name: cpqSm2NicXmitBytes
+        scale_factor: 8
+        chart_meta:
+          description: Number of bytes transmitted by the network interface controller
+          family: 'Network/Interface/Traffic/Total/Out'
+          unit: "bit/s"
       - OID: 1.3.6.1.4.1.232.9.2.5.2.1.3
         name: cpqSm2NicXmitTotalPackets
+        chart_meta:
+          description: Total number of packets transmitted by the network interface controller
+          family: 'Network/Interface/Packet/Total/Out'
+          unit: "{packet}/s"
       - OID: 1.3.6.1.4.1.232.9.2.5.2.1.6
         name: cpqSm2NicXmitDiscardPackets
+        chart_meta:
+          description: Total number of discarded packets transmitted by the network interface controller
+          family: 'Network/Interface/Discard/Out'
+          unit: "{packet}/s"
       - OID: 1.3.6.1.4.1.232.9.2.5.2.1.7
         name: cpqSm2NicXmitErrorPackets
+        chart_meta:
+          description: Total number of error packets transmitted by the network interface controller
+          family: 'Network/Interface/Error/Total/Out'
+          unit: "{packet}/s"
       - OID: 1.3.6.1.4.1.232.9.2.5.2.1.8
         name: cpqSm2NicXmitQueueLength
+        chart_meta:
+          description: Number of outstanding packets in the transmit queue
+          family: 'Network/Interface/Queue/Transmit'
+          unit: "{packet}"
       - OID: 1.3.6.1.4.1.232.9.2.5.2.1.9
         name: cpqSm2NicRecvBytes
+        scale_factor: 8
+        chart_meta:
+          description: Number of bytes received by the network interface controller
+          family: 'Network/Interface/Traffic/Total/In'
+          unit: "bit/s"
       - OID: 1.3.6.1.4.1.232.9.2.5.2.1.10
         name: cpqSm2NicRecvTotalPackets
+        chart_meta:
+          description: Total number of packets received by the network interface controller
+          family: 'Network/Interface/Packet/Total/In'
+          unit: "{packet}/s"
       - OID: 1.3.6.1.4.1.232.9.2.5.2.1.13
         name: cpqSm2NicRecvDiscardPackets
+        chart_meta:
+          description: Total number of discarded packets received by the network interface controller
+          family: 'Network/Interface/Discard/In'
+          unit: "{packet}/s"
       - OID: 1.3.6.1.4.1.232.9.2.5.2.1.14
         name: cpqSm2NicRecvErrorPackets
+        chart_meta:
+          description: Total number of error packets received by the network interface controller
+          family: 'Network/Interface/Error/Total/In'
+          unit: "{packet}/s"
       - OID: 1.3.6.1.4.1.232.9.2.5.2.1.15
         name: cpqSm2NicRecvUnknownPackets
-    metric_type: monotonic_count # Sent as Counter (would be ingested as rates if not forced).
+        chart_meta:
+          description: Number of unknown protocol packets received by the network interface controller
+          family: 'Network/Interface/Packet/Unknown/In'
+          unit: "{packet}/s"
     metric_tags:
-      - # Location of the controller (embedded controller vs. PC card).
-        # NOTE: other(1), embedded(2), pcmcia(3)
-        tag: nic_stats_location
+      - tag: nic_index
+        index: 1
+      - tag: nic_stats_location
         symbol:
           OID: 1.3.6.1.4.1.232.9.2.5.2.1.1
           name: cpqSm2NicStatsLocation
+          mapping:
+            1: other
+            2: embedded
+            3: pcmcia
 
-  - # Network physical adapters statistics (counts).
-    MIB: CPQNIC-MIB
+    # Network physical adapters statistics (counts).
+  - MIB: CPQNIC-MIB
     table:
       OID: 1.3.6.1.4.1.232.18.2.3.1
       name: cpqNicIfPhysAdapterTable
     symbols:
-      - # Number of frames successfully transmitted.
-        OID: 1.3.6.1.4.1.232.18.2.3.1.1.16
+      # Number of frames successfully transmitted.
+      - OID: 1.3.6.1.4.1.232.18.2.3.1.1.16
         name: cpqNicIfPhysAdapterGoodTransmits
-      - # Number of frames successfully received.
-        OID: 1.3.6.1.4.1.232.18.2.3.1.1.17
+        chart_meta:
+          description: Count of frames successfully transmitted by the physical adapter
+          family: 'Network/Adapter/Frame/Good/Out'
+          unit: "{frame}/s"
+        # Number of frames successfully received.
+      - OID: 1.3.6.1.4.1.232.18.2.3.1.1.17
         name: cpqNicIfPhysAdapterGoodReceives
-      - # Number of frames not transmitted because of an error.
+        chart_meta:
+          description: Count of frames successfully received by the physical adapter
+          family: 'Network/Adapter/Frame/Good/In'
+          unit: "{frame}/s"
+        # Number of frames not transmitted because of an error.
         # NOTE: this is the sum of 4 other metrics. (As a result, we don't submit those 4 metrics.)
         # NOTE: MIB recommends looking at details stats and take action if this counter increments frequently.
-        OID: 1.3.6.1.4.1.232.18.2.3.1.1.18
+      - OID: 1.3.6.1.4.1.232.18.2.3.1.1.18
         name: cpqNicIfPhysAdapterBadTransmits
-      - # Number of frames not received because of an error.
+        chart_meta:
+          description: Count of frames not transmitted due to errors by the physical adapter
+          family: 'Network/Adapter/Frame/Error/Out'
+          unit: "{frame}/s"
+        # Number of frames not received because of an error.
         # NOTE: this is the sum of 4 other metrics. (As a result, we don't submit those 4 metrics.)
         # NOTE: MIB recommends looking at details stats and take action if this counter increments frequently.
-        OID: 1.3.6.1.4.1.232.18.2.3.1.1.19
+      - OID: 1.3.6.1.4.1.232.18.2.3.1.1.19
         name: cpqNicIfPhysAdapterBadReceives
-      - # Number of octets received.
-        OID: 1.3.6.1.4.1.232.18.2.3.1.1.37
+        chart_meta:
+          description: Count of frames not received due to errors by the physical adapter
+          family: 'Network/Adapter/Frame/Error/In'
+          unit: "{frame}/s"
+        # Number of octets received.
+      - OID: 1.3.6.1.4.1.232.18.2.3.1.1.37
         name: cpqNicIfPhysAdapterInOctets
-      - # Number of octets sent.
-        OID: 1.3.6.1.4.1.232.18.2.3.1.1.38
+        scale_factor: 8
+        chart_meta:
+          description: Count of octets received on the physical adapter
+          family: 'Network/Adapter/Traffic/Total/In'
+          unit: "bit/s"
+        # Number of octets sent.
+      - OID: 1.3.6.1.4.1.232.18.2.3.1.1.38
         name: cpqNicIfPhysAdapterOutOctets
-    metric_type: monotonic_count  # Sent as Counters (not forcing would make us ingest them as rates).
-    metric_tags:
-      - tag: interface
-        symbol:
-          OID: 1.3.6.1.4.1.232.18.2.3.1.1.39
-          name: cpqNicIfPhysAdapterName
-
-  - # Network physical adapters statistics (rates).
-    MIB: CPQNIC-MIB
-    table:
-      OID: 1.3.6.1.4.1.232.18.2.3.1
-      name: cpqNicIfPhysAdapterTable
-    symbols:
-      - # Estimate of current bandwidth in bps.
-        # NOTE: this is zero if the value exceeds 4Gbps.
-        OID: 1.3.6.1.4.1.232.18.2.3.1.1.33
+        scale_factor: 8
+        chart_meta:
+          description: Count of octets sent on the physical adapter
+          family: 'Network/Adapter/Traffic/Total/Out'
+          unit: "bit/s"
+      - OID: 1.3.6.1.4.1.232.18.2.3.1.1.33
         name: cpqNicIfPhysAdapterSpeed
-      - # Estimate of current bandwidth in Mbps.
-        OID: 1.3.6.1.4.1.232.18.2.3.1.1.36
-        name: cpqNicIfPhysAdapterSpeedMbps
-    # NOTE: no 'metric_type', as these are correctly sent as gauges.
+        chart_meta:
+          description: Estimate of the interface's current bandwidth in bits per second
+          family: 'Network/Adapter/Speed'
+          unit: "bit/s"
     metric_tags:
-      - tag: interface
+      - tag: adapter_index
+        symbol:
+          OID: 1.3.6.1.4.1.232.18.2.3.1.1.1
+          name: cpqNicIfPhysAdapterIndex
+      - tag: adapter
         symbol:
           OID: 1.3.6.1.4.1.232.18.2.3.1.1.39
           name: cpqNicIfPhysAdapterName
 
-  # Miscellaneous.
 
-  - # Virus activity detection.
-    # NOTE: notDetected(1), detected(2)
-    MIB: CPQNIC-MIB
+    # Miscellaneous.
+
+    # Virus activity detection.
+  - MIB: CPQNIC-MIB
     symbol:
       OID: 1.3.6.1.4.1.232.18.2.5.3.0
       name: cpqNicVtVirusActivity
+      chart_meta:
+        description: Virus activity detection status
+        family: 'System/Security/VirusDetection/Status'
+        unit: "{status}"
+      mapping:
+        1: notDetected
+        2: detected

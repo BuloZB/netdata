@@ -603,7 +603,7 @@ static inline int am_i_running_as_root() {
     return 0;
 }
 
-#ifdef HAVE_SYS_CAPABILITY_H
+#ifdef HAVE_CAPABILITY
 static inline int check_capabilities() {
     cap_t caps = cap_get_proc();
     if(!caps) {
@@ -654,7 +654,15 @@ static inline int check_capabilities() {
 #endif
 #endif
 
-netdata_mutex_t apps_and_stdout_mutex = NETDATA_MUTEX_INITIALIZER;
+netdata_mutex_t apps_and_stdout_mutex;
+
+static void __attribute__((constructor)) init_mutex(void) {
+    netdata_mutex_init(&apps_and_stdout_mutex);
+}
+
+static void __attribute__((destructor)) destroy_mutex(void) {
+    netdata_mutex_destroy(&apps_and_stdout_mutex);
+}
 
 static bool apps_plugin_exit = false;
 
@@ -710,7 +718,7 @@ int main(int argc, char **argv) {
 #if !defined(OS_WINDOWS)
     if(!check_capabilities() && !am_i_running_as_root() && !check_proc_1_io()) {
         uid_t uid = getuid(), euid = geteuid();
-#ifdef HAVE_SYS_CAPABILITY_H
+#ifdef HAVE_CAPABILITY
         netdata_log_error("apps.plugin should either run as root (now running with uid %u, euid %u) or have special capabilities. "
                           "Without these, apps.plugin cannot report disk I/O utilization of other processes. "
                           "To enable capabilities run: sudo setcap cap_dac_read_search,cap_sys_ptrace+ep %s; "
@@ -815,14 +823,14 @@ int main(int argc, char **argv) {
 
 #if (PROCESSES_HAVE_UID == 1)
         if (enable_users_charts) {
-            send_charts_updates_to_netdata(users_root_target, "user", "user", "User Processes");
+            send_charts_updates_to_netdata(users_root_target, "user", "user", "User");
             send_collected_data_to_netdata(users_root_target, "user", dt);
         }
 #endif
 
 #if (PROCESSES_HAVE_GID == 1)
         if (enable_groups_charts) {
-            send_charts_updates_to_netdata(groups_root_target, "usergroup", "user_group", "User Group Processes");
+            send_charts_updates_to_netdata(groups_root_target, "usergroup", "user_group", "User Group");
             send_collected_data_to_netdata(groups_root_target, "usergroup", dt);
         }
 #endif

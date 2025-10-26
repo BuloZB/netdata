@@ -152,6 +152,7 @@ void health_plugin_init(void) {
 
     health_globals.initialization.done = true;
 
+    health_alarm_entry_aral_init();
     health_init_prototypes();
     health_load_config_defaults();
 
@@ -166,7 +167,36 @@ cleanup:
 }
 
 void health_plugin_destroy(void) {
-    ;
+    if(!health_globals.initialization.done)
+        return;
+
+    spinlock_lock(&health_globals.initialization.spinlock);
+
+    // Clean up health prototypes dictionary
+    if(health_globals.prototypes.dict) {
+        dictionary_destroy(health_globals.prototypes.dict);
+        health_globals.prototypes.dict = NULL;
+    }
+
+    // Free allocated strings
+    string_freez(health_globals.config.default_exec);
+    string_freez(health_globals.config.default_recipient);
+    string_freez(health_globals.config.silencers_filename);
+    
+    // Free the enabled_alerts pattern
+    simple_pattern_free(health_globals.config.enabled_alerts);
+
+    // Reset pointers to NULL
+    health_globals.config.default_exec = NULL;
+    health_globals.config.default_recipient = NULL;
+    health_globals.config.silencers_filename = NULL;
+    health_globals.config.enabled_alerts = NULL;
+
+    alert_variable_lookup_cleanup();
+
+    health_globals.initialization.done = false;
+
+    spinlock_unlock(&health_globals.initialization.spinlock);
 }
 
 void health_plugin_reload(void) {

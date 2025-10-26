@@ -9,10 +9,10 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/netdata/netdata/go/plugins/pkg/confopt"
+	"github.com/netdata/netdata/go/plugins/pkg/prometheus"
+	"github.com/netdata/netdata/go/plugins/pkg/web"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/confopt"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/prometheus"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/web"
 )
 
 //go:embed "config_schema.json"
@@ -35,14 +35,14 @@ func New() *Collector {
 		Config: Config{
 			HTTPConfig: web.HTTPConfig{
 				RequestConfig: web.RequestConfig{
-					URL:     "http://127.0.0.1:10255/metrics",
-					Headers: make(map[string]string),
+					URL:             "http://127.0.0.1:10255/metrics",
+					Headers:         make(map[string]string),
+					BearerTokenFile: "/var/run/secrets/kubernetes.io/serviceaccount/token",
 				},
 				ClientConfig: web.ClientConfig{
 					Timeout: confopt.Duration(time.Second),
 				},
 			},
-			TokenPath: "/var/run/secrets/kubernetes.io/serviceaccount/token",
 		},
 
 		charts:             charts.Copy(),
@@ -51,10 +51,10 @@ func New() *Collector {
 }
 
 type Config struct {
-	Vnode          string `yaml:"vnode,omitempty" json:"vnode"`
-	UpdateEvery    int    `yaml:"update_every,omitempty" json:"update_every"`
-	web.HTTPConfig `yaml:",inline" json:""`
-	TokenPath      string `yaml:"token_path,omitempty" json:"token_path"`
+	Vnode              string `yaml:"vnode,omitempty" json:"vnode"`
+	UpdateEvery        int    `yaml:"update_every,omitempty" json:"update_every"`
+	AutoDetectionRetry int    `yaml:"autodetection_retry,omitempty" json:"autodetection_retry"`
+	web.HTTPConfig     `yaml:",inline" json:""`
 }
 
 type Collector struct {
@@ -82,10 +82,6 @@ func (c *Collector) Init(context.Context) error {
 		return fmt.Errorf("init prometheus client: %v", err)
 	}
 	c.prom = prom
-
-	if tok := c.initAuthToken(); tok != "" {
-		c.RequestConfig.Headers["Authorization"] = "Bearer " + tok
-	}
 
 	return nil
 }

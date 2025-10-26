@@ -8,29 +8,37 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
+	"gopkg.in/yaml.v2"
+
 	"github.com/netdata/netdata/go/plugins/logger"
+	"github.com/netdata/netdata/go/plugins/pkg/executable"
 	"github.com/netdata/netdata/go/plugins/pkg/netdataapi"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/confgroup"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/functions"
-
-	"gopkg.in/yaml.v2"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
 )
 
 const (
-	dyncfgCollectorIDPrefix = "go.d:collector:"
-	dyncfgCollectorPath     = "/collectors/jobs"
+	dyncfgCollectorPrefixf = "%s:collector:"
+	dyncfgCollectorPath    = "/collectors/%s/Jobs"
 )
 
-func dyncfgModID(name string) string {
-	return fmt.Sprintf("%s%s", dyncfgCollectorIDPrefix, name)
+func (m *Manager) dyncfgCollectorPrefixValue() string {
+	return fmt.Sprintf(dyncfgCollectorPrefixf, executable.Name)
 }
-func dyncfgJobID(cfg confgroup.Config) string {
-	return fmt.Sprintf("%s%s:%s", dyncfgCollectorIDPrefix, cfg.Module(), cfg.Name())
+
+func (m *Manager) dyncfgModID(name string) string {
+	return fmt.Sprintf("%s%s", m.dyncfgCollectorPrefixValue(), name)
+}
+
+func (m *Manager) dyncfgJobID(cfg confgroup.Config) string {
+	return fmt.Sprintf("%s%s:%s", m.dyncfgCollectorPrefixValue(), cfg.Module(), cfg.Name())
 }
 
 func dyncfgModCmds() string {
@@ -46,10 +54,10 @@ func dyncfgJobCmds(cfg confgroup.Config) string {
 
 func (m *Manager) dyncfgCollectorModuleCreate(name string) {
 	m.api.CONFIGCREATE(netdataapi.ConfigOpts{
-		ID:                dyncfgModID(name),
+		ID:                m.dyncfgModID(name),
 		Status:            dyncfgAccepted.String(),
 		ConfigType:        "template",
-		Path:              dyncfgCollectorPath,
+		Path:              fmt.Sprintf(dyncfgCollectorPath, executable.Name),
 		SourceType:        "internal",
 		Source:            "internal",
 		SupportedCommands: dyncfgModCmds(),
@@ -58,10 +66,10 @@ func (m *Manager) dyncfgCollectorModuleCreate(name string) {
 
 func (m *Manager) dyncfgCollectorJobCreate(cfg confgroup.Config, status dyncfgStatus) {
 	m.api.CONFIGCREATE(netdataapi.ConfigOpts{
-		ID:                dyncfgJobID(cfg),
+		ID:                m.dyncfgJobID(cfg),
 		Status:            status.String(),
 		ConfigType:        "job",
-		Path:              dyncfgCollectorPath,
+		Path:              fmt.Sprintf(dyncfgCollectorPath, executable.Name),
 		SourceType:        cfg.SourceType(),
 		Source:            cfg.Source(),
 		SupportedCommands: dyncfgJobCmds(cfg),
@@ -69,11 +77,11 @@ func (m *Manager) dyncfgCollectorJobCreate(cfg confgroup.Config, status dyncfgSt
 }
 
 func (m *Manager) dyncfgJobRemove(cfg confgroup.Config) {
-	m.api.CONFIGDELETE(dyncfgJobID(cfg))
+	m.api.CONFIGDELETE(m.dyncfgJobID(cfg))
 }
 
 func (m *Manager) dyncfgJobStatus(cfg confgroup.Config, status dyncfgStatus) {
-	m.api.CONFIGSTATUS(dyncfgJobID(cfg), status.String())
+	m.api.CONFIGSTATUS(m.dyncfgJobID(cfg), status.String())
 }
 
 func (m *Manager) dyncfgCollectorExec(fn functions.Function) {
@@ -133,7 +141,7 @@ func (m *Manager) dyncfgConfigUserconfig(fn functions.Function) {
 		jn = fn.Args[2]
 	}
 
-	mn, ok := extractModuleName(id)
+	mn, ok := m.extractModuleName(id)
 	if !ok {
 		m.Warningf("dyncfg: userconfig: could not extract module and job from id (%s)", id)
 		m.dyncfgRespf(fn, 400,
@@ -165,7 +173,7 @@ func (m *Manager) dyncfgConfigUserconfig(fn functions.Function) {
 
 func (m *Manager) dyncfgConfigTest(fn functions.Function) {
 	id := fn.Args[0]
-	mn, ok := extractModuleName(id)
+	mn, ok := m.extractModuleName(id)
 	if !ok {
 		m.Warningf("dyncfg: test: could not extract module and job from id (%s)", id)
 		m.dyncfgRespf(fn, 400,
@@ -240,7 +248,7 @@ func (m *Manager) dyncfgConfigTest(fn functions.Function) {
 
 func (m *Manager) dyncfgConfigSchema(fn functions.Function) {
 	id := fn.Args[0]
-	mn, ok := extractModuleName(id)
+	mn, ok := m.extractModuleName(id)
 	if !ok {
 		m.Warningf("dyncfg: schema: could not extract module from id (%s)", id)
 		m.dyncfgRespf(fn, 400, "Invalid ID format. Could not extract module name from ID. Provided ID: %s.", id)
@@ -267,7 +275,7 @@ func (m *Manager) dyncfgConfigSchema(fn functions.Function) {
 
 func (m *Manager) dyncfgConfigGet(fn functions.Function) {
 	id := fn.Args[0]
-	mn, jn, ok := extractModuleJobName(id)
+	mn, jn, ok := m.extractModuleJobName(id)
 	if !ok {
 		m.Warningf("dyncfg: get: could not extract module and job from id (%s)", id)
 		m.dyncfgRespf(fn, 400,
@@ -318,7 +326,7 @@ func (m *Manager) dyncfgConfigGet(fn functions.Function) {
 
 func (m *Manager) dyncfgConfigRestart(fn functions.Function) {
 	id := fn.Args[0]
-	mn, jn, ok := extractModuleJobName(id)
+	mn, jn, ok := m.extractModuleJobName(id)
 	if !ok {
 		m.Warningf("dyncfg: restart: could not extract module from id (%s)", id)
 		m.dyncfgRespf(fn, 400, "Invalid ID format. Could not extract module name from ID. Provided ID: %s.", id)
@@ -352,6 +360,8 @@ func (m *Manager) dyncfgConfigRestart(fn functions.Function) {
 	default:
 	}
 
+	m.retryingTasks.remove(ecfg.cfg)
+
 	m.Infof("dyncfg: restart: %s/%s job by user '%s'", mn, jn, getFnSourceValue(fn, "user"))
 
 	if err := job.AutoDetection(); err != nil {
@@ -359,6 +369,7 @@ func (m *Manager) dyncfgConfigRestart(fn functions.Function) {
 		ecfg.status = dyncfgFailed
 		m.dyncfgRespf(fn, 422, "Job restart failed: %v", err)
 		m.dyncfgJobStatus(ecfg.cfg, ecfg.status)
+		m.runRetryTask(ecfg, job)
 		return
 	}
 
@@ -374,7 +385,7 @@ func (m *Manager) dyncfgConfigRestart(fn functions.Function) {
 
 func (m *Manager) dyncfgConfigEnable(fn functions.Function) {
 	id := fn.Args[0]
-	mn, jn, ok := extractModuleJobName(id)
+	mn, jn, ok := m.extractModuleJobName(id)
 	if !ok {
 		m.Warningf("dyncfg: enable: could not extract module and job from id (%s)", id)
 		m.dyncfgRespf(fn, 400, "Invalid ID format. Could not extract module and job name from ID. Provided ID: %s.", id)
@@ -419,6 +430,8 @@ func (m *Manager) dyncfgConfigEnable(fn functions.Function) {
 		m.Infof("dyncfg: enable: %s/%s job by user '%s'", mn, jn, getFnSourceValue(fn, "user"))
 	}
 
+	m.retryingTasks.remove(ecfg.cfg)
+
 	if err := job.AutoDetection(); err != nil {
 		job.Cleanup()
 		ecfg.status = dyncfgFailed
@@ -431,14 +444,7 @@ func (m *Manager) dyncfgConfigEnable(fn functions.Function) {
 			m.dyncfgJobStatus(ecfg.cfg, ecfg.status)
 		}
 
-		if job.RetryAutoDetection() && !isDyncfg(ecfg.cfg) {
-			m.Infof("%s[%s] job detection failed, will retry in %d seconds",
-				ecfg.cfg.Module(), ecfg.cfg.Name(), job.AutoDetectionEvery())
-
-			ctx, cancel := context.WithCancel(m.ctx)
-			m.retryingTasks.add(ecfg.cfg, &retryTask{cancel: cancel})
-			go runRetryTask(ctx, m.addCh, ecfg.cfg)
-		}
+		m.runRetryTask(ecfg, job)
 		return
 	}
 
@@ -456,7 +462,7 @@ func (m *Manager) dyncfgConfigEnable(fn functions.Function) {
 
 func (m *Manager) dyncfgConfigDisable(fn functions.Function) {
 	id := fn.Args[0]
-	mn, jn, ok := extractModuleJobName(id)
+	mn, jn, ok := m.extractModuleJobName(id)
 	if !ok {
 		m.Warningf("dyncfg: disable: could not extract module from id (%s)", id)
 		m.dyncfgRespf(fn, 400, "Invalid ID format. Could not extract module name from ID. Provided ID: %s.", id)
@@ -487,6 +493,8 @@ func (m *Manager) dyncfgConfigDisable(fn functions.Function) {
 	default:
 	}
 
+	m.retryingTasks.remove(ecfg.cfg)
+
 	m.Infof("dyncfg: disable: %s/%s job by user '%s'", mn, jn, getFnSourceValue(fn, "user"))
 
 	ecfg.status = dyncfgDisabled
@@ -503,7 +511,7 @@ func (m *Manager) dyncfgConfigAdd(fn functions.Function) {
 
 	id := fn.Args[0]
 	jn := fn.Args[2]
-	mn, ok := extractModuleName(id)
+	mn, ok := m.extractModuleName(id)
 	if !ok {
 		m.Warningf("dyncfg: add: could not extract module from id (%s)", id)
 		m.dyncfgRespf(fn, 400, "Invalid ID format. Could not extract module name from ID. Provided ID: %s.", id)
@@ -544,6 +552,7 @@ func (m *Manager) dyncfgConfigAdd(fn functions.Function) {
 			m.seenConfigs.remove(ecfg.cfg)
 		}
 		m.exposedConfigs.remove(ecfg.cfg)
+		m.retryingTasks.remove(ecfg.cfg)
 		m.stopRunningJob(ecfg.cfg.FullName())
 	}
 
@@ -558,7 +567,7 @@ func (m *Manager) dyncfgConfigAdd(fn functions.Function) {
 
 func (m *Manager) dyncfgConfigRemove(fn functions.Function) {
 	id := fn.Args[0]
-	mn, jn, ok := extractModuleJobName(id)
+	mn, jn, ok := m.extractModuleJobName(id)
 	if !ok {
 		m.Warningf("dyncfg: remove: could not extract module and job from id (%s)", id)
 		m.dyncfgRespf(fn, 400, "Invalid ID format. Could not extract module and job name from ID. Provided ID: %s.", id)
@@ -580,6 +589,7 @@ func (m *Manager) dyncfgConfigRemove(fn functions.Function) {
 
 	m.Infof("dyncfg: remove: %s/%s job by user '%s'", mn, jn, getFnSourceValue(fn, "user"))
 
+	m.retryingTasks.remove(ecfg.cfg)
 	m.seenConfigs.remove(ecfg.cfg)
 	m.exposedConfigs.remove(ecfg.cfg)
 	m.stopRunningJob(ecfg.cfg.FullName())
@@ -591,7 +601,7 @@ func (m *Manager) dyncfgConfigRemove(fn functions.Function) {
 
 func (m *Manager) dyncfgConfigUpdate(fn functions.Function) {
 	id := fn.Args[0]
-	mn, jn, ok := extractModuleJobName(id)
+	mn, jn, ok := m.extractModuleJobName(id)
 	if !ok {
 		m.Warningf("dyncfg: update: could not extract module from id (%s)", id)
 		m.dyncfgRespf(fn, 400, "Invalid ID format. Could not extract module name from ID. Provided ID: %s.", id)
@@ -659,11 +669,14 @@ func (m *Manager) dyncfgConfigUpdate(fn functions.Function) {
 		return
 	}
 
+	m.retryingTasks.remove(ecfg.cfg)
+
 	if err := job.AutoDetection(); err != nil {
 		job.Cleanup()
 		scfg.status = dyncfgFailed
 		m.dyncfgRespf(fn, 200, "Job update failed: %v", err)
 		m.dyncfgJobStatus(scfg.cfg, scfg.status)
+		m.runRetryTask(scfg, job)
 		return
 	}
 
@@ -722,6 +735,19 @@ func (m *Manager) dyncfgRespf(fn functions.Function, code int, msgf string, a ..
 	})
 }
 
+func (m *Manager) runRetryTask(ecfg *seenConfig, job *module.Job) {
+	if !job.RetryAutoDetection() {
+		return
+	}
+	m.Infof("%s[%s] job detection failed, will retry in %d seconds",
+		ecfg.cfg.Module(), ecfg.cfg.Name(), job.AutoDetectionEvery())
+
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.retryingTasks.add(ecfg.cfg, &retryTask{cancel: cancel})
+
+	go runRetryTask(ctx, m.addCh, ecfg.cfg)
+}
+
 func userConfigFromPayload(cfg any, jobName string, fn functions.Function) ([]byte, error) {
 	if err := unmarshalPayload(cfg, fn); err != nil {
 		return nil, err
@@ -737,18 +763,15 @@ func userConfigFromPayload(cfg any, jobName string, fn functions.Function) ([]by
 		return nil, err
 	}
 
+	yms = slices.DeleteFunc(yms, func(item yaml.MapItem) bool { return item.Key == "name" })
+
 	yms = append([]yaml.MapItem{{Key: "name", Value: jobName}}, yms...)
 
 	v := map[string]any{
 		"jobs": []any{yms},
 	}
 
-	bs, err = yaml.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-
-	return bs, nil
+	return yaml.Marshal(v)
 }
 
 func configFromPayload(fn functions.Function) (confgroup.Config, error) {
@@ -769,8 +792,8 @@ func configFromPayload(fn functions.Function) (confgroup.Config, error) {
 	return cfg, nil
 }
 
-func extractModuleJobName(id string) (mn string, jn string, ok bool) {
-	if mn, ok = extractModuleName(id); !ok {
+func (m *Manager) extractModuleJobName(id string) (mn string, jn string, ok bool) {
+	if mn, ok = m.extractModuleName(id); !ok {
 		return "", "", false
 	}
 	if jn, ok = extractJobName(id); !ok {
@@ -779,8 +802,8 @@ func extractModuleJobName(id string) (mn string, jn string, ok bool) {
 	return mn, jn, true
 }
 
-func extractModuleName(id string) (string, bool) {
-	id = strings.TrimPrefix(id, dyncfgCollectorIDPrefix)
+func (m *Manager) extractModuleName(id string) (string, bool) {
+	id = strings.TrimPrefix(id, m.dyncfgCollectorPrefixValue())
 	i := strings.IndexByte(id, ':')
 	if i == -1 {
 		return id, id != ""

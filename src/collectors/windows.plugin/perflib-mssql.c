@@ -3,27 +3,98 @@
 #include "windows_plugin.h"
 #include "windows-internals.h"
 
-// https://learn.microsoft.com/en-us/sql/sql-server/install/instance-configuration?view=sql-server-ver16
-#define NETDATA_MAX_INSTANCE_NAME 32
-#define NETDATA_MAX_INSTANCE_OBJECT 128
+#include "perflib-mssql-queries.h"
 
-BOOL is_sqlexpress = FALSE;
+#include <sqlext.h>
+#include <sqltypes.h>
+#include <sql.h>
+
+#define MEGA_FACTOR (1048576) // 1024 * 1024
+// https://learn.microsoft.com/en-us/sql/sql-server/install/instance-configuration?view=sql-server-ver16
+#define NETDATA_MAX_INSTANCE_NAME (32)
+#define NETDATA_MAX_INSTANCE_OBJECT (128)
+// https://learn.microsoft.com/en-us/previous-versions/sql/sql-server-2008-r2/ms191240(v=sql.105)#sysname
+#define SQLSERVER_MAX_NAME_LENGTH NETDATA_MAX_INSTANCE_OBJECT
+#define NETDATA_MSSQL_NEXT_TRY (60)
+
+struct netdata_mssql_conn {
+    const char *instance;
+    const char *driver;
+    const char *server;
+    const char *address;
+    const char *username;
+    const char *password;
+    int instances;
+    bool windows_auth;
+    bool is_sqlexpress;
+
+    SQLCHAR *connectionString;
+
+    SQLHENV netdataSQLEnv;
+    SQLHDBC netdataSQLHDBc;
+
+    SQLHSTMT checkPermSTMT;
+    SQLHSTMT databaseListSTMT;
+    SQLHSTMT dataFileSizeSTMT;
+    SQLHSTMT dbTransactionSTMT;
+    SQLHSTMT dbInstanceTransactionSTMT;
+    SQLHSTMT dbWaitsSTMT;
+    SQLHSTMT dbLocksSTMT;
+    SQLHSTMT dbSQLState;
+    SQLHSTMT dbSQLJobs;
+
+    BOOL is_connected;
+};
+
+DICTIONARY *conn_options;
 
 enum netdata_mssql_metrics {
     NETDATA_MSSQL_GENERAL_STATS,
     NETDATA_MSSQL_SQL_ERRORS,
-    NETDATA_MSSQL_DATABASE,
-    NETDATA_MSSQL_LOCKS,
     NETDATA_MSSQL_MEMORY,
-    NETDATA_MSSQL_BUFFER_MANAGEMENT,
     NETDATA_MSSQL_SQL_STATS,
     NETDATA_MSSQL_ACCESS_METHODS,
+
+    NETDATA_MSSQL_DATABASE,
+    NETDATA_MSSQL_LOCKS,
+    NETDATA_MSSQL_WAITS,
+    NETDATA_MSSQL_BUFFER_MANAGEMENT,
+    NETDATA_MSSQL_JOBS,
 
     NETDATA_MSSQL_METRICS_END
 };
 
+struct mssql_db_waits {
+    const char *wait_type;
+    const char *wait_category;
+
+    RRDSET *st_total_wait;
+    RRDDIM *rd_total_wait;
+
+    RRDSET *st_resource_wait_msec;
+    RRDDIM *rd_resource_wait_msec;
+
+    RRDSET *st_signal_wait_msec;
+    RRDDIM *rd_signal_wait_msec;
+
+    RRDSET *st_max_wait_time_msec;
+    RRDDIM *rd_max_wait_time_msec;
+
+    RRDSET *st_waiting_tasks;
+    RRDDIM *rd_waiting_tasks;
+
+    COUNTER_DATA MSSQLDatabaseTotalWait;
+    COUNTER_DATA MSSQLDatabaseResourceWaitMSec;
+    COUNTER_DATA MSSQLDatabaseSignalWaitMSec;
+    COUNTER_DATA MSSQLDatabaseMaxWaitTimeMSec;
+    COUNTER_DATA MSSQLDatabaseWaitingTasks;
+};
+
 struct mssql_instance {
     char *instanceID;
+    int update_every;
+
+    struct netdata_mssql_conn *conn;
 
     char *objectName[NETDATA_MSSQL_METRICS_END];
 
@@ -42,36 +113,16 @@ struct mssql_instance {
     RRDSET *st_stats_safe_auto;
     RRDDIM *rd_stats_safe_auto;
 
-    RRDSET *st_stats_compilation;
-    RRDDIM *rd_stats_compilation;
-
-    RRDSET *st_stats_recompiles;
-    RRDDIM *rd_stats_recompiles;
-
-    RRDSET *st_buff_cache_hits;
-    RRDDIM *rd_buff_cache_hits;
-
-    RRDSET *st_buff_cache_page_life_expectancy;
-    RRDDIM *rd_buff_cache_page_life_expectancy;
-
-    RRDSET *st_buff_checkpoint_pages;
-    RRDDIM *rd_buff_checkpoint_pages;
-
-    RRDSET *st_buff_page_iops;
-    RRDDIM *rd_buff_page_reads;
-    RRDDIM *rd_buff_page_writes;
-
     RRDSET *st_access_method_page_splits;
     RRDDIM *rd_access_method_page_splits;
 
     RRDSET *st_sql_errors;
     RRDDIM *rd_sql_errors;
 
-    RRDSET *st_lockWait;
-    RRDSET *st_deadLocks;
     DICTIONARY *locks_instances;
 
     DICTIONARY *databases;
+    DICTIONARY *sysjobs;
 
     RRDSET *st_conn_memory;
     RRDDIM *rd_conn_memory;
@@ -85,12 +136,9 @@ struct mssql_instance {
     RRDSET *st_mem_tot_server;
     RRDDIM *rd_mem_tot_server;
 
+    DICTIONARY *waits;
+
     COUNTER_DATA MSSQLAccessMethodPageSplits;
-    COUNTER_DATA MSSQLBufferCacheHits;
-    COUNTER_DATA MSSQLBufferCheckpointPages;
-    COUNTER_DATA MSSQLBufferPageLifeExpectancy;
-    COUNTER_DATA MSSQLBufferPageReads;
-    COUNTER_DATA MSSQLBufferPageWrites;
     COUNTER_DATA MSSQLBlockedProcesses;
     COUNTER_DATA MSSQLUserConnections;
     COUNTER_DATA MSSQLConnectionMemoryBytes;
@@ -101,43 +149,38 @@ struct mssql_instance {
     COUNTER_DATA MSSQLStatsAutoParameterization;
     COUNTER_DATA MSSQLStatsBatchRequests;
     COUNTER_DATA MSSQLStatSafeAutoParameterization;
-    COUNTER_DATA MSSQLCompilations;
-    COUNTER_DATA MSSQLRecompilations;
-};
-
-enum lock_instance_idx {
-    NETDATA_MSSQL_ENUM_MLI_IDX_WAIT,
-    NETDATA_MSSQL_ENUM_MLI_IDX_DEAD_LOCKS,
-
-    NETDATA_MSSQL_ENUM_MLI_IDX_END
 };
 
 struct mssql_lock_instance {
     struct mssql_instance *parent;
 
+    char *resourceID;
+
     COUNTER_DATA lockWait;
     COUNTER_DATA deadLocks;
 
+    RRDSET *st_deadLocks;
     RRDDIM *rd_lockWait;
-    RRDDIM *rd_deadLocks;
 
-    uint32_t updated;
+    RRDSET *st_lockWait;
+    RRDDIM *rd_deadLocks;
 };
 
-enum db_instance_idx {
-    NETDATA_MSSQL_ENUM_MDI_IDX_FILE_SIZE,
-    NETDATA_MSSQL_ENUM_MDI_IDX_ACTIVE_TRANSACTIONS,
-    NETDATA_MSSQL_ENUM_MDI_IDX_BACKUP_RESTORE_OP,
-    NETDATA_MSSQL_ENUM_MDI_IDX_LOG_FLUSHED,
-    NETDATA_MSSQL_ENUM_MDI_IDX_LOG_FLUSHES,
-    NETDATA_MSSQL_ENUM_MDI_IDX_TRANSACTIONS,
-    NETDATA_MSSQL_ENUM_MDI_IDX_WRITE_TRANSACTIONS,
+struct mssql_db_jobs {
+    bool enabled;
 
-    NETDATA_MSSQL_ENUM_MDI_IDX_END
+    RRDSET *st_status;
+    RRDDIM *rd_status_enabled;
+    RRDDIM *rd_status_disabled;
+
+    COUNTER_DATA MSSQLJOBState;
 };
 
 struct mssql_db_instance {
     struct mssql_instance *parent;
+
+    bool collecting_data;
+    bool collect_instance;
 
     RRDSET *st_db_data_file_size;
     RRDSET *st_db_active_transactions;
@@ -146,6 +189,21 @@ struct mssql_db_instance {
     RRDSET *st_db_log_flushes;
     RRDSET *st_db_transactions;
     RRDSET *st_db_write_transactions;
+    RRDSET *st_db_lockwait;
+    RRDSET *st_db_deadlock;
+    RRDSET *st_db_readonly;
+    RRDSET *st_db_state;
+    RRDSET *st_lock_timeouts;
+    RRDSET *st_lock_requests;
+    RRDSET *st_buff_page_iops;
+    RRDSET *st_buff_cache_hits;
+    RRDSET *st_buff_checkpoint_pages;
+    RRDSET *st_buff_cache_page_life_expectancy;
+    RRDSET *st_buff_lazy_write;
+    RRDSET *st_buff_page_lookups;
+
+    RRDSET *st_stats_compilation;
+    RRDSET *st_stats_recompiles;
 
     RRDDIM *rd_db_data_file_size;
     RRDDIM *rd_db_active_transactions;
@@ -154,144 +212,1138 @@ struct mssql_db_instance {
     RRDDIM *rd_db_log_flushes;
     RRDDIM *rd_db_transactions;
     RRDDIM *rd_db_write_transactions;
+    RRDDIM *rd_db_lockwait;
+    RRDDIM *rd_db_deadlock;
+    RRDDIM *rd_db_readonly_yes;
+    RRDDIM *rd_db_readonly_no;
+    RRDDIM *rd_db_state[NETDATA_DB_STATES];
+    RRDDIM *rd_lock_timeouts;
+    RRDDIM *rd_lock_requests;
+    RRDDIM *rd_buff_page_reads;
+    RRDDIM *rd_buff_page_writes;
+    RRDDIM *rd_buff_cache_hits;
+    RRDDIM *rd_buff_checkpoint_pages;
+    RRDDIM *rd_buff_cache_page_life_expectancy;
+    RRDDIM *rd_buff_lazy_write;
+    RRDDIM *rd_buff_page_lookups;
+
+    RRDDIM *rd_stats_compilation;
+    RRDDIM *rd_stats_recompiles;
+
+    COUNTER_DATA MSSQLDatabaseDataFileSize;
 
     COUNTER_DATA MSSQLDatabaseActiveTransactions;
     COUNTER_DATA MSSQLDatabaseBackupRestoreOperations;
-    COUNTER_DATA MSSQLDatabaseDataFileSize;
     COUNTER_DATA MSSQLDatabaseLogFlushed;
     COUNTER_DATA MSSQLDatabaseLogFlushes;
     COUNTER_DATA MSSQLDatabaseTransactions;
     COUNTER_DATA MSSQLDatabaseWriteTransactions;
 
+    COUNTER_DATA MSSQLDatabaseLockWaitSec;
+    COUNTER_DATA MSSQLDatabaseDeadLockSec;
+    COUNTER_DATA MSSQLDatabaseLockTimeoutsSec;
+    COUNTER_DATA MSSQLDatabaseLockRequestsSec;
+
+    // Buffer Management (https://learn.microsoft.com/en-us/sql/relational-databases/performance-monitor/sql-server-buffer-manager-object)
+    COUNTER_DATA MSSQLBufferPageReads;
+    COUNTER_DATA MSSQLBufferPageWrites;
+    COUNTER_DATA MSSQLBufferCacheHits;
+    COUNTER_DATA MSSQLBufferCheckpointPages;
+    COUNTER_DATA MSSQLBufferPageLifeExpectancy;
+    COUNTER_DATA MSSQLBufferLazyWrite;
+    COUNTER_DATA MSSQLBufferPageLookups;
+
+    COUNTER_DATA MSSQLCompilations;
+    COUNTER_DATA MSSQLRecompilations;
+
+    COUNTER_DATA MSSQLDBIsReadonly;
+    COUNTER_DATA MSSQLDBState;
+
     uint32_t updated;
 };
 
+enum netdata_mssql_odbc_errors {
+    NETDATA_MSSQL_ODBC_NO_ERROR,
+    NETDATA_MSSQL_ODBC_CONNECT,
+    NETDATA_MSSQL_ODBC_BIND,
+    NETDATA_MSSQL_ODBC_PREPARE,
+    NETDATA_MSSQL_ODBC_QUERY,
+    NETDATA_MSSQL_ODBC_FETCH
+};
+
+static char *netdata_MSSQL_error_text(enum netdata_mssql_odbc_errors val)
+{
+    switch (val) {
+        case NETDATA_MSSQL_ODBC_NO_ERROR:
+            return "NO ERROR";
+        case NETDATA_MSSQL_ODBC_CONNECT:
+            return "CONNECTION";
+        case NETDATA_MSSQL_ODBC_BIND:
+            return "BIND PARAMETER";
+        case NETDATA_MSSQL_ODBC_PREPARE:
+            return "PREPARE PARAMETER";
+        case NETDATA_MSSQL_ODBC_QUERY:
+            return "QUERY PARAMETER";
+        case NETDATA_MSSQL_ODBC_FETCH:
+        default:
+            return "QUERY FETCH";
+    }
+}
+
+static char *netdata_MSSQL_type_text(uint32_t type)
+{
+    switch (type) {
+        case SQL_HANDLE_STMT:
+            return "STMT";
+        case SQL_HANDLE_DBC:
+        default:
+            return "DBC";
+    }
+}
+
+// Connection and SQL
+static void netdata_MSSQL_error(uint32_t type, SQLHANDLE handle, enum netdata_mssql_odbc_errors step, char *instance)
+{
+    SQLCHAR state[1024];
+    SQLCHAR message[1024];
+    if (SQL_SUCCESS == SQLGetDiagRec((short)type, handle, 1, state, NULL, message, 1024, NULL)) {
+        char *str_step = netdata_MSSQL_error_text(step);
+        char *str_type = netdata_MSSQL_type_text(type);
+        char *use_instance = (!instance) ? "no instance" : instance;
+        nd_log(
+            NDLS_COLLECTORS,
+            NDLP_INFO,
+            "MSSQL server error on %s using the handle %s running %s :  %s, %s",
+            use_instance,
+            str_type,
+            str_step,
+            message,
+            state);
+    }
+}
+
+static inline void netdata_MSSQL_release_results(SQLHSTMT *stmt)
+{
+    SQLCloseCursor(stmt);
+}
+
+static ULONGLONG netdata_MSSQL_fill_long_value(SQLHSTMT *stmt, const char *mask, const char *dbname, char *instance)
+{
+    long db_size = 0;
+    SQLLEN col_data_len = 0;
+
+    SQLCHAR query[512];
+    snprintfz((char *)query, 511, mask, dbname);
+
+    SQLRETURN ret;
+
+    ret = SQLExecDirect(stmt, query, SQL_NTS);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, stmt, NETDATA_MSSQL_ODBC_QUERY, instance);
+        return (ULONGLONG)ULONG_LONG_MAX;
+    }
+
+    ret = SQLBindCol(stmt, 1, SQL_C_LONG, &db_size, sizeof(long), &col_data_len);
+
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, stmt, NETDATA_MSSQL_ODBC_PREPARE, instance);
+        return (ULONGLONG)ULONG_LONG_MAX;
+    }
+
+    ret = SQLFetch(stmt);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, stmt, NETDATA_MSSQL_ODBC_FETCH, instance);
+        return (ULONGLONG)ULONG_LONG_MAX;
+    }
+
+    netdata_MSSQL_release_results(stmt);
+    return (ULONGLONG)(db_size * MEGA_FACTOR);
+}
+
+#define NETDATA_MSSQL_BUFFER_PAGE_READS_METRIC "Page reads/sec"
+#define NETDATA_MSSQL_BUFFER_PAGE_WRITES_METRIC "Page writes/sec"
+#define NETDATA_MSSQL_BUFFER_PAGE_CACHE_METRIC "Buffer cache hit ratio"
+#define NETDATA_MSSQL_BUFFER_CHECKPOINT_METRIC "Checkpoint pages/sec"
+#define NETDATA_MSSQL_BUFFER_PAGE_LIFE_METRIC "Page life expectancy"
+#define NETDATA_MSSQL_BUFFER_LAZY_WRITES_METRIC "Lazy writes/sec"
+#define NETDATA_MSSQL_BUFFER_PAGE_LOOKUPS_METRIC "Page Lookups/sec"
+
+#define NETDATA_MSSQL_STATS_COMPILATIONS_METRIC "SQL Compilations/sec"
+#define NETDATA_MSSQL_STATS_RECOMPILATIONS_METRIC "SQL Re-Compilations/sec"
+
+void dict_mssql_fill_instance_transactions(struct mssql_db_instance *mdi)
+{
+    char object_name[NETDATA_MAX_INSTANCE_OBJECT + 1] = {};
+    long value = 0;
+    SQLLEN col_object_len = 0, col_value_len = 0;
+
+    SQLCHAR query[sizeof(NETDATA_QUERY_TRANSACTIONS_PER_INSTANCE_MASK) + NETDATA_MAX_INSTANCE_OBJECT + 1];
+    snprintfz(
+            (char *)query,
+            sizeof(NETDATA_QUERY_TRANSACTIONS_PER_INSTANCE_MASK) + NETDATA_MAX_INSTANCE_OBJECT,
+            NETDATA_QUERY_TRANSACTIONS_PER_INSTANCE_MASK,
+            mdi->parent->instanceID);
+
+    SQLRETURN ret = SQLExecDirect(mdi->parent->conn->dbInstanceTransactionSTMT, (SQLCHAR *)query, SQL_NTS);
+    if (ret != SQL_SUCCESS) {
+        mdi->collecting_data = false;
+        netdata_MSSQL_error(
+                SQL_HANDLE_STMT, mdi->parent->conn->dbInstanceTransactionSTMT, NETDATA_MSSQL_ODBC_QUERY, mdi->parent->instanceID);
+        goto enditransactions;
+    }
+
+    ret = SQLBindCol(
+            mdi->parent->conn->dbInstanceTransactionSTMT, 1, SQL_C_CHAR, object_name, sizeof(object_name), &col_object_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(
+                SQL_HANDLE_STMT, mdi->parent->conn->dbInstanceTransactionSTMT, NETDATA_MSSQL_ODBC_PREPARE, mdi->parent->instanceID);
+        goto enditransactions;
+    }
+
+    ret = SQLBindCol(mdi->parent->conn->dbInstanceTransactionSTMT, 2, SQL_C_LONG, &value, sizeof(value), &col_value_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(
+                SQL_HANDLE_STMT, mdi->parent->conn->dbInstanceTransactionSTMT, NETDATA_MSSQL_ODBC_PREPARE, mdi->parent->instanceID);
+        goto enditransactions;
+    }
+
+    do {
+        ret = SQLFetch(mdi->parent->conn->dbInstanceTransactionSTMT);
+        switch (ret) {
+            case SQL_SUCCESS:
+            case SQL_SUCCESS_WITH_INFO:
+                break;
+            case SQL_NO_DATA:
+            default:
+                goto enditransactions;
+        }
+
+        // We cannot use strcmp, because buffer is filled with spaces instead NULL.
+        if (!strncmp(
+                object_name, NETDATA_MSSQL_BUFFER_PAGE_READS_METRIC, sizeof(NETDATA_MSSQL_BUFFER_PAGE_READS_METRIC) - 1))
+            mdi->MSSQLBufferPageReads.current.Data = (ULONGLONG)value;
+        else if (!strncmp(
+                object_name, NETDATA_MSSQL_BUFFER_PAGE_WRITES_METRIC, sizeof(NETDATA_MSSQL_BUFFER_PAGE_WRITES_METRIC) - 1))
+            mdi->MSSQLBufferPageWrites.current.Data = (ULONGLONG)value;
+        else if (!strncmp(
+                object_name, NETDATA_MSSQL_BUFFER_PAGE_CACHE_METRIC, sizeof(NETDATA_MSSQL_BUFFER_PAGE_CACHE_METRIC) - 1))
+            mdi->MSSQLBufferCacheHits.current.Data = (ULONGLONG)value;
+        else if (!strncmp(
+                object_name, NETDATA_MSSQL_BUFFER_CHECKPOINT_METRIC, sizeof(NETDATA_MSSQL_BUFFER_CHECKPOINT_METRIC) - 1))
+            mdi->MSSQLBufferCheckpointPages.current.Data = (ULONGLONG)value;
+        else if (!strncmp(
+                object_name, NETDATA_MSSQL_BUFFER_PAGE_LIFE_METRIC, sizeof(NETDATA_MSSQL_BUFFER_PAGE_LIFE_METRIC) - 1))
+            mdi->MSSQLBufferPageLifeExpectancy.current.Data = (ULONGLONG)value;
+        else if (!strncmp(
+                object_name, NETDATA_MSSQL_BUFFER_LAZY_WRITES_METRIC, sizeof(NETDATA_MSSQL_BUFFER_LAZY_WRITES_METRIC) - 1))
+            mdi->MSSQLBufferLazyWrite.current.Data = (ULONGLONG)value;
+        else if (!strncmp(
+                object_name, NETDATA_MSSQL_BUFFER_PAGE_LOOKUPS_METRIC, sizeof(NETDATA_MSSQL_BUFFER_PAGE_LOOKUPS_METRIC) - 1))
+            mdi->MSSQLBufferPageLookups.current.Data = (ULONGLONG)value;
+        else if (!strncmp(
+                object_name, NETDATA_MSSQL_STATS_COMPILATIONS_METRIC, sizeof(NETDATA_MSSQL_STATS_COMPILATIONS_METRIC) - 1))
+            mdi->MSSQLCompilations.current.Data = (ULONGLONG)value;
+        else if (!strncmp(
+                object_name, NETDATA_MSSQL_STATS_RECOMPILATIONS_METRIC, sizeof(NETDATA_MSSQL_STATS_RECOMPILATIONS_METRIC) - 1))
+            mdi->MSSQLRecompilations.current.Data = (ULONGLONG)value;
+    } while (true);
+
+    enditransactions:
+    netdata_MSSQL_release_results(mdi->parent->conn->dbInstanceTransactionSTMT);
+}
+
+#define NETDATA_MSSQL_ACTIVE_TRANSACTIONS_METRIC "Active Transactions"
+#define NETDATA_MSSQL_TRANSACTION_PER_SEC_METRIC "Transactions/sec"
+#define NETDATA_MSSQL_WRITE_TRANSACTIONS_METRIC "Write Transactions/sec"
+#define NETDATA_MSSQL_BACKUP_RESTORE_METRIC "Backup/Restore Throughput/sec"
+#define NETDATA_MSSQL_LOG_FLUSHED_METRIC "Log Bytes Flushed/sec"
+#define NETDATA_MSSQL_LOG_FLUSHES_METRIC "Log Flushes/sec"
+#define NETDATA_MSSQL_NUMBER_DEADLOCKS_METRIC "Number of Deadlocks/sec"
+#define NETDATA_MSSQL_LOCK_WAITS_METRIC "Lock Waits/sec"
+#define NETDATA_MSSQL_LOCK_TIMEOUTS_METRIC "Lock Timeouts/sec"
+#define NETDATA_MSSQL_LOCK_REQUESTS_METRIC "Lock Requests/sec"
+
+void dict_mssql_fill_transactions(struct mssql_db_instance *mdi, const char *dbname)
+{
+    char object_name[NETDATA_MAX_INSTANCE_OBJECT + 1] = {};
+    long value = 0;
+    SQLLEN col_object_len = 0, col_value_len = 0;
+
+    if (mdi->collect_instance)
+        dict_mssql_fill_instance_transactions(mdi);
+
+    SQLCHAR query[sizeof(NETDATA_QUERY_TRANSACTIONS_MASK) + 2 * NETDATA_MAX_INSTANCE_OBJECT + 1];
+    snprintfz(
+        (char *)query,
+        sizeof(NETDATA_QUERY_TRANSACTIONS_MASK) + 2 * NETDATA_MAX_INSTANCE_OBJECT,
+        NETDATA_QUERY_TRANSACTIONS_MASK,
+        dbname,
+        dbname);
+
+    SQLRETURN ret = SQLExecDirect(mdi->parent->conn->dbTransactionSTMT, (SQLCHAR *)query, SQL_NTS);
+    if (ret != SQL_SUCCESS) {
+        mdi->collecting_data = false;
+        netdata_MSSQL_error(
+            SQL_HANDLE_STMT, mdi->parent->conn->dbTransactionSTMT, NETDATA_MSSQL_ODBC_QUERY, mdi->parent->instanceID);
+        goto endtransactions;
+    }
+
+    ret = SQLBindCol(
+        mdi->parent->conn->dbTransactionSTMT, 1, SQL_C_CHAR, object_name, sizeof(object_name), &col_object_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(
+            SQL_HANDLE_STMT, mdi->parent->conn->dbTransactionSTMT, NETDATA_MSSQL_ODBC_PREPARE, mdi->parent->instanceID);
+        goto endtransactions;
+    }
+
+    ret = SQLBindCol(mdi->parent->conn->dbTransactionSTMT, 2, SQL_C_LONG, &value, sizeof(value), &col_value_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(
+            SQL_HANDLE_STMT, mdi->parent->conn->dbTransactionSTMT, NETDATA_MSSQL_ODBC_PREPARE, mdi->parent->instanceID);
+        goto endtransactions;
+    }
+
+    do {
+        ret = SQLFetch(mdi->parent->conn->dbTransactionSTMT);
+        switch (ret) {
+            case SQL_SUCCESS:
+            case SQL_SUCCESS_WITH_INFO:
+                break;
+            case SQL_NO_DATA:
+            default:
+                goto endtransactions;
+        }
+
+        // We cannot use strcmp, because buffer is filled with spaces instead NULL.
+        if (!strncmp(
+                object_name,
+                NETDATA_MSSQL_ACTIVE_TRANSACTIONS_METRIC,
+                sizeof(NETDATA_MSSQL_ACTIVE_TRANSACTIONS_METRIC) - 1))
+            mdi->MSSQLDatabaseActiveTransactions.current.Data = (ULONGLONG)value;
+        else if (!strncmp(
+                     object_name,
+                     NETDATA_MSSQL_TRANSACTION_PER_SEC_METRIC,
+                     sizeof(NETDATA_MSSQL_TRANSACTION_PER_SEC_METRIC) - 1))
+            mdi->MSSQLDatabaseTransactions.current.Data = (ULONGLONG)value;
+        else if (!strncmp(
+                     object_name,
+                     NETDATA_MSSQL_WRITE_TRANSACTIONS_METRIC,
+                     sizeof(NETDATA_MSSQL_WRITE_TRANSACTIONS_METRIC) - 1))
+            mdi->MSSQLDatabaseWriteTransactions.current.Data = (ULONGLONG)value;
+        else if (!strncmp(
+                     object_name, NETDATA_MSSQL_BACKUP_RESTORE_METRIC, sizeof(NETDATA_MSSQL_BACKUP_RESTORE_METRIC) - 1))
+            mdi->MSSQLDatabaseBackupRestoreOperations.current.Data = (ULONGLONG)value;
+        else if (!strncmp(object_name, NETDATA_MSSQL_LOG_FLUSHED_METRIC, sizeof(NETDATA_MSSQL_LOG_FLUSHED_METRIC) - 1))
+            mdi->MSSQLDatabaseLogFlushed.current.Data = (ULONGLONG)value;
+        else if (!strncmp(object_name, NETDATA_MSSQL_LOG_FLUSHES_METRIC, sizeof(NETDATA_MSSQL_LOG_FLUSHES_METRIC) - 1))
+            mdi->MSSQLDatabaseLogFlushes.current.Data = (ULONGLONG)value;
+        else if (!strncmp(
+                     object_name,
+                     NETDATA_MSSQL_NUMBER_DEADLOCKS_METRIC,
+                     sizeof(NETDATA_MSSQL_NUMBER_DEADLOCKS_METRIC) - 1))
+            mdi->MSSQLDatabaseDeadLockSec.current.Data = (ULONGLONG)value;
+        else if (!strncmp(object_name, NETDATA_MSSQL_LOCK_WAITS_METRIC, sizeof(NETDATA_MSSQL_LOCK_WAITS_METRIC) - 1))
+            mdi->MSSQLDatabaseLockWaitSec.current.Data = (ULONGLONG)value;
+        else if (!strncmp(
+                     object_name, NETDATA_MSSQL_LOCK_TIMEOUTS_METRIC, sizeof(NETDATA_MSSQL_LOCK_TIMEOUTS_METRIC) - 1))
+            mdi->MSSQLDatabaseLockTimeoutsSec.current.Data = (ULONGLONG)value;
+        else if (!strncmp(
+                     object_name, NETDATA_MSSQL_LOCK_REQUESTS_METRIC, sizeof(NETDATA_MSSQL_LOCK_REQUESTS_METRIC) - 1))
+            mdi->MSSQLDatabaseLockRequestsSec.current.Data = (ULONGLONG)value;
+
+    } while (true);
+
+endtransactions:
+    netdata_MSSQL_release_results(mdi->parent->conn->dbTransactionSTMT);
+}
+
+void dict_mssql_fill_locks(struct mssql_db_instance *mdi, const char *dbname)
+{
+#define NETDATA_MSSQL_MAX_RESOURCE_TYPE (60)
+    char resource_type[NETDATA_MSSQL_MAX_RESOURCE_TYPE + 1] = {};
+    long value = 0;
+    SQLLEN col_object_len = 0, col_value_len = 0;
+
+    SQLCHAR query[sizeof(NETDATA_QUERY_LOCKS_MASK) + 2 * NETDATA_MAX_INSTANCE_OBJECT + 1];
+    snprintfz(
+        (char *)query,
+        sizeof(NETDATA_QUERY_TRANSACTIONS_MASK) + 2 * NETDATA_MAX_INSTANCE_OBJECT,
+        NETDATA_QUERY_LOCKS_MASK,
+        dbname,
+        dbname);
+
+    SQLRETURN ret = SQLExecDirect(mdi->parent->conn->dbLocksSTMT, (SQLCHAR *)query, SQL_NTS);
+    if (ret != SQL_SUCCESS) {
+        mdi->collecting_data = false;
+        netdata_MSSQL_error(
+            SQL_HANDLE_STMT, mdi->parent->conn->dbLocksSTMT, NETDATA_MSSQL_ODBC_QUERY, mdi->parent->instanceID);
+        goto endlocks;
+    }
+
+    ret = SQLBindCol(
+        mdi->parent->conn->dbLocksSTMT, 1, SQL_C_CHAR, resource_type, sizeof(resource_type), &col_object_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(
+            SQL_HANDLE_STMT, mdi->parent->conn->dbLocksSTMT, NETDATA_MSSQL_ODBC_PREPARE, mdi->parent->instanceID);
+        goto endlocks;
+    }
+
+    ret = SQLBindCol(mdi->parent->conn->dbLocksSTMT, 2, SQL_C_LONG, &value, sizeof(value), &col_value_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(
+            SQL_HANDLE_STMT, mdi->parent->conn->dbLocksSTMT, NETDATA_MSSQL_ODBC_PREPARE, mdi->parent->instanceID);
+        goto endlocks;
+    }
+
+    do {
+        ret = SQLFetch(mdi->parent->conn->dbLocksSTMT);
+        switch (ret) {
+            case SQL_SUCCESS:
+            case SQL_SUCCESS_WITH_INFO:
+                break;
+            case SQL_NO_DATA:
+            default:
+                goto endlocks;
+        }
+
+        char *space = strchr(resource_type, ' ');
+        if (space)
+            *space = '\0';
+
+        struct mssql_lock_instance *mli =
+            dictionary_set(mdi->parent->locks_instances, resource_type, NULL, sizeof(*mli));
+        if (!mli)
+            continue;
+
+        mli->lockWait.current.Data = value;
+    } while (true);
+
+endlocks:
+    netdata_MSSQL_release_results(mdi->parent->conn->dbLocksSTMT);
+}
+
+int dict_mssql_fill_waits(struct mssql_instance *mi)
+{
+    char wait_type[NETDATA_MAX_INSTANCE_OBJECT + 1] = {};
+    char wait_category[NETDATA_MAX_INSTANCE_OBJECT + 1] = {};
+    SQLBIGINT total_wait = 0;
+    SQLBIGINT resource_wait = 0;
+    SQLBIGINT signal_wait = 0;
+    SQLBIGINT max_wait = 0;
+    SQLBIGINT waiting_tasks = 0;
+    int success = 0;
+    SQLLEN col_wait_type_len = 0, col_total_wait_len = 0, col_resource_wait_len = 0, col_signal_wait_len = 0,
+           col_max_wait_len = 0, col_waiting_tasks_len = 0, col_wait_category_len = 0;
+
+    SQLRETURN ret = SQLExecDirect(mi->conn->dbWaitsSTMT, (SQLCHAR *)NETDATA_QUERY_CHECK_WAITS, SQL_NTS);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->dbWaitsSTMT, NETDATA_MSSQL_ODBC_QUERY, mi->instanceID);
+        goto endwait;
+    }
+
+    ret = SQLBindCol(mi->conn->dbWaitsSTMT, 1, SQL_C_CHAR, wait_type, sizeof(wait_type), &col_wait_type_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->dbWaitsSTMT, NETDATA_MSSQL_ODBC_PREPARE, mi->instanceID);
+        goto endwait;
+    }
+
+    ret = SQLBindCol(mi->conn->dbWaitsSTMT, 2, SQL_C_LONG, &total_wait, sizeof(total_wait), &col_total_wait_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->dbWaitsSTMT, NETDATA_MSSQL_ODBC_PREPARE, mi->instanceID);
+        goto endwait;
+    }
+
+    ret =
+        SQLBindCol(mi->conn->dbWaitsSTMT, 3, SQL_C_LONG, &resource_wait, sizeof(resource_wait), &col_resource_wait_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->dbWaitsSTMT, NETDATA_MSSQL_ODBC_PREPARE, mi->instanceID);
+        goto endwait;
+    }
+
+    ret = SQLBindCol(mi->conn->dbWaitsSTMT, 4, SQL_C_LONG, &signal_wait, sizeof(signal_wait), &col_signal_wait_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->dbWaitsSTMT, NETDATA_MSSQL_ODBC_PREPARE, mi->instanceID);
+        goto endwait;
+    }
+
+    ret = SQLBindCol(mi->conn->dbWaitsSTMT, 5, SQL_C_LONG, &max_wait, sizeof(max_wait), &col_max_wait_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->dbWaitsSTMT, NETDATA_MSSQL_ODBC_PREPARE, mi->instanceID);
+        goto endwait;
+    }
+
+    ret =
+        SQLBindCol(mi->conn->dbWaitsSTMT, 6, SQL_C_LONG, &waiting_tasks, sizeof(waiting_tasks), &col_waiting_tasks_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->dbWaitsSTMT, NETDATA_MSSQL_ODBC_PREPARE, mi->instanceID);
+        goto endwait;
+    }
+
+    ret =
+        SQLBindCol(mi->conn->dbWaitsSTMT, 7, SQL_C_CHAR, wait_category, sizeof(wait_category), &col_wait_category_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->dbWaitsSTMT, NETDATA_MSSQL_ODBC_PREPARE, mi->instanceID);
+        goto endwait;
+    }
+
+    do {
+        ret = SQLFetch(mi->conn->dbWaitsSTMT);
+        switch (ret) {
+            case SQL_SUCCESS:
+            case SQL_SUCCESS_WITH_INFO:
+                break;
+            case SQL_NO_DATA:
+            default:
+                success = 1;
+                goto endwait;
+        }
+
+        struct mssql_db_waits *mdw = dictionary_set(mi->waits, wait_type, NULL, sizeof(*mdw));
+        if (!mdw)
+            continue;
+
+        mdw->MSSQLDatabaseTotalWait.current.Data = (ULONGLONG)total_wait;
+        // Variable mdw->MSSQLDatabaseResourceWaitMSec.current.Data stores a mathematical operation
+        // that can be negative sometimes. This is the reason we have this if
+        if (resource_wait > mdw->MSSQLDatabaseResourceWaitMSec.current.Data)
+            mdw->MSSQLDatabaseResourceWaitMSec.current.Data = (ULONGLONG)resource_wait;
+        mdw->MSSQLDatabaseSignalWaitMSec.current.Data = (ULONGLONG)signal_wait;
+        mdw->MSSQLDatabaseMaxWaitTimeMSec.current.Data = (ULONGLONG)max_wait;
+        mdw->MSSQLDatabaseWaitingTasks.current.Data = (ULONGLONG)waiting_tasks;
+
+        if (!mdw->wait_category)
+            mdw->wait_category = strdupz(wait_category);
+    } while (true);
+
+endwait:
+    netdata_MSSQL_release_results(mi->conn->dbWaitsSTMT);
+
+    return success;
+}
+
+int dict_mssql_databases_run_queries(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused)
+{
+    struct mssql_db_instance *mdi = value;
+    const char *dbname = dictionary_acquired_item_name((DICTIONARY_ITEM *)item);
+
+    if (!mdi->collecting_data || !mdi->parent || !mdi->parent->conn) {
+        goto enddrunquery;
+    }
+
+    // We failed to collect this for the database, so we are not going to try again
+    if (mdi->MSSQLDatabaseDataFileSize.current.Data != ULONG_LONG_MAX)
+        mdi->MSSQLDatabaseDataFileSize.current.Data = netdata_MSSQL_fill_long_value(
+            mdi->parent->conn->dataFileSizeSTMT, NETDATA_QUERY_DATA_FILE_SIZE_MASK, dbname, mdi->parent->instanceID);
+    else {
+        mdi->collecting_data = false;
+        goto enddrunquery;
+    }
+
+    dict_mssql_fill_transactions(mdi, dbname);
+    dict_mssql_fill_locks(mdi, dbname);
+
+enddrunquery:
+    return 1;
+}
+
+long metdata_mssql_check_permission(struct mssql_instance *mi)
+{
+    static int next_try = NETDATA_MSSQL_NEXT_TRY - 1;
+    long perm = 0;
+    SQLLEN col_data_len = 0;
+
+    if (++next_try != NETDATA_MSSQL_NEXT_TRY)
+        return 1;
+
+    next_try = 0;
+
+    SQLRETURN ret;
+
+    ret = SQLExecDirect(mi->conn->checkPermSTMT, (SQLCHAR *)NETDATA_QUERY_CHECK_PERM, SQL_NTS);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->checkPermSTMT, NETDATA_MSSQL_ODBC_QUERY, mi->instanceID);
+        perm = LONG_MAX;
+        goto endperm;
+    }
+
+    ret = SQLBindCol(mi->conn->checkPermSTMT, 1, SQL_C_LONG, &perm, sizeof(perm), &col_data_len);
+
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->checkPermSTMT, NETDATA_MSSQL_ODBC_PREPARE, mi->instanceID);
+        perm = LONG_MAX;
+        goto endperm;
+    }
+
+    ret = SQLFetch(mi->conn->checkPermSTMT);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->checkPermSTMT, NETDATA_MSSQL_ODBC_FETCH, mi->instanceID);
+        perm = LONG_MAX;
+        goto endperm;
+    }
+
+endperm:
+    netdata_MSSQL_release_results(mi->conn->checkPermSTMT);
+    return perm;
+}
+
+void metdata_mssql_fill_mssql_status(struct mssql_instance *mi)
+{
+    char dbname[SQLSERVER_MAX_NAME_LENGTH + 1];
+    int readonly = 0;
+    BYTE state = 0;
+    SQLLEN col_data_len = 0;
+
+    static int next_try = NETDATA_MSSQL_NEXT_TRY - 1;
+
+    if (++next_try != NETDATA_MSSQL_NEXT_TRY)
+        return;
+
+    next_try = 0;
+
+    SQLRETURN ret;
+
+    ret = SQLExecDirect(mi->conn->dbSQLState, (SQLCHAR *)NETDATA_QUERY_DATABASE_STATUS, SQL_NTS);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->dbSQLState, NETDATA_MSSQL_ODBC_QUERY, mi->instanceID);
+        goto enddbstate;
+    }
+
+    ret = SQLBindCol(mi->conn->dbSQLState, 1, SQL_C_TINYINT, &state, sizeof(state), &col_data_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->dbSQLState, NETDATA_MSSQL_ODBC_PREPARE, mi->instanceID);
+        goto enddbstate;
+    }
+
+    ret = SQLBindCol(mi->conn->dbSQLState, 3, SQL_C_BIT, &readonly, sizeof(readonly), &col_data_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->dbWaitsSTMT, NETDATA_MSSQL_ODBC_PREPARE, mi->instanceID);
+        goto enddbstate;
+    }
+
+    int i = 0;
+    do {
+        ret = SQLFetch(mi->conn->dbSQLState);
+        if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+            goto enddbstate;
+        }
+
+        struct mssql_db_instance *mdi = dictionary_set(mi->databases, dbname, NULL, sizeof(*mdi));
+        if (!mdi)
+            continue;
+
+        mdi->MSSQLDBState.current.Data = (ULONGLONG)state;
+        mdi->MSSQLDBIsReadonly.current.Data = (ULONGLONG)readonly;
+    } while (true);
+
+enddbstate:
+    netdata_MSSQL_release_results(mi->conn->dbSQLState);
+}
+
+void metdata_mssql_fill_job_status(struct mssql_instance *mi)
+{
+    char job[SQLSERVER_MAX_NAME_LENGTH + 1];
+    BYTE state = 0;
+    SQLLEN col_job_len = 0;
+    SQLLEN col_state_len = 0;
+
+    static int next_try = NETDATA_MSSQL_NEXT_TRY - 1;
+
+    if (++next_try != NETDATA_MSSQL_NEXT_TRY)
+        return;
+
+    next_try = 0;
+
+    SQLRETURN ret;
+
+    ret = SQLExecDirect(mi->conn->dbSQLJobs, (SQLCHAR *)NETDATA_QUERY_JOBS_STATUS, SQL_NTS);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->dbSQLJobs, NETDATA_MSSQL_ODBC_QUERY, mi->instanceID);
+        goto enddbjobs;
+    }
+
+    ret = SQLBindCol(mi->conn->dbSQLJobs, 1, SQL_C_CHAR, job, sizeof(job), &col_job_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->dbSQLJobs, NETDATA_MSSQL_ODBC_PREPARE, mi->instanceID);
+        goto enddbjobs;
+    }
+
+    ret = SQLBindCol(mi->conn->dbSQLJobs, 2, SQL_C_TINYINT, &state, sizeof(state), &col_state_len);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->dbSQLJobs, NETDATA_MSSQL_ODBC_PREPARE, mi->instanceID);
+        goto enddbjobs;
+    }
+
+    do {
+        ret = SQLFetch(mi->conn->dbSQLJobs);
+        if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+            goto enddbjobs;
+        }
+
+        struct mssql_db_jobs *mdj = dictionary_set(mi->sysjobs, job, NULL, sizeof(*mdj));
+        if (!mdj)
+            continue;
+
+        mdj->MSSQLJOBState.current.Data = (ULONGLONG)state;
+    } while (true);
+
+enddbjobs:
+    netdata_MSSQL_release_results(mi->conn->dbSQLJobs);
+}
+
+void metdata_mssql_fill_dictionary_from_db(struct mssql_instance *mi)
+{
+    char dbname[SQLSERVER_MAX_NAME_LENGTH + 1];
+    SQLLEN col_data_len = 0;
+
+    static int next_try = NETDATA_MSSQL_NEXT_TRY - 1;
+
+    if (++next_try != NETDATA_MSSQL_NEXT_TRY)
+        return;
+
+    next_try = 0;
+
+    SQLRETURN ret;
+
+    ret = SQLExecDirect(mi->conn->databaseListSTMT, (SQLCHAR *)NETDATA_QUERY_LIST_DB, SQL_NTS);
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->databaseListSTMT, NETDATA_MSSQL_ODBC_QUERY, mi->instanceID);
+        goto enddblist;
+    }
+
+    ret = SQLBindCol(mi->conn->databaseListSTMT, 1, SQL_C_CHAR, dbname, sizeof(dbname), &col_data_len);
+
+    if (ret != SQL_SUCCESS) {
+        netdata_MSSQL_error(SQL_HANDLE_STMT, mi->conn->databaseListSTMT, NETDATA_MSSQL_ODBC_PREPARE, mi->instanceID);
+        goto enddblist;
+    }
+
+    int i = 0;
+    do {
+        ret = SQLFetch(mi->conn->databaseListSTMT);
+        if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+            goto enddblist;
+        }
+
+        struct mssql_db_instance *mdi = dictionary_set(mi->databases, dbname, NULL, sizeof(*mdi));
+        if (!mdi)
+            continue;
+
+        mdi->updated = 0;
+        if (!mdi->parent) {
+            mdi->parent = mi;
+        }
+
+        if (!i) {
+            mdi->collect_instance = true;
+        }
+    } while (true);
+
+enddblist:
+    netdata_MSSQL_release_results(mi->conn->databaseListSTMT);
+}
+
+static bool netdata_MSSQL_initialize_connection(struct netdata_mssql_conn *nmc)
+{
+    SQLRETURN ret;
+    if (nmc->netdataSQLEnv == NULL) {
+        ret = SQLAllocHandle(SQL_HANDLE_ENV, SQL_NULL_HANDLE, &nmc->netdataSQLEnv);
+        if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO)
+            return FALSE;
+
+        ret = SQLSetEnvAttr(nmc->netdataSQLEnv, SQL_ATTR_ODBC_VERSION, (SQLPOINTER)SQL_OV_ODBC3, 0);
+        if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+            return FALSE;
+        }
+    }
+
+    ret = SQLAllocHandle(SQL_HANDLE_DBC, nmc->netdataSQLEnv, &nmc->netdataSQLHDBc);
+    if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+        return FALSE;
+    }
+
+    ret = SQLSetConnectAttr(nmc->netdataSQLHDBc, SQL_LOGIN_TIMEOUT, (SQLPOINTER)5, 0);
+    if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+        return FALSE;
+    }
+
+    ret = SQLSetConnectAttr(nmc->netdataSQLHDBc, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)TRUE, 0);
+    if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+        return FALSE;
+    }
+
+    SQLCHAR ret_conn_str[1024];
+    ret = SQLDriverConnect(
+        nmc->netdataSQLHDBc, NULL, nmc->connectionString, SQL_NTS, ret_conn_str, 1024, NULL, SQL_DRIVER_NOPROMPT);
+
+    BOOL retConn;
+    switch (ret) {
+        case SQL_NO_DATA_FOUND:
+        case SQL_INVALID_HANDLE:
+        case SQL_ERROR:
+        default:
+            netdata_MSSQL_error(SQL_HANDLE_DBC, nmc->netdataSQLHDBc, NETDATA_MSSQL_ODBC_CONNECT, NULL);
+            retConn = FALSE;
+            break;
+        case SQL_SUCCESS:
+        case SQL_SUCCESS_WITH_INFO:
+            retConn = TRUE;
+            break;
+    }
+
+    if (retConn) {
+        SQLSetConnectAttr(nmc->netdataSQLHDBc, SQL_ATTR_AUTOCOMMIT, (SQLPOINTER)SQL_AUTOCOMMIT_ON, 0);
+
+        ret = SQLAllocHandle(SQL_HANDLE_STMT, nmc->netdataSQLHDBc, &nmc->checkPermSTMT);
+        if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+            retConn = FALSE;
+            goto endMSSQLInitializationConnection;
+        }
+
+        ret = SQLAllocHandle(SQL_HANDLE_STMT, nmc->netdataSQLHDBc, &nmc->databaseListSTMT);
+        if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+            retConn = FALSE;
+            goto endMSSQLInitializationConnection;
+        }
+
+        ret = SQLAllocHandle(SQL_HANDLE_STMT, nmc->netdataSQLHDBc, &nmc->dataFileSizeSTMT);
+        if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+            retConn = FALSE;
+            goto endMSSQLInitializationConnection;
+        }
+
+        ret = SQLAllocHandle(SQL_HANDLE_STMT, nmc->netdataSQLHDBc, &nmc->dbTransactionSTMT);
+        if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+            retConn = FALSE;
+            goto endMSSQLInitializationConnection;
+        }
+
+        ret = SQLAllocHandle(SQL_HANDLE_STMT, nmc->netdataSQLHDBc, &nmc->dbInstanceTransactionSTMT);
+        if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+            retConn = FALSE;
+            goto endMSSQLInitializationConnection;
+        }
+
+        ret = SQLAllocHandle(SQL_HANDLE_STMT, nmc->netdataSQLHDBc, &nmc->dbLocksSTMT);
+        if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+            retConn = FALSE;
+            goto endMSSQLInitializationConnection;
+        }
+
+        ret = SQLAllocHandle(SQL_HANDLE_STMT, nmc->netdataSQLHDBc, &nmc->dbWaitsSTMT);
+        if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+            retConn = FALSE;
+            goto endMSSQLInitializationConnection;
+        }
+
+        ret = SQLAllocHandle(SQL_HANDLE_STMT, nmc->netdataSQLHDBc, &nmc->dbSQLState);
+        if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+            retConn = FALSE;
+            goto endMSSQLInitializationConnection;
+        }
+
+        ret = SQLAllocHandle(SQL_HANDLE_STMT, nmc->netdataSQLHDBc, &nmc->dbSQLJobs);
+        if (ret != SQL_SUCCESS && ret != SQL_SUCCESS_WITH_INFO) {
+            retConn = FALSE;
+            goto endMSSQLInitializationConnection;
+        }
+    }
+
+endMSSQLInitializationConnection:
+    return retConn;
+}
+
+// Dictionary
 static DICTIONARY *mssql_instances = NULL;
 
-static void initialize_mssql_objects(struct mssql_instance *p, const char *instance)
+static void initialize_mssql_objects(struct mssql_instance *mi, const char *instance)
 {
     char prefix[NETDATA_MAX_INSTANCE_NAME];
     if (!strcmp(instance, "MSSQLSERVER")) {
         strncpyz(prefix, "SQLServer:", sizeof(prefix) - 1);
     } else if (!strcmp(instance, "SQLEXPRESS")) {
         strncpyz(prefix, "MSSQL$SQLEXPRESS:", sizeof(prefix) - 1);
+        if (mi->conn)
+            mi->conn->is_sqlexpress = true;
     } else {
-        char *express = (!is_sqlexpress) ? "" : "SQLEXPRESS:";
+        char *express = (mi->conn && mi->conn->is_sqlexpress) ? "SQLEXPRESS:": "";
         snprintfz(prefix, sizeof(prefix) - 1, "MSSQL$%s%s:", express, instance);
     }
 
     size_t length = strlen(prefix);
     char name[NETDATA_MAX_INSTANCE_OBJECT];
     snprintfz(name, sizeof(name) - 1, "%s%s", prefix, "General Statistics");
-    p->objectName[NETDATA_MSSQL_GENERAL_STATS] = strdup(name);
+    mi->objectName[NETDATA_MSSQL_GENERAL_STATS] = strdupz(name);
 
     strncpyz(&name[length], "SQL Errors", sizeof(name) - length);
-    p->objectName[NETDATA_MSSQL_SQL_ERRORS] = strdup(name);
+    mi->objectName[NETDATA_MSSQL_SQL_ERRORS] = strdupz(name);
 
     strncpyz(&name[length], "Databases", sizeof(name) - length);
-    p->objectName[NETDATA_MSSQL_DATABASE] = strdup(name);
+    mi->objectName[NETDATA_MSSQL_DATABASE] = strdupz(name);
 
     strncpyz(&name[length], "SQL Statistics", sizeof(name) - length);
-    p->objectName[NETDATA_MSSQL_SQL_STATS] = strdup(name);
+    mi->objectName[NETDATA_MSSQL_SQL_STATS] = strdupz(name);
 
     strncpyz(&name[length], "Buffer Manager", sizeof(name) - length);
-    p->objectName[NETDATA_MSSQL_BUFFER_MANAGEMENT] = strdup(name);
+    mi->objectName[NETDATA_MSSQL_BUFFER_MANAGEMENT] = strdupz(name);
+
+    strncpyz(&name[length], "SystemJobs", sizeof(name) - length);
+    mi->objectName[NETDATA_MSSQL_JOBS] = strdupz(name);
 
     strncpyz(&name[length], "Memory Manager", sizeof(name) - length);
-    p->objectName[NETDATA_MSSQL_MEMORY] = strdup(name);
+    mi->objectName[NETDATA_MSSQL_MEMORY] = strdupz(name);
 
     strncpyz(&name[length], "Locks", sizeof(name) - length);
-    p->objectName[NETDATA_MSSQL_LOCKS] = strdup(name);
+    mi->objectName[NETDATA_MSSQL_LOCKS] = strdupz(name);
+
+    strncpyz(&name[length], "Wait Statistics", sizeof(name) - length);
+    mi->objectName[NETDATA_MSSQL_WAITS] = strdupz(name);
 
     strncpyz(&name[length], "Access Methods", sizeof(name) - length);
-    p->objectName[NETDATA_MSSQL_ACCESS_METHODS] = strdup(name);
+    mi->objectName[NETDATA_MSSQL_ACCESS_METHODS] = strdupz(name);
 
-    p->instanceID = strdup(instance);
+    mi->instanceID = strdupz(instance);
 }
 
-static inline void initialize_mssql_keys(struct mssql_instance *p)
+static inline void initialize_mssql_keys(struct mssql_instance *mi)
 {
     // General Statistics (https://learn.microsoft.com/en-us/sql/relational-databases/performance-monitor/sql-server-general-statistics-object)
-    p->MSSQLUserConnections.key = "User Connections";
-    p->MSSQLBlockedProcesses.key = "Processes blocked";
+    mi->MSSQLUserConnections.key = "User Connections";
+    mi->MSSQLBlockedProcesses.key = "Processes blocked";
 
     // SQL Statistics (https://learn.microsoft.com/en-us/sql/relational-databases/performance-monitor/sql-server-sql-statistics-object)
-    p->MSSQLStatsAutoParameterization.key = "Auto-Param Attempts/sec";
-    p->MSSQLStatsBatchRequests.key = "Batch Requests/sec";
-    p->MSSQLStatSafeAutoParameterization.key = "Safe Auto-Params/sec";
-    p->MSSQLCompilations.key = "SQL Compilations/sec";
-    p->MSSQLRecompilations.key = "SQL Re-Compilations/sec";
-
-    // Buffer Management (https://learn.microsoft.com/en-us/sql/relational-databases/performance-monitor/sql-server-buffer-manager-object)
-    p->MSSQLBufferCacheHits.key = "Buffer cache hit ratio";
-    p->MSSQLBufferPageLifeExpectancy.key = "Page life expectancy";
-    p->MSSQLBufferCheckpointPages.key = "Checkpoint pages/sec";
-    p->MSSQLBufferPageReads.key = "Page reads/sec";
-    p->MSSQLBufferPageWrites.key = "Page writes/sec";
+    mi->MSSQLStatsAutoParameterization.key = "Auto-Param Attempts/sec";
+    mi->MSSQLStatsBatchRequests.key = "Batch Requests/sec";
+    mi->MSSQLStatSafeAutoParameterization.key = "Safe Auto-Params/sec";
 
     // Access Methods (https://learn.microsoft.com/en-us/sql/relational-databases/performance-monitor/sql-server-access-methods-object)
-    p->MSSQLAccessMethodPageSplits.key = "Page Splits/sec";
+    mi->MSSQLAccessMethodPageSplits.key = "Page Splits/sec";
 
     // Errors (https://learn.microsoft.com/en-us/sql/relational-databases/performance-monitor/sql-server-sql-errors-object)
-    p->MSSQLSQLErrorsTotal.key = "Errors/sec";
+    mi->MSSQLSQLErrorsTotal.key = "Errors/sec";
 
     // Memory Management (https://learn.microsoft.com/en-us/sql/relational-databases/performance-monitor/sql-server-memory-manager-object)
-    p->MSSQLConnectionMemoryBytes.key = "Connection Memory (KB)";
-    p->MSSQLExternalBenefitOfMemory.key = "External benefit of memory";
-    p->MSSQLPendingMemoryGrants.key = "Memory Grants Pending";
-    p->MSSQLTotalServerMemory.key = "Total Server Memory (KB)";
+    mi->MSSQLConnectionMemoryBytes.key = "Connection Memory (KB)";
+    mi->MSSQLExternalBenefitOfMemory.key = "External benefit of memory";
+    mi->MSSQLPendingMemoryGrants.key = "Memory Grants Pending";
+    mi->MSSQLTotalServerMemory.key = "Total Server Memory (KB)";
 }
 
 void dict_mssql_insert_locks_cb(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused)
 {
+    const char *resource = dictionary_acquired_item_name((DICTIONARY_ITEM *)item);
+
     // https://learn.microsoft.com/en-us/sql/relational-databases/performance-monitor/sql-server-locks-object
     struct mssql_lock_instance *ptr = value;
+    ptr->resourceID = strdupz(resource);
     ptr->deadLocks.key = "Number of Deadlocks/sec";
     ptr->lockWait.key = "Lock Waits/sec";
 }
 
+void dict_mssql_insert_wait_cb(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused)
+{
+    const char *type = dictionary_acquired_item_name((DICTIONARY_ITEM *)item);
+
+    struct mssql_db_waits *mdw = value;
+
+    mdw->wait_type = strdupz(type);
+    mdw->wait_category = NULL;
+    mdw->rd_total_wait = mdw->rd_max_wait_time_msec = mdw->rd_resource_wait_msec = mdw->rd_signal_wait_msec =
+        mdw->rd_waiting_tasks = NULL;
+}
+
 void dict_mssql_insert_databases_cb(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused)
 {
-    struct mssql_db_instance *ptr = value;
+    struct mssql_db_instance *mdi = value;
 
-    // https://learn.microsoft.com/en-us/sql/relational-databases/performance-monitor/sql-server-databases-object
-    ptr->MSSQLDatabaseDataFileSize.key = "Data File(s) Size (KB)";
-    ptr->MSSQLDatabaseActiveTransactions.key = "Active Transactions";
-    ptr->MSSQLDatabaseBackupRestoreOperations.key = "Backup/Restore Throughput/sec";
-    ptr->MSSQLDatabaseLogFlushed.key = "Log Bytes Flushed/sec";
-    ptr->MSSQLDatabaseLogFlushes.key = "Log Flushes/sec";
-    ptr->MSSQLDatabaseTransactions.key = "Transactions/sec";
-    ptr->MSSQLDatabaseWriteTransactions.key = "Write Transactions/sec";
+    mdi->collecting_data = true;
+}
+
+void dict_mssql_insert_jobs_cb(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused)
+{
+    UNUSED(value);
+}
+
+// Options
+void netdata_mount_mssql_connection_string(struct netdata_mssql_conn *dbInput)
+{
+    SQLCHAR conn[1024];
+    const char *serverAddress;
+    const char *serverAddressArg;
+    if (!dbInput) {
+        return;
+    }
+
+    char auth[512];
+    if (dbInput->server && dbInput->address) {
+        nd_log(
+            NDLS_COLLECTORS,
+            NDLP_ERR,
+            "Collector is not expecting server and address defined together, please, select one of them.");
+        dbInput->connectionString = NULL;
+        return;
+    }
+
+    if (dbInput->server) {
+        serverAddress = "Server";
+        serverAddressArg = dbInput->server;
+    } else {
+        serverAddressArg = "Address";
+        serverAddress = dbInput->address;
+    }
+
+    if (dbInput->windows_auth)
+        snprintfz(auth, sizeof(auth) - 1, "Trusted_Connection = yes");
+    else if (!dbInput->username || !dbInput->password) {
+        nd_log(
+            NDLS_COLLECTORS,
+            NDLP_ERR,
+            "You are not using Windows Authentication. Thus, it is necessary to specify user and password.");
+        dbInput->connectionString = NULL;
+        return;
+    } else {
+        snprintfz(auth, sizeof(auth) - 1, "UID=%s;PWD=%s;", dbInput->username, dbInput->password);
+    }
+
+    snprintfz(
+        (char *)conn, sizeof(conn) - 1, "Driver={%s};%s=%s;%s", dbInput->driver, serverAddress, serverAddressArg, auth);
+    dbInput->connectionString = (SQLCHAR *)strdupz((char *)conn);
+}
+
+static void netdata_read_config_options()
+{
+#define NETDATA_MAX_MSSSQL_SECTION_LENGTH (40)
+#define NETDATA_DEFAULT_MSSQL_SECTION "plugin:windows:PerflibMSSQL"
+    uint16_t expected_instances = 1;
+    uint16_t total_instances = 0;
+    for (; total_instances < expected_instances; total_instances++) {
+        char section_name[NETDATA_MAX_MSSSQL_SECTION_LENGTH + 1];
+        char upper_instance[NETDATA_MAX_INSTANCE_OBJECT + 1];
+        strncpyz(section_name, NETDATA_DEFAULT_MSSQL_SECTION, sizeof(NETDATA_DEFAULT_MSSQL_SECTION));
+        if (total_instances) {
+            snprintfz(&section_name[sizeof(NETDATA_DEFAULT_MSSQL_SECTION) - 1], 5, "%d", total_instances);
+        }
+        const char *instance = inicfg_get(&netdata_config, section_name, "instance", NULL);
+        int additional_instances = (int)inicfg_get_number(&netdata_config, section_name, "additional instances", 0);
+        if (!instance || strlen(instance) > NETDATA_MAX_INSTANCE_OBJECT) {
+            nd_log(NDLS_COLLECTORS, NDLP_ERR, "You must specify a valid 'instance' name to collect data from database in section %s.", section_name);
+            continue;
+        }
+
+        if (!total_instances && additional_instances) {
+            if (additional_instances > 64) {
+                nd_log(NDLS_COLLECTORS, NDLP_ERR, "Number of instances is bigger than expected (64)");
+                expected_instances = 64;
+            }
+            expected_instances = additional_instances + 1;
+        }
+
+        const char *move = instance;
+        int i;
+        for (i = 0; *move; move++, i++) {
+            upper_instance[i] = toupper(*move);
+        }
+        upper_instance[i] = '\0';
+
+        struct netdata_mssql_conn *dbconn = dictionary_set(conn_options, upper_instance, NULL, sizeof(*dbconn));
+
+        dbconn->instance = strdupz(upper_instance);
+        dbconn->driver = inicfg_get(&netdata_config, section_name, "driver", "SQL Server");
+        dbconn->server = inicfg_get(&netdata_config, section_name, "server", NULL);
+        dbconn->address = inicfg_get(&netdata_config, section_name, "address", NULL);
+        dbconn->username = inicfg_get(&netdata_config, section_name, "uid", NULL);
+        dbconn->password = inicfg_get(&netdata_config, section_name, "pwd", NULL);
+        dbconn->instances = additional_instances;
+        dbconn->windows_auth = inicfg_get_boolean(&netdata_config, section_name, "windows authentication", false);
+        dbconn->is_sqlexpress = inicfg_get_boolean(&netdata_config, section_name, "express", false);
+        dbconn->is_connected = FALSE;
+
+        netdata_mount_mssql_connection_string(dbconn);
+    }
+}
+
+static inline struct netdata_mssql_conn *netdata_mssql_get_conn_option(const char *instance)
+{
+    return (struct netdata_mssql_conn *)dictionary_get(conn_options, instance);
+}
+
+void mssql_fill_initial_instances(struct mssql_instance *mi)
+{
+    // https://learn.microsoft.com/en-us/sql/relational-databases/performance-monitor/sql-server-locks-object?view=sql-server-ver17
+    char *keys[] = {
+        "AllocUnit",
+        "Application",
+        "Database",
+        "Extent",
+        "File",
+        "HoBT",
+        "Key",
+        "Metadata",
+        "OIB",
+        "Object",
+        "Page",
+        "RID",
+        "RowGroup",
+        "Xact",
+        NULL};
+    for (int i = 0; keys[i]; i++) {
+        (void)dictionary_set(mi->locks_instances, keys[i], NULL, sizeof(struct mssql_lock_instance));
+    }
 }
 
 void dict_mssql_insert_cb(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused)
 {
-    struct mssql_instance *p = value;
+    struct mssql_instance *mi = value;
     const char *instance = dictionary_acquired_item_name((DICTIONARY_ITEM *)item);
+    bool *create_thread = data;
 
-    if (!p->locks_instances) {
-        p->locks_instances = dictionary_create_advanced(
+    if (!mi->locks_instances) {
+        mi->locks_instances = dictionary_create_advanced(
             DICT_OPTION_DONT_OVERWRITE_VALUE | DICT_OPTION_FIXED_SIZE, NULL, sizeof(struct mssql_lock_instance));
-        dictionary_register_insert_callback(p->locks_instances, dict_mssql_insert_locks_cb, NULL);
+        dictionary_register_insert_callback(mi->locks_instances, dict_mssql_insert_locks_cb, NULL);
+        mssql_fill_initial_instances(mi);
     }
 
-    if (!p->databases) {
-        p->databases = dictionary_create_advanced(
+    if (!mi->databases) {
+        mi->databases = dictionary_create_advanced(
             DICT_OPTION_DONT_OVERWRITE_VALUE | DICT_OPTION_FIXED_SIZE, NULL, sizeof(struct mssql_db_instance));
-        dictionary_register_insert_callback(p->databases, dict_mssql_insert_databases_cb, NULL);
+        dictionary_register_insert_callback(mi->databases, dict_mssql_insert_databases_cb, NULL);
     }
 
-    initialize_mssql_objects(p, instance);
-    initialize_mssql_keys(p);
+    if (!mi->sysjobs) {
+        mi->sysjobs = dictionary_create_advanced(
+                DICT_OPTION_DONT_OVERWRITE_VALUE | DICT_OPTION_FIXED_SIZE, NULL, sizeof(struct mssql_db_jobs));
+        dictionary_register_insert_callback(mi->sysjobs, dict_mssql_insert_jobs_cb, NULL);
+    }
+
+    if (!mi->waits) {
+        mi->waits = dictionary_create_advanced(
+            DICT_OPTION_DONT_OVERWRITE_VALUE | DICT_OPTION_FIXED_SIZE, NULL, sizeof(struct mssql_db_waits));
+        dictionary_register_insert_callback(mi->waits, dict_mssql_insert_wait_cb, NULL);
+    }
+
+    initialize_mssql_objects(mi, instance);
+    initialize_mssql_keys(mi);
+    mi->conn = netdata_mssql_get_conn_option(instance);
+
+    if (mi->conn && mi->conn->connectionString) {
+        mi->conn->is_connected = netdata_MSSQL_initialize_connection(mi->conn);
+        if (mi->conn->is_connected)
+            *create_thread = true;
+    }
 }
 
-static int mssql_fill_dictionary()
+void dict_mssql_insert_conn_option(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused)
+{
+    ;
+}
+
+static void mssql_fill_dictionary(int update_every)
 {
     HKEY hKey;
     LSTATUS ret = RegOpenKeyExA(
         HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Microsoft SQL Server\\Instance Names\\SQL", 0, KEY_READ, &hKey);
     if (ret != ERROR_SUCCESS)
-        return -1;
+        return;
 
     DWORD values = 0;
 
@@ -318,46 +1370,105 @@ static int mssql_fill_dictionary()
         if (ret != ERROR_SUCCESS)
             continue;
 
-        if (!strcmp(avalue, "SQLEXPRESS")) {
-            is_sqlexpress = TRUE;
-        }
-
         struct mssql_instance *p = dictionary_set(mssql_instances, avalue, NULL, sizeof(*p));
+        p->update_every = update_every;
     }
 
 endMSSQLFillDict:
     RegCloseKey(hKey);
-
-    return (ret == ERROR_SUCCESS) ? 0 : -1;
 }
 
-static int initialize(void)
+int netdata_mssql_reset_value(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused)
 {
+    struct mssql_db_instance *mdi = value;
+
+    mdi->collecting_data = false;
+
+    return 1;
+}
+
+int dict_mssql_query_cb(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused)
+{
+    struct mssql_instance *mi = value;
+    static long collecting = 1;
+
+    if (mi->conn && mi->conn->is_connected && collecting) {
+        collecting = metdata_mssql_check_permission(mi);
+        if (!collecting) {
+            nd_log(
+                NDLS_COLLECTORS,
+                NDLP_ERR,
+                "User %s does not have permission to run queries on %s",
+                mi->conn->username,
+                mi->instanceID);
+        } else {
+            metdata_mssql_fill_dictionary_from_db(mi);
+            metdata_mssql_fill_mssql_status(mi);
+            metdata_mssql_fill_job_status(mi);
+            dictionary_sorted_walkthrough_read(mi->databases, dict_mssql_databases_run_queries, NULL);
+        }
+
+        collecting = dict_mssql_fill_waits(mi);
+    } else {
+        dictionary_sorted_walkthrough_read(mi->databases, netdata_mssql_reset_value, NULL);
+    }
+
+    return 1;
+}
+
+static void netdata_mssql_queries(void *ptr __maybe_unused)
+{
+    heartbeat_t hb;
+    heartbeat_init(&hb, USEC_PER_SEC);
+    int update_every = UPDATE_EVERY_MIN;
+
+    while (service_running(SERVICE_COLLECTORS)) {
+        (void)heartbeat_next(&hb);
+
+        if (unlikely(!service_running(SERVICE_COLLECTORS)))
+            break;
+
+        dictionary_sorted_walkthrough_read(mssql_instances, dict_mssql_query_cb, &update_every);
+    }
+}
+
+static ND_THREAD *mssql_queries_thread = NULL;
+
+static int initialize(int update_every)
+{
+    static bool create_thread = false;
     mssql_instances = dictionary_create_advanced(
         DICT_OPTION_DONT_OVERWRITE_VALUE | DICT_OPTION_FIXED_SIZE, NULL, sizeof(struct mssql_instance));
 
-    dictionary_register_insert_callback(mssql_instances, dict_mssql_insert_cb, NULL);
+    dictionary_register_insert_callback(mssql_instances, dict_mssql_insert_cb, &create_thread);
 
-    if (mssql_fill_dictionary()) {
-        return -1;
-    }
+    conn_options = dictionary_create_advanced(
+        DICT_OPTION_DONT_OVERWRITE_VALUE | DICT_OPTION_FIXED_SIZE, NULL, sizeof(struct netdata_mssql_conn));
+    dictionary_register_insert_callback(conn_options, dict_mssql_insert_conn_option, NULL);
+
+    netdata_read_config_options();
+    mssql_fill_dictionary(update_every);
+
+    if (create_thread)
+        mssql_queries_thread = nd_thread_create("mssql_queries", NETDATA_THREAD_OPTION_DEFAULT, netdata_mssql_queries, &update_every);
 
     return 0;
 }
 
-static void do_mssql_general_stats(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *p, int update_every)
+static void do_mssql_general_stats(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *mi, int update_every)
 {
     char id[RRD_ID_LENGTH_MAX + 1];
 
-    PERF_OBJECT_TYPE *pObjectType = perflibFindObjectTypeByName(pDataBlock, p->objectName[NETDATA_MSSQL_GENERAL_STATS]);
+    PERF_OBJECT_TYPE *pObjectType =
+        perflibFindObjectTypeByName(pDataBlock, mi->objectName[NETDATA_MSSQL_GENERAL_STATS]);
     if (!pObjectType)
         return;
 
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLUserConnections)) {
-        if (!p->st_user_connections) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_user_connections", p->instanceID);
+    if (perflibGetObjectCounter(pDataBlock, pObjectType, &mi->MSSQLUserConnections)) {
+        if (!mi->st_user_connections) {
+            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_user_connections", mi->instanceID);
             netdata_fix_chart_name(id);
-            p->st_user_connections = rrdset_create_localhost(
+            mi->st_user_connections = rrdset_create_localhost(
                 "mssql",
                 id,
                 NULL,
@@ -371,21 +1482,21 @@ static void do_mssql_general_stats(PERF_DATA_BLOCK *pDataBlock, struct mssql_ins
                 update_every,
                 RRDSET_TYPE_LINE);
 
-            p->rd_user_connections = rrddim_add(p->st_user_connections, "user", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+            mi->rd_user_connections = rrddim_add(mi->st_user_connections, "user", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
 
-            rrdlabels_add(p->st_user_connections->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
+            rrdlabels_add(mi->st_user_connections->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
         }
 
         rrddim_set_by_pointer(
-            p->st_user_connections, p->rd_user_connections, (collected_number)p->MSSQLUserConnections.current.Data);
-        rrdset_done(p->st_user_connections);
+            mi->st_user_connections, mi->rd_user_connections, (collected_number)mi->MSSQLUserConnections.current.Data);
+        rrdset_done(mi->st_user_connections);
     }
 
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLBlockedProcesses)) {
-        if (!p->st_process_blocked) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_blocked_process", p->instanceID);
+    if (perflibGetObjectCounter(pDataBlock, pObjectType, &mi->MSSQLBlockedProcesses)) {
+        if (!mi->st_process_blocked) {
+            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_blocked_process", mi->instanceID);
             netdata_fix_chart_name(id);
-            p->st_process_blocked = rrdset_create_localhost(
+            mi->st_process_blocked = rrdset_create_localhost(
                 "mssql",
                 id,
                 NULL,
@@ -399,30 +1510,30 @@ static void do_mssql_general_stats(PERF_DATA_BLOCK *pDataBlock, struct mssql_ins
                 update_every,
                 RRDSET_TYPE_LINE);
 
-            p->rd_process_blocked = rrddim_add(p->st_process_blocked, "blocked", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+            mi->rd_process_blocked = rrddim_add(mi->st_process_blocked, "blocked", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
 
-            rrdlabels_add(p->st_process_blocked->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
+            rrdlabels_add(mi->st_process_blocked->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
         }
 
         rrddim_set_by_pointer(
-            p->st_process_blocked, p->rd_process_blocked, (collected_number)p->MSSQLBlockedProcesses.current.Data);
-        rrdset_done(p->st_process_blocked);
+            mi->st_process_blocked, mi->rd_process_blocked, (collected_number)mi->MSSQLBlockedProcesses.current.Data);
+        rrdset_done(mi->st_process_blocked);
     }
 }
 
-static void do_mssql_sql_statistics(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *p, int update_every)
+static void do_mssql_statistics_perflib(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *mi, int update_every)
 {
     char id[RRD_ID_LENGTH_MAX + 1];
 
-    PERF_OBJECT_TYPE *pObjectType = perflibFindObjectTypeByName(pDataBlock, p->objectName[NETDATA_MSSQL_SQL_STATS]);
+    PERF_OBJECT_TYPE *pObjectType = perflibFindObjectTypeByName(pDataBlock, mi->objectName[NETDATA_MSSQL_SQL_STATS]);
     if (!pObjectType)
         return;
 
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLStatsAutoParameterization)) {
-        if (!p->st_stats_auto_param) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_sqlstats_auto_parameterization_attempts", p->instanceID);
+    if (perflibGetObjectCounter(pDataBlock, pObjectType, &mi->MSSQLStatsAutoParameterization)) {
+        if (!mi->st_stats_auto_param) {
+            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_sqlstats_auto_parameterization_attempts", mi->instanceID);
             netdata_fix_chart_name(id);
-            p->st_stats_auto_param = rrdset_create_localhost(
+            mi->st_stats_auto_param = rrdset_create_localhost(
                 "mssql",
                 id,
                 NULL,
@@ -436,24 +1547,24 @@ static void do_mssql_sql_statistics(PERF_DATA_BLOCK *pDataBlock, struct mssql_in
                 update_every,
                 RRDSET_TYPE_LINE);
 
-            p->rd_stats_auto_param =
-                rrddim_add(p->st_stats_auto_param, "failed", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+            mi->rd_stats_auto_param =
+                rrddim_add(mi->st_stats_auto_param, "failed", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
 
-            rrdlabels_add(p->st_stats_auto_param->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
+            rrdlabels_add(mi->st_stats_auto_param->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
         }
 
         rrddim_set_by_pointer(
-            p->st_stats_auto_param,
-            p->rd_stats_auto_param,
-            (collected_number)p->MSSQLStatsAutoParameterization.current.Data);
-        rrdset_done(p->st_stats_auto_param);
+            mi->st_stats_auto_param,
+            mi->rd_stats_auto_param,
+            (collected_number)mi->MSSQLStatsAutoParameterization.current.Data);
+        rrdset_done(mi->st_stats_auto_param);
     }
 
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLStatsBatchRequests)) {
-        if (!p->st_stats_batch_request) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_sqlstats_batch_requests", p->instanceID);
+    if (perflibGetObjectCounter(pDataBlock, pObjectType, &mi->MSSQLStatsBatchRequests)) {
+        if (!mi->st_stats_batch_request) {
+            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_sqlstats_batch_requests", mi->instanceID);
             netdata_fix_chart_name(id);
-            p->st_stats_batch_request = rrdset_create_localhost(
+            mi->st_stats_batch_request = rrdset_create_localhost(
                 "mssql",
                 id,
                 NULL,
@@ -467,24 +1578,25 @@ static void do_mssql_sql_statistics(PERF_DATA_BLOCK *pDataBlock, struct mssql_in
                 update_every,
                 RRDSET_TYPE_LINE);
 
-            p->rd_stats_batch_request =
-                rrddim_add(p->st_stats_batch_request, "batch", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+            mi->rd_stats_batch_request =
+                rrddim_add(mi->st_stats_batch_request, "batch", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
 
-            rrdlabels_add(p->st_stats_batch_request->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
+            rrdlabels_add(mi->st_stats_batch_request->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
         }
 
         rrddim_set_by_pointer(
-            p->st_stats_batch_request,
-            p->rd_stats_batch_request,
-            (collected_number)p->MSSQLStatsBatchRequests.current.Data);
-        rrdset_done(p->st_stats_batch_request);
+            mi->st_stats_batch_request,
+            mi->rd_stats_batch_request,
+            (collected_number)mi->MSSQLStatsBatchRequests.current.Data);
+        rrdset_done(mi->st_stats_batch_request);
     }
 
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLStatSafeAutoParameterization)) {
-        if (!p->st_stats_safe_auto) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_sqlstats_safe_auto_parameterization_attempts", p->instanceID);
+    if (perflibGetObjectCounter(pDataBlock, pObjectType, &mi->MSSQLStatSafeAutoParameterization)) {
+        if (!mi->st_stats_safe_auto) {
+            snprintfz(
+                id, RRD_ID_LENGTH_MAX, "instance_%s_sqlstats_safe_auto_parameterization_attempts", mi->instanceID);
             netdata_fix_chart_name(id);
-            p->st_stats_safe_auto = rrdset_create_localhost(
+            mi->st_stats_safe_auto = rrdset_create_localhost(
                 "mssql",
                 id,
                 NULL,
@@ -498,226 +1610,33 @@ static void do_mssql_sql_statistics(PERF_DATA_BLOCK *pDataBlock, struct mssql_in
                 update_every,
                 RRDSET_TYPE_LINE);
 
-            p->rd_stats_safe_auto = rrddim_add(p->st_stats_safe_auto, "safe", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+            mi->rd_stats_safe_auto = rrddim_add(mi->st_stats_safe_auto, "safe", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
 
-            rrdlabels_add(p->st_stats_safe_auto->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
+            rrdlabels_add(mi->st_stats_safe_auto->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
         }
 
         rrddim_set_by_pointer(
-            p->st_stats_safe_auto,
-            p->rd_stats_safe_auto,
-            (collected_number)p->MSSQLStatSafeAutoParameterization.current.Data);
-        rrdset_done(p->st_stats_safe_auto);
-    }
-
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLCompilations)) {
-        if (!p->st_stats_compilation) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_sqlstats_sql_compilations", p->instanceID);
-            netdata_fix_chart_name(id);
-            p->st_stats_compilation = rrdset_create_localhost(
-                "mssql",
-                id,
-                NULL,
-                "sql activity",
-                "mssql.instance_sqlstats_sql_compilations",
-                "SQL compilations",
-                "compilations/s",
-                PLUGIN_WINDOWS_NAME,
-                "PerflibMSSQL",
-                PRIO_MSSQL_STATS_COMPILATIONS,
-                update_every,
-                RRDSET_TYPE_LINE);
-
-            p->rd_stats_compilation =
-                rrddim_add(p->st_stats_compilation, "compilations", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
-
-            rrdlabels_add(p->st_stats_compilation->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
-        }
-
-        rrddim_set_by_pointer(
-            p->st_stats_compilation, p->rd_stats_compilation, (collected_number)p->MSSQLCompilations.current.Data);
-        rrdset_done(p->st_stats_compilation);
-    }
-
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLRecompilations)) {
-        if (!p->st_stats_recompiles) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_sqlstats_sql_recompilations", p->instanceID);
-            netdata_fix_chart_name(id);
-            p->st_stats_recompiles = rrdset_create_localhost(
-                "mssql",
-                id,
-                NULL,
-                "sql activity",
-                "mssql.instance_sqlstats_sql_recompilations",
-                "SQL re-compilations",
-                "recompiles/",
-                PLUGIN_WINDOWS_NAME,
-                "PerflibMSSQL",
-                PRIO_MSSQL_STATS_RECOMPILATIONS,
-                update_every,
-                RRDSET_TYPE_LINE);
-
-            p->rd_stats_recompiles =
-                rrddim_add(p->st_stats_recompiles, "recompiles", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
-
-            rrdlabels_add(p->st_stats_recompiles->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
-        }
-
-        rrddim_set_by_pointer(
-            p->st_stats_recompiles, p->rd_stats_recompiles, (collected_number)p->MSSQLRecompilations.current.Data);
-        rrdset_done(p->st_stats_recompiles);
+            mi->st_stats_safe_auto,
+            mi->rd_stats_safe_auto,
+            (collected_number)mi->MSSQLStatSafeAutoParameterization.current.Data);
+        rrdset_done(mi->st_stats_safe_auto);
     }
 }
 
-static void do_mssql_buffer_management(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *p, int update_every)
+static void do_mssql_access_methods(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *mi, int update_every)
 {
     char id[RRD_ID_LENGTH_MAX + 1];
 
     PERF_OBJECT_TYPE *pObjectType =
-        perflibFindObjectTypeByName(pDataBlock, p->objectName[NETDATA_MSSQL_BUFFER_MANAGEMENT]);
+        perflibFindObjectTypeByName(pDataBlock, mi->objectName[NETDATA_MSSQL_ACCESS_METHODS]);
     if (!pObjectType)
         return;
 
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLBufferCacheHits)) {
-        if (!p->st_buff_cache_hits) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_cache_hit_ratio", p->instanceID);
+    if (perflibGetObjectCounter(pDataBlock, pObjectType, &mi->MSSQLAccessMethodPageSplits)) {
+        if (!mi->st_access_method_page_splits) {
+            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_accessmethods_page_splits", mi->instanceID);
             netdata_fix_chart_name(id);
-            p->st_buff_cache_hits = rrdset_create_localhost(
-                "mssql",
-                id,
-                NULL,
-                "buffer cache",
-                "mssql.instance_cache_hit_ratio",
-                "Buffer Cache hit ratio",
-                "percentage",
-                PLUGIN_WINDOWS_NAME,
-                "PerflibMSSQL",
-                PRIO_MSSQL_BUFF_CACHE_HIT_RATIO,
-                update_every,
-                RRDSET_TYPE_LINE);
-
-            p->rd_buff_cache_hits = rrddim_add(p->st_buff_cache_hits, "hit_ratio", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
-
-            rrdlabels_add(p->st_buff_cache_hits->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
-        }
-
-        rrddim_set_by_pointer(
-            p->st_buff_cache_hits, p->rd_buff_cache_hits, (collected_number)p->MSSQLBufferCacheHits.current.Data);
-        rrdset_done(p->st_buff_cache_hits);
-    }
-
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLBufferCheckpointPages)) {
-        if (!p->st_buff_checkpoint_pages) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_bufman_checkpoint_pages", p->instanceID);
-            netdata_fix_chart_name(id);
-            p->st_buff_checkpoint_pages = rrdset_create_localhost(
-                "mssql",
-                id,
-                NULL,
-                "buffer cache",
-                "mssql.instance_bufman_checkpoint_pages",
-                "Flushed pages",
-                "pages/s",
-                PLUGIN_WINDOWS_NAME,
-                "PerflibMSSQL",
-                PRIO_MSSQL_BUFF_CHECKPOINT_PAGES,
-                update_every,
-                RRDSET_TYPE_LINE);
-
-            p->rd_buff_checkpoint_pages =
-                rrddim_add(p->st_buff_checkpoint_pages, "log", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
-
-            rrdlabels_add(p->st_buff_checkpoint_pages->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
-        }
-
-        rrddim_set_by_pointer(
-            p->st_buff_checkpoint_pages,
-            p->rd_buff_checkpoint_pages,
-            (collected_number)p->MSSQLBufferCheckpointPages.current.Data);
-        rrdset_done(p->st_buff_checkpoint_pages);
-    }
-
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLBufferPageLifeExpectancy)) {
-        if (!p->st_buff_cache_page_life_expectancy) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_bufman_page_life_expectancy", p->instanceID);
-            netdata_fix_chart_name(id);
-            p->st_buff_cache_page_life_expectancy = rrdset_create_localhost(
-                "mssql",
-                id,
-                NULL,
-                "buffer cache",
-                "mssql.instance_bufman_page_life_expectancy",
-                "Page life expectancy",
-                "seconds",
-                PLUGIN_WINDOWS_NAME,
-                "PerflibMSSQL",
-                PRIO_MSSQL_BUFF_PAGE_LIFE_EXPECTANCY,
-                update_every,
-                RRDSET_TYPE_LINE);
-
-            p->rd_buff_cache_page_life_expectancy = rrddim_add(
-                p->st_buff_cache_page_life_expectancy, "life_expectancy", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
-
-            rrdlabels_add(
-                p->st_buff_cache_page_life_expectancy->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
-        }
-
-        rrddim_set_by_pointer(
-            p->st_buff_cache_page_life_expectancy,
-            p->rd_buff_cache_page_life_expectancy,
-            (collected_number)p->MSSQLBufferPageLifeExpectancy.current.Data);
-        rrdset_done(p->st_buff_cache_page_life_expectancy);
-    }
-
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLBufferPageReads) &&
-        perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLBufferPageWrites)) {
-        if (!p->st_buff_page_iops) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_bufman_iops", p->instanceID);
-            netdata_fix_chart_name(id);
-            p->st_buff_page_iops = rrdset_create_localhost(
-                "mssql",
-                id,
-                NULL,
-                "buffer cache",
-                "mssql.instance_bufman_iops",
-                "Number of pages input and output",
-                "pages/s",
-                PLUGIN_WINDOWS_NAME,
-                "PerflibMSSQL",
-                PRIO_MSSQL_BUFF_MAN_IOPS,
-                update_every,
-                RRDSET_TYPE_LINE);
-
-            p->rd_buff_page_reads = rrddim_add(p->st_buff_page_iops, "read", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
-            p->rd_buff_page_writes =
-                rrddim_add(p->st_buff_page_iops, "written", NULL, -1, 1, RRD_ALGORITHM_INCREMENTAL);
-
-            rrdlabels_add(p->st_buff_page_iops->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
-        }
-
-        rrddim_set_by_pointer(
-            p->st_buff_page_iops, p->rd_buff_page_reads, (collected_number)p->MSSQLBufferPageReads.current.Data);
-        rrddim_set_by_pointer(
-            p->st_buff_page_iops, p->rd_buff_page_writes, (collected_number)p->MSSQLBufferPageWrites.current.Data);
-
-        rrdset_done(p->st_buff_page_iops);
-    }
-}
-
-static void do_mssql_access_methods(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *p, int update_every)
-{
-    char id[RRD_ID_LENGTH_MAX + 1];
-
-    PERF_OBJECT_TYPE *pObjectType =
-        perflibFindObjectTypeByName(pDataBlock, p->objectName[NETDATA_MSSQL_ACCESS_METHODS]);
-    if (!pObjectType)
-        return;
-
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLAccessMethodPageSplits)) {
-        if (!p->st_access_method_page_splits) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_accessmethods_page_splits", p->instanceID);
-            netdata_fix_chart_name(id);
-            p->st_access_method_page_splits = rrdset_create_localhost(
+            mi->st_access_method_page_splits = rrdset_create_localhost(
                 "mssql",
                 id,
                 NULL,
@@ -731,34 +1650,34 @@ static void do_mssql_access_methods(PERF_DATA_BLOCK *pDataBlock, struct mssql_in
                 update_every,
                 RRDSET_TYPE_LINE);
 
-            p->rd_access_method_page_splits =
-                rrddim_add(p->st_access_method_page_splits, "page", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+            mi->rd_access_method_page_splits =
+                rrddim_add(mi->st_access_method_page_splits, "page", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
 
             rrdlabels_add(
-                p->st_access_method_page_splits->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
+                mi->st_access_method_page_splits->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
         }
 
         rrddim_set_by_pointer(
-            p->st_access_method_page_splits,
-            p->rd_access_method_page_splits,
-            (collected_number)p->MSSQLAccessMethodPageSplits.current.Data);
-        rrdset_done(p->st_access_method_page_splits);
+            mi->st_access_method_page_splits,
+            mi->rd_access_method_page_splits,
+            (collected_number)mi->MSSQLAccessMethodPageSplits.current.Data);
+        rrdset_done(mi->st_access_method_page_splits);
     }
 }
 
-static void do_mssql_errors(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *p, int update_every)
+static void do_mssql_errors(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *mi, int update_every)
 {
     char id[RRD_ID_LENGTH_MAX + 1];
 
-    PERF_OBJECT_TYPE *pObjectType = perflibFindObjectTypeByName(pDataBlock, p->objectName[NETDATA_MSSQL_SQL_ERRORS]);
+    PERF_OBJECT_TYPE *pObjectType = perflibFindObjectTypeByName(pDataBlock, mi->objectName[NETDATA_MSSQL_SQL_ERRORS]);
     if (!pObjectType)
         return;
 
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLSQLErrorsTotal)) {
-        if (!p->st_sql_errors) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_sql_errors_total", p->instanceID);
+    if (perflibGetObjectCounter(pDataBlock, pObjectType, &mi->MSSQLSQLErrorsTotal)) {
+        if (!mi->st_sql_errors) {
+            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_sql_errors_total", mi->instanceID);
             netdata_fix_chart_name(id);
-            p->st_sql_errors = rrdset_create_localhost(
+            mi->st_sql_errors = rrdset_create_localhost(
                 "mssql",
                 id,
                 NULL,
@@ -772,135 +1691,664 @@ static void do_mssql_errors(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *
                 update_every,
                 RRDSET_TYPE_LINE);
 
-            p->rd_sql_errors = rrddim_add(p->st_sql_errors, "errors", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+            mi->rd_sql_errors = rrddim_add(mi->st_sql_errors, "errors", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
 
-            rrdlabels_add(p->st_sql_errors->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
+            rrdlabels_add(mi->st_sql_errors->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
         }
 
         rrddim_set_by_pointer(
-            p->st_sql_errors, p->rd_sql_errors, (collected_number)p->MSSQLAccessMethodPageSplits.current.Data);
-        rrdset_done(p->st_sql_errors);
+            mi->st_sql_errors, mi->rd_sql_errors, (collected_number)mi->MSSQLAccessMethodPageSplits.current.Data);
+        rrdset_done(mi->st_sql_errors);
     }
 }
 
-int dict_mssql_locks_charts_cb(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused)
+void dict_mssql_locks_wait_charts(struct mssql_instance *mi, struct mssql_lock_instance *mli, const char *resource)
 {
-    char id[RRD_ID_LENGTH_MAX + 1];
+    if (!mli->st_lockWait) {
+        char id[RRD_ID_LENGTH_MAX + 1];
 
-    struct mssql_lock_instance *mli = value;
-    const char *instance = dictionary_acquired_item_name((DICTIONARY_ITEM *)item);
-
-    int *update_every = data;
-
-    if (!mli->parent->st_lockWait) {
-        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_locks_lock_wait", mli->parent->instanceID);
+        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_resource_%s_lock_wait", mi->instanceID, resource);
         netdata_fix_chart_name(id);
-        mli->parent->st_lockWait = rrdset_create_localhost(
+        mli->st_lockWait = rrdset_create_localhost(
             "mssql",
             id,
             NULL,
             "locks",
-            "mssql.instance_locks_lock_wait",
-            "Lock requests that required the caller to wait.",
+            "mssql.instance_resource_lock_waits",
+            "Lock requests that required the caller to wait per resource",
             "locks/s",
             PLUGIN_WINDOWS_NAME,
             "PerflibMSSQL",
             PRIO_MSSQL_LOCKS_WAIT,
-            *update_every,
+            mi->update_every,
             RRDSET_TYPE_LINE);
 
-        rrdlabels_add(
-            mli->parent->st_lockWait->rrdlabels, "mssql_instance", mli->parent->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mli->st_lockWait->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mli->st_lockWait->rrdlabels, "resource", resource, RRDLABEL_SRC_AUTO);
+        mli->rd_lockWait = rrddim_add(mli->st_lockWait, "locks", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
     }
 
-    if (!mli->rd_lockWait) {
-        mli->rd_lockWait = rrddim_add(mli->parent->st_lockWait, instance, NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
-    }
+    rrddim_set_by_pointer(mli->st_lockWait, mli->rd_lockWait, (collected_number)mli->lockWait.current.Data);
+    rrdset_done(mli->st_lockWait);
+}
 
-    if (mli->updated & (1 << NETDATA_MSSQL_ENUM_MLI_IDX_WAIT)) {
-        rrddim_set_by_pointer(
-            mli->parent->st_lockWait, mli->rd_lockWait, (collected_number)(mli->lockWait.current.Data));
-    }
+void dict_mssql_dead_locks_charts(struct mssql_instance *mi, struct mssql_lock_instance *mli, const char *resource)
+{
+    if (!mli->st_deadLocks) {
+        char id[RRD_ID_LENGTH_MAX + 1];
 
-    if (!mli->parent->st_deadLocks) {
-        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_locks_deadlocks", mli->parent->instanceID);
+        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_resource_%s_deadlocks", mi->instanceID, resource);
         netdata_fix_chart_name(id);
-        mli->parent->st_deadLocks = rrdset_create_localhost(
+        mli->st_deadLocks = rrdset_create_localhost(
             "mssql",
             id,
             NULL,
             "locks",
-            "mssql.instance_locks_deadlocks",
-            "Lock requests that resulted in deadlock.",
+            "mssql.instance_resource_deadlocks",
+            "Active lock requests that resulted in deadlock per resource",
             "deadlocks/s",
             PLUGIN_WINDOWS_NAME,
             "PerflibMSSQL",
-            PRIO_MSSQL_LOCKS_DEADLOCK,
-            *update_every,
+            PRIO_MSSQL_LOCKS_DEADLOCK_PER_RESOURCE,
+            mi->update_every,
             RRDSET_TYPE_LINE);
 
-        rrdlabels_add(
-            mli->parent->st_deadLocks->rrdlabels, "mssql_instance", mli->parent->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mli->st_deadLocks->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mli->st_deadLocks->rrdlabels, "resource", resource, RRDLABEL_SRC_AUTO);
+        mli->rd_deadLocks = rrddim_add(mli->st_deadLocks, "deadlocks", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
     }
 
-    if (!mli->rd_deadLocks) {
-        mli->rd_deadLocks = rrddim_add(mli->parent->st_deadLocks, instance, NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
-    }
+    rrddim_set_by_pointer(mli->st_deadLocks, mli->rd_deadLocks, (collected_number)mli->deadLocks.current.Data);
+    rrdset_done(mli->st_deadLocks);
+}
 
-    if (mli->updated & (1 << NETDATA_MSSQL_ENUM_MLI_IDX_DEAD_LOCKS)) {
-        rrddim_set_by_pointer(
-            mli->parent->st_deadLocks, mli->rd_deadLocks, (collected_number)mli->deadLocks.current.Data);
-    }
+int dict_mssql_locks_charts_cb(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused)
+{
+    const char *dimension = dictionary_acquired_item_name((DICTIONARY_ITEM *)item);
+    struct mssql_lock_instance *mli = value;
+    struct mssql_instance *mi = data;
+
+    dict_mssql_locks_wait_charts(mi, mli, dimension);
+    dict_mssql_dead_locks_charts(mi, mli, dimension);
 
     return 1;
 }
 
-static void do_mssql_locks(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *p, int update_every)
+static void do_mssql_locks(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *mi, int update_every __maybe_unused)
 {
-    PERF_OBJECT_TYPE *pObjectType = perflibFindObjectTypeByName(pDataBlock, p->objectName[NETDATA_MSSQL_LOCKS]);
-    if (!pObjectType)
-        return;
+    if (!pDataBlock)
+        goto end_mssql_locks;
 
-    PERF_INSTANCE_DEFINITION *pi = NULL;
-    for (LONG i = 0; i < pObjectType->NumInstances; i++) {
-        pi = perflibForEachInstance(pDataBlock, pObjectType, pi);
-        if (!pi)
-            break;
+    PERF_OBJECT_TYPE *pObjectType = perflibFindObjectTypeByName(pDataBlock, mi->objectName[NETDATA_MSSQL_LOCKS]);
+    if (pObjectType) {
+        if (pObjectType->NumInstances) {
+            PERF_INSTANCE_DEFINITION *pi = NULL;
+            for (LONG i = 0; i < pObjectType->NumInstances; i++) {
+                pi = perflibForEachInstance(pDataBlock, pObjectType, pi);
+                if (!pi)
+                    break;
 
-        if (!getInstanceName(pDataBlock, pObjectType, pi, windows_shared_buffer, sizeof(windows_shared_buffer)))
-            strncpyz(windows_shared_buffer, "[unknown]", sizeof(windows_shared_buffer) - 1);
+                if (!getInstanceName(pDataBlock, pObjectType, pi, windows_shared_buffer, sizeof(windows_shared_buffer)))
+                    strncpyz(windows_shared_buffer, "[unknown]", sizeof(windows_shared_buffer) - 1);
 
-        if (!strcasecmp(windows_shared_buffer, "_Total"))
-            continue;
+                if (!strcasecmp(windows_shared_buffer, "_Total"))
+                    continue;
 
-        struct mssql_lock_instance *mli = dictionary_set(p->locks_instances, windows_shared_buffer, NULL, sizeof(*mli));
-        if (!mli)
-            continue;
+                struct mssql_lock_instance *mli =
+                    dictionary_set(mi->locks_instances, windows_shared_buffer, NULL, sizeof(*mli));
+                if (!mli)
+                    continue;
 
-        if (!mli->parent) {
-            mli->parent = p;
+                perflibGetInstanceCounter(pDataBlock, pObjectType, pi, &mli->deadLocks);
+                perflibGetInstanceCounter(pDataBlock, pObjectType, pi, &mli->lockWait);
+            }
         }
-
-        if (perflibGetObjectCounter(pDataBlock, pObjectType, &mli->lockWait))
-            mli->updated |= (1 << NETDATA_MSSQL_ENUM_MLI_IDX_WAIT);
-
-        if (perflibGetObjectCounter(pDataBlock, pObjectType, &mli->deadLocks))
-            mli->updated |= (1 << NETDATA_MSSQL_ENUM_MLI_IDX_DEAD_LOCKS);
     }
 
-    dictionary_sorted_walkthrough_read(p->locks_instances, dict_mssql_locks_charts_cb, &update_every);
-    rrdset_done(p->st_lockWait);
-    rrdset_done(p->st_deadLocks);
+end_mssql_locks:
+    dictionary_sorted_walkthrough_read(mi->locks_instances, dict_mssql_locks_charts_cb, mi);
 }
 
-static void mssql_database_backup_restore_chart(struct mssql_db_instance *mli, const char *db, int update_every)
+void mssql_total_wait_charts(struct mssql_instance *mi, struct mssql_db_waits *mdw, const char *type)
+{
+    if (!mdw->st_total_wait) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+
+        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_%s_total_wait", mi->instanceID, type);
+        netdata_fix_chart_name(id);
+        mdw->st_total_wait = rrdset_create_localhost(
+            "mssql",
+            id,
+            NULL,
+            "locks",
+            "mssql.instance_total_wait_time",
+            "Wait time for each wait type and category",
+            "ms",
+            PLUGIN_WINDOWS_NAME,
+            "PerflibMSSQL",
+            PRIO_MSSQL_WAITS_TOTAL,
+            mi->update_every,
+            RRDSET_TYPE_LINE);
+
+        rrdlabels_add(mdw->st_total_wait->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdw->st_total_wait->rrdlabels, "wait_type", mdw->wait_type, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdw->st_total_wait->rrdlabels, "wait_category", mdw->wait_category, RRDLABEL_SRC_AUTO);
+        mdw->rd_total_wait = rrddim_add(mdw->st_total_wait, "duration", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+    }
+
+    rrddim_set_by_pointer(
+        mdw->st_total_wait, mdw->rd_total_wait, (collected_number)mdw->MSSQLDatabaseTotalWait.current.Data);
+
+    rrdset_done(mdw->st_total_wait);
+}
+
+void mssql_resource_wait_charts(struct mssql_instance *mi, struct mssql_db_waits *mdw, const char *type)
+{
+    if (!mdw->st_resource_wait_msec) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+
+        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_%s_resource_wait", mi->instanceID, type);
+        netdata_fix_chart_name(id);
+        mdw->st_resource_wait_msec = rrdset_create_localhost(
+            "mssql",
+            id,
+            NULL,
+            "locks",
+            "mssql.instance_resource_wait_time",
+            "Wait time for threads waiting on specific resource types for each wait type and category",
+            "ms",
+            PLUGIN_WINDOWS_NAME,
+            "PerflibMSSQL",
+            PRIO_MSSQL_RESOURCE_WAIT,
+            mi->update_every,
+            RRDSET_TYPE_LINE);
+
+        rrdlabels_add(mdw->st_resource_wait_msec->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdw->st_resource_wait_msec->rrdlabels, "wait_type", mdw->wait_type, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdw->st_resource_wait_msec->rrdlabels, "wait_category", mdw->wait_category, RRDLABEL_SRC_AUTO);
+        mdw->rd_resource_wait_msec =
+            rrddim_add(mdw->st_resource_wait_msec, "duration", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+    }
+
+    rrddim_set_by_pointer(
+        mdw->st_resource_wait_msec,
+        mdw->rd_resource_wait_msec,
+        (collected_number)mdw->MSSQLDatabaseResourceWaitMSec.current.Data);
+
+    rrdset_done(mdw->st_resource_wait_msec);
+}
+
+void mssql_signal_wait_charts(struct mssql_instance *mi, struct mssql_db_waits *mdw, const char *type)
+{
+    if (!mdw->st_signal_wait_msec) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+
+        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_%s_signal_wait", mi->instanceID, type);
+        netdata_fix_chart_name(id);
+        mdw->st_signal_wait_msec = rrdset_create_localhost(
+            "mssql",
+            id,
+            NULL,
+            "locks",
+            "mssql.instance_signal_wait_time",
+            "Delay between thread wakeup signal and actual execution start for each wait type and category",
+            "ms",
+            PLUGIN_WINDOWS_NAME,
+            "PerflibMSSQL",
+            PRIO_MSSQL_SIGNAL_WAIT,
+            mi->update_every,
+            RRDSET_TYPE_LINE);
+
+        rrdlabels_add(mdw->st_signal_wait_msec->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdw->st_signal_wait_msec->rrdlabels, "wait_type", mdw->wait_type, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdw->st_signal_wait_msec->rrdlabels, "wait_category", mdw->wait_category, RRDLABEL_SRC_AUTO);
+        mdw->rd_signal_wait_msec =
+            rrddim_add(mdw->st_signal_wait_msec, "duration", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+    }
+
+    rrddim_set_by_pointer(
+        mdw->st_signal_wait_msec,
+        mdw->rd_signal_wait_msec,
+        (collected_number)mdw->MSSQLDatabaseSignalWaitMSec.current.Data);
+
+    rrdset_done(mdw->st_signal_wait_msec);
+}
+
+void mssql_max_wait_charts(struct mssql_instance *mi, struct mssql_db_waits *mdw, const char *type)
+{
+    if (!mdw->st_max_wait_time_msec) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+
+        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_%s_max_wait", mi->instanceID, type);
+        netdata_fix_chart_name(id);
+        mdw->st_max_wait_time_msec = rrdset_create_localhost(
+            "mssql",
+            id,
+            NULL,
+            "locks",
+            "mssql.instance_max_wait_time",
+            "Maximum wait time for each wait type and category",
+            "ms",
+            PLUGIN_WINDOWS_NAME,
+            "PerflibMSSQL",
+            PRIO_MSSQL_MAX_WAIT_TIME,
+            mi->update_every,
+            RRDSET_TYPE_LINE);
+
+        rrdlabels_add(mdw->st_max_wait_time_msec->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdw->st_max_wait_time_msec->rrdlabels, "wait_type", mdw->wait_type, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdw->st_max_wait_time_msec->rrdlabels, "wait_category", mdw->wait_category, RRDLABEL_SRC_AUTO);
+        mdw->rd_max_wait_time_msec =
+            rrddim_add(mdw->st_max_wait_time_msec, "duration", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+    }
+
+    rrddim_set_by_pointer(
+        mdw->st_max_wait_time_msec,
+        mdw->rd_max_wait_time_msec,
+        (collected_number)mdw->MSSQLDatabaseMaxWaitTimeMSec.current.Data);
+
+    rrdset_done(mdw->st_max_wait_time_msec);
+}
+
+void mssql_waiting_count_charts(struct mssql_instance *mi, struct mssql_db_waits *mdw, const char *type)
+{
+    if (!mdw->st_waiting_tasks) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+
+        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_%s_waiting_count", mi->instanceID, type);
+        netdata_fix_chart_name(id);
+        mdw->st_waiting_tasks = rrdset_create_localhost(
+            "mssql",
+            id,
+            NULL,
+            "locks",
+            "mssql.instance_waits",
+            "Number of waits for each wait type and category",
+            "waits/s",
+            PLUGIN_WINDOWS_NAME,
+            "PerflibMSSQL",
+            PRIO_MSSQL_WAITING_COUNT,
+            mi->update_every,
+            RRDSET_TYPE_LINE);
+
+        rrdlabels_add(mdw->st_waiting_tasks->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdw->st_waiting_tasks->rrdlabels, "wait_type", mdw->wait_type, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdw->st_waiting_tasks->rrdlabels, "wait_category", mdw->wait_category, RRDLABEL_SRC_AUTO);
+        mdw->rd_waiting_tasks = rrddim_add(mdw->st_waiting_tasks, "waits", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+    }
+
+    rrddim_set_by_pointer(
+        mdw->st_waiting_tasks, mdw->rd_waiting_tasks, (collected_number)mdw->MSSQLDatabaseWaitingTasks.current.Data);
+
+    rrdset_done(mdw->st_waiting_tasks);
+}
+
+int dict_mssql_waits_charts_cb(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused)
+{
+    const char *dimension = dictionary_acquired_item_name((DICTIONARY_ITEM *)item);
+    struct mssql_db_waits *mdw = value;
+    struct mssql_instance *mi = data;
+
+    mssql_total_wait_charts(mi, mdw, dimension);
+    mssql_resource_wait_charts(mi, mdw, dimension);
+    mssql_signal_wait_charts(mi, mdw, dimension);
+    mssql_max_wait_charts(mi, mdw, dimension);
+    mssql_waiting_count_charts(mi, mdw, dimension);
+
+    return 1;
+}
+
+static void do_mssql_waits(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *mi, int update_every)
+{
+    dictionary_sorted_walkthrough_read(mi->waits, dict_mssql_waits_charts_cb, mi);
+}
+
+void mssql_buffman_iops_chart(struct mssql_db_instance *mdi, struct mssql_instance *mi)
+{
+    if (!mdi->st_buff_page_iops) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_bufman_iops", mi->instanceID);
+        netdata_fix_chart_name(id);
+        mdi->st_buff_page_iops = rrdset_create_localhost(
+                "mssql",
+                id,
+                NULL,
+                "buffer cache",
+                "mssql.instance_bufman_iops",
+                "Number of pages input and output",
+                "pages/s",
+                PLUGIN_WINDOWS_NAME,
+                "PerflibMSSQL",
+                PRIO_MSSQL_BUFF_MAN_IOPS,
+                mi->update_every,
+                RRDSET_TYPE_LINE);
+
+        mdi->rd_buff_page_reads = rrddim_add(mdi->st_buff_page_iops, "read", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+        mdi->rd_buff_page_writes =
+                rrddim_add(mdi->st_buff_page_iops, "written", NULL, -1, 1, RRD_ALGORITHM_INCREMENTAL);
+
+        rrdlabels_add(mdi->st_buff_page_iops->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+    }
+
+    rrddim_set_by_pointer(
+            mdi->st_buff_page_iops, mdi->rd_buff_page_reads, (collected_number)mdi->MSSQLBufferPageReads.current.Data);
+    rrddim_set_by_pointer(
+            mdi->st_buff_page_iops, mdi->rd_buff_page_writes, (collected_number)mdi->MSSQLBufferPageWrites.current.Data);
+
+    rrdset_done(mdi->st_buff_page_iops);
+}
+
+void mssql_buffman_cache_hit_ratio_chart(struct mssql_db_instance *mdi, struct mssql_instance *mi)
+{
+    if (!mdi->st_buff_cache_hits) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_cache_hit_ratio", mi->instanceID);
+        netdata_fix_chart_name(id);
+        mdi->st_buff_cache_hits = rrdset_create_localhost(
+                "mssql",
+                id,
+                NULL,
+                "buffer cache",
+                "mssql.instance_cache_hit_ratio",
+                "Buffer Cache hit ratio",
+                "percentage",
+                PLUGIN_WINDOWS_NAME,
+                "PerflibMSSQL",
+                PRIO_MSSQL_BUFF_CACHE_HIT_RATIO,
+                mi->update_every,
+                RRDSET_TYPE_LINE);
+
+        mdi->rd_buff_cache_hits =
+                rrddim_add(mdi->st_buff_cache_hits, "hit_ratio", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+
+        rrdlabels_add(mdi->st_buff_cache_hits->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+    }
+
+    rrddim_set_by_pointer(
+            mdi->st_buff_cache_hits, mdi->rd_buff_cache_hits, (collected_number)mdi->MSSQLBufferCacheHits.current.Data);
+    rrdset_done(mdi->st_buff_cache_hits);
+}
+
+void mssql_buffman_checkpoints_pages_chart(struct mssql_db_instance *mdi, struct mssql_instance *mi)
+{
+    if (!mdi->st_buff_checkpoint_pages) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_bufman_checkpoint_pages", mi->instanceID);
+        netdata_fix_chart_name(id);
+        mdi->st_buff_checkpoint_pages = rrdset_create_localhost(
+                "mssql",
+                id,
+                NULL,
+                "buffer cache",
+                "mssql.instance_bufman_checkpoint_pages",
+                "Flushed pages",
+                "pages/s",
+                PLUGIN_WINDOWS_NAME,
+                "PerflibMSSQL",
+                PRIO_MSSQL_BUFF_CHECKPOINT_PAGES,
+                mi->update_every,
+                RRDSET_TYPE_LINE);
+
+        mdi->rd_buff_checkpoint_pages =
+                rrddim_add(mdi->st_buff_checkpoint_pages, "log", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+
+        rrdlabels_add(mdi->st_buff_checkpoint_pages->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+    }
+
+    rrddim_set_by_pointer(
+            mdi->st_buff_checkpoint_pages,
+            mdi->rd_buff_checkpoint_pages,
+            (collected_number)mdi->MSSQLBufferCheckpointPages.current.Data);
+    rrdset_done(mdi->st_buff_checkpoint_pages);
+}
+
+void mssql_buffman_page_life_expectancy_chart(struct mssql_db_instance *mdi, struct mssql_instance *mi)
+{
+    if (!mdi->st_buff_cache_page_life_expectancy) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_bufman_page_life_expectancy", mi->instanceID);
+        netdata_fix_chart_name(id);
+        mdi->st_buff_cache_page_life_expectancy = rrdset_create_localhost(
+                "mssql",
+                id,
+                NULL,
+                "buffer cache",
+                "mssql.instance_bufman_page_life_expectancy",
+                "Page life expectancy",
+                "seconds",
+                PLUGIN_WINDOWS_NAME,
+                "PerflibMSSQL",
+                PRIO_MSSQL_BUFF_PAGE_LIFE_EXPECTANCY,
+                mi->update_every,
+                RRDSET_TYPE_LINE);
+
+        mdi->rd_buff_cache_page_life_expectancy = rrddim_add(
+                mdi->st_buff_cache_page_life_expectancy, "life_expectancy", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+
+        rrdlabels_add(
+                mdi->st_buff_cache_page_life_expectancy->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+    }
+
+    rrddim_set_by_pointer(
+            mdi->st_buff_cache_page_life_expectancy,
+            mdi->rd_buff_cache_page_life_expectancy,
+            (collected_number)mdi->MSSQLBufferPageLifeExpectancy.current.Data);
+    rrdset_done(mdi->st_buff_cache_page_life_expectancy);
+}
+
+void mssql_buffman_lazy_write_chart(struct mssql_db_instance *mdi, struct mssql_instance *mi)
+{
+    if (!mdi->st_buff_lazy_write) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_bufman_lazy_write", mi->instanceID);
+        netdata_fix_chart_name(id);
+        mdi->st_buff_lazy_write = rrdset_create_localhost(
+                "mssql",
+                id,
+                NULL,
+                "buffer cache",
+                "mssql.instance_bufman_lazy_write",
+                "Buffers written by buffer manager's lazy writer",
+                "writes/s",
+                PLUGIN_WINDOWS_NAME,
+                "PerflibMSSQL",
+                PRIO_MSSQL_BUFF_LAZY_WRITE,
+                mi->update_every,
+                RRDSET_TYPE_LINE);
+
+        mdi->rd_buff_lazy_write = rrddim_add(
+                mdi->st_buff_lazy_write, "writes", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+
+        rrdlabels_add(
+                mdi->st_buff_lazy_write->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+    }
+
+    rrddim_set_by_pointer(
+            mdi->st_buff_lazy_write,
+            mdi->rd_buff_lazy_write,
+            (collected_number)mdi->MSSQLBufferLazyWrite.current.Data);
+    rrdset_done(mdi->st_buff_lazy_write);
+}
+
+void mssql_buffman_page_lookups_chart(struct mssql_db_instance *mdi, struct mssql_instance *mi) {
+    if (!mdi->st_buff_page_lookups) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_bufman_page_lookups", mi->instanceID);
+        netdata_fix_chart_name(id);
+        mdi->st_buff_page_lookups = rrdset_create_localhost(
+                "mssql",
+                id,
+                NULL,
+                "buffer cache",
+                "mssql.instance_bufman_page_lookups",
+                "Requests to find a page in the buffer pool.",
+                "lookups/s",
+                PLUGIN_WINDOWS_NAME,
+                "PerflibMSSQL",
+                PRIO_MSSQL_BUFF_PAGE_LOOKUPS,
+                mi->update_every,
+                RRDSET_TYPE_LINE);
+
+        mdi->rd_buff_page_lookups = rrddim_add(
+                mdi->st_buff_page_lookups, "lookups", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+
+        rrdlabels_add(
+                mdi->st_buff_page_lookups->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+    }
+
+    rrddim_set_by_pointer(
+            mdi->st_buff_page_lookups,
+            mdi->rd_buff_page_lookups,
+            (collected_number) mdi->MSSQLBufferPageLookups.current.Data);
+    rrdset_done(mdi->st_buff_page_lookups);
+}
+
+static void netdata_mssql_compilations(struct mssql_db_instance *mdi, struct mssql_instance *mi) {
+    if (!mdi->st_stats_compilation) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_sqlstats_sql_compilations", mi->instanceID);
+        netdata_fix_chart_name(id);
+        mdi->st_stats_compilation = rrdset_create_localhost(
+                "mssql",
+                id,
+                NULL,
+                "sql activity",
+                "mssql.instance_sqlstats_sql_compilations",
+                "SQL compilations",
+                "compilations/s",
+                PLUGIN_WINDOWS_NAME,
+                "PerflibMSSQL",
+                PRIO_MSSQL_STATS_COMPILATIONS,
+                mi->update_every,
+                RRDSET_TYPE_LINE);
+
+        mdi->rd_stats_compilation =
+                rrddim_add(mdi->st_stats_compilation, "compilations", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+
+        rrdlabels_add(mdi->st_stats_compilation->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+    }
+
+    rrddim_set_by_pointer(
+            mdi->st_stats_compilation, mdi->rd_stats_compilation,
+            (collected_number) mdi->MSSQLCompilations.current.Data);
+    rrdset_done(mdi->st_stats_compilation);
+}
+
+static void netdata_mssql_recompilations(struct mssql_db_instance *mdi, struct mssql_instance *mi)
+{
+    if (!mdi->st_stats_recompiles) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+        snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_sqlstats_sql_recompilations", mi->instanceID);
+        netdata_fix_chart_name(id);
+        mdi->st_stats_recompiles = rrdset_create_localhost(
+                "mssql",
+                id,
+                NULL,
+                "sql activity",
+                "mssql.instance_sqlstats_sql_recompilations",
+                "SQL re-compilations",
+                "recompiles/s",
+                PLUGIN_WINDOWS_NAME,
+                "PerflibMSSQL",
+                PRIO_MSSQL_STATS_RECOMPILATIONS,
+                mi->update_every,
+                RRDSET_TYPE_LINE);
+
+        mdi->rd_stats_recompiles =
+                rrddim_add(mdi->st_stats_recompiles, "recompiles", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+
+        rrdlabels_add(mdi->st_stats_recompiles->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+    }
+
+    rrddim_set_by_pointer(
+            mdi->st_stats_recompiles, mdi->rd_stats_recompiles, (collected_number)mdi->MSSQLRecompilations.current.Data);
+    rrdset_done(mdi->st_stats_recompiles);
+}
+
+int dict_mssql_buffman_stats_charts_cb(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused)
+{
+    struct mssql_db_instance *mdi = value;
+    struct mssql_instance *mi = data;
+
+    if (unlikely(!mdi->collect_instance))
+        return 1;
+
+    mssql_buffman_iops_chart(mdi, mi);
+    mssql_buffman_cache_hit_ratio_chart(mdi, mi);
+    mssql_buffman_checkpoints_pages_chart(mdi, mi);
+    mssql_buffman_page_life_expectancy_chart(mdi, mi);
+    mssql_buffman_lazy_write_chart(mdi, mi);
+    mssql_buffman_page_lookups_chart(mdi, mi);
+
+    netdata_mssql_compilations(mdi, mi);
+    netdata_mssql_recompilations(mdi, mi);
+
+    return 1;
+}
+
+static void do_mssql_bufferman_stats_sql(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *mi, int update_every)
+{
+    dictionary_sorted_walkthrough_read(mi->databases, dict_mssql_buffman_stats_charts_cb, mi);
+}
+
+static void netdata_mssql_jobs_status(struct mssql_db_jobs *mdj, struct mssql_instance *mi, const char *job)
+{
+    if (!mdj->st_status) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+        snprintfz(id, RRD_ID_LENGTH_MAX, "job_%s_instance_%s_status", job, mi->instanceID);
+        netdata_fix_chart_name(id);
+        mdj->st_status = rrdset_create_localhost(
+                "mssql",
+                id,
+                NULL,
+                "jobs",
+                "mssql.instance_jobs_status",
+                "Jobs running",
+                "status",
+                PLUGIN_WINDOWS_NAME,
+                "PerflibMSSQL",
+                PRIO_MSSQL_DATABASE_JOBS_STATUS,
+                mi->update_every,
+                RRDSET_TYPE_LINE);
+
+        mdj->rd_status_enabled =
+                rrddim_add(mdj->st_status, "enabled", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+
+        mdj->rd_status_disabled =
+                rrddim_add(mdj->st_status, "disabled", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+
+        rrdlabels_add(mdj->st_status->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdj->st_status->rrdlabels, "job_name", job, RRDLABEL_SRC_AUTO);
+    }
+
+    rrddim_set_by_pointer(
+            mdj->st_status, mdj->rd_status_enabled, (collected_number)(mdj->MSSQLJOBState.current.Data == 1));
+    rrddim_set_by_pointer(
+            mdj->st_status, mdj->rd_status_disabled, (collected_number)(mdj->MSSQLJOBState.current.Data == 0));
+    rrdset_done(mdj->st_status);
+}
+
+int dict_mssql_sysjobs_chart_cb(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused) {
+    const char *job = dictionary_acquired_item_name((DICTIONARY_ITEM *)item);
+    struct mssql_db_jobs *mdj = value;
+    struct mssql_instance *mi = data;
+
+    netdata_mssql_jobs_status(mdj, mi, job);
+}
+
+static void do_mssql_job_status_sql(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *mi, int update_every)
+{
+    dictionary_sorted_walkthrough_read(mi->sysjobs, dict_mssql_sysjobs_chart_cb, mi);
+}
+
+static void mssql_database_backup_restore_chart(struct mssql_db_instance *mdi, const char *db, int update_every)
 {
     char id[RRD_ID_LENGTH_MAX + 1];
 
-    if (!mli->st_db_backup_restore_operations) {
-        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_backup_restore_operations", db, mli->parent->instanceID);
+    if (!mdi->st_db_backup_restore_operations) {
+        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_backup_restore_operations", db, mdi->parent->instanceID);
         netdata_fix_chart_name(id);
-        mli->st_db_backup_restore_operations = rrdset_create_localhost(
+        mdi->st_db_backup_restore_operations = rrdset_create_localhost(
             "mssql",
             id,
             NULL,
@@ -915,36 +2363,32 @@ static void mssql_database_backup_restore_chart(struct mssql_db_instance *mli, c
             RRDSET_TYPE_LINE);
 
         rrdlabels_add(
-            mli->st_db_backup_restore_operations->rrdlabels,
+            mdi->st_db_backup_restore_operations->rrdlabels,
             "mssql_instance",
-            mli->parent->instanceID,
+            mdi->parent->instanceID,
             RRDLABEL_SRC_AUTO);
-        rrdlabels_add(mli->st_db_backup_restore_operations->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_db_backup_restore_operations->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+
+        mdi->rd_db_backup_restore_operations =
+            rrddim_add(mdi->st_db_backup_restore_operations, "backup", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
     }
 
-    if (!mli->rd_db_backup_restore_operations) {
-        mli->rd_db_backup_restore_operations =
-            rrddim_add(mli->st_db_backup_restore_operations, "backup", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
-    }
+    rrddim_set_by_pointer(
+        mdi->st_db_backup_restore_operations,
+        mdi->rd_db_backup_restore_operations,
+        (collected_number)mdi->MSSQLDatabaseBackupRestoreOperations.current.Data);
 
-    if (mli->updated & (1 << NETDATA_MSSQL_ENUM_MDI_IDX_BACKUP_RESTORE_OP)) {
-        rrddim_set_by_pointer(
-            mli->st_db_backup_restore_operations,
-            mli->rd_db_backup_restore_operations,
-            (collected_number)mli->MSSQLDatabaseBackupRestoreOperations.current.Data);
-    }
-
-    rrdset_done(mli->st_db_backup_restore_operations);
+    rrdset_done(mdi->st_db_backup_restore_operations);
 }
 
-static void mssql_database_log_flushes_chart(struct mssql_db_instance *mli, const char *db, int update_every)
+static void mssql_database_log_flushes_chart(struct mssql_db_instance *mdi, const char *db, int update_every)
 {
     char id[RRD_ID_LENGTH_MAX + 1];
 
-    if (!mli->st_db_log_flushes) {
-        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_log_flushes", db, mli->parent->instanceID);
+    if (!mdi->st_db_log_flushes) {
+        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_log_flushes", db, mdi->parent->instanceID);
         netdata_fix_chart_name(id);
-        mli->st_db_log_flushes = rrdset_create_localhost(
+        mdi->st_db_log_flushes = rrdset_create_localhost(
             "mssql",
             id,
             NULL,
@@ -958,32 +2402,28 @@ static void mssql_database_log_flushes_chart(struct mssql_db_instance *mli, cons
             update_every,
             RRDSET_TYPE_LINE);
 
-        rrdlabels_add(mli->st_db_log_flushes->rrdlabels, "mssql_instance", mli->parent->instanceID, RRDLABEL_SRC_AUTO);
-        rrdlabels_add(mli->st_db_log_flushes->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_db_log_flushes->rrdlabels, "mssql_instance", mdi->parent->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_db_log_flushes->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
     }
 
-    if (!mli->rd_db_log_flushes) {
-        mli->rd_db_log_flushes = rrddim_add(mli->st_db_log_flushes, "flushes", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+    if (!mdi->rd_db_log_flushes) {
+        mdi->rd_db_log_flushes = rrddim_add(mdi->st_db_log_flushes, "flushes", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
     }
 
-    if (mli->updated & (1 << NETDATA_MSSQL_ENUM_MDI_IDX_LOG_FLUSHES)) {
-        rrddim_set_by_pointer(
-            mli->st_db_log_flushes,
-            mli->rd_db_log_flushes,
-            (collected_number)mli->MSSQLDatabaseLogFlushes.current.Data);
-    }
+    rrddim_set_by_pointer(
+        mdi->st_db_log_flushes, mdi->rd_db_log_flushes, (collected_number)mdi->MSSQLDatabaseLogFlushes.current.Data);
 
-    rrdset_done(mli->st_db_log_flushes);
+    rrdset_done(mdi->st_db_log_flushes);
 }
 
-static void mssql_database_log_flushed_chart(struct mssql_db_instance *mli, const char *db, int update_every)
+static void mssql_database_log_flushed_chart(struct mssql_db_instance *mdi, const char *db, int update_every)
 {
     char id[RRD_ID_LENGTH_MAX + 1];
 
-    if (!mli->st_db_log_flushed) {
-        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_log_flushed", db, mli->parent->instanceID);
+    if (!mdi->st_db_log_flushed) {
+        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_log_flushed", db, mdi->parent->instanceID);
         netdata_fix_chart_name(id);
-        mli->st_db_log_flushed = rrdset_create_localhost(
+        mdi->st_db_log_flushed = rrdset_create_localhost(
             "mssql",
             id,
             NULL,
@@ -997,32 +2437,26 @@ static void mssql_database_log_flushed_chart(struct mssql_db_instance *mli, cons
             update_every,
             RRDSET_TYPE_LINE);
 
-        rrdlabels_add(mli->st_db_log_flushed->rrdlabels, "mssql_instance", mli->parent->instanceID, RRDLABEL_SRC_AUTO);
-        rrdlabels_add(mli->st_db_log_flushed->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_db_log_flushed->rrdlabels, "mssql_instance", mdi->parent->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_db_log_flushed->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+
+        mdi->rd_db_log_flushed = rrddim_add(mdi->st_db_log_flushed, "flushed", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
     }
 
-    if (!mli->rd_db_log_flushed) {
-        mli->rd_db_log_flushed = rrddim_add(mli->st_db_log_flushed, "flushed", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
-    }
+    rrddim_set_by_pointer(
+        mdi->st_db_log_flushed, mdi->rd_db_log_flushed, (collected_number)mdi->MSSQLDatabaseLogFlushed.current.Data);
 
-    if (mli->updated & (1 << NETDATA_MSSQL_ENUM_MDI_IDX_LOG_FLUSHED)) {
-        rrddim_set_by_pointer(
-            mli->st_db_log_flushed,
-            mli->rd_db_log_flushed,
-            (collected_number)mli->MSSQLDatabaseLogFlushed.current.Data);
-    }
-
-    rrdset_done(mli->st_db_log_flushed);
+    rrdset_done(mdi->st_db_log_flushed);
 }
 
-static void mssql_transactions_chart(struct mssql_db_instance *mli, const char *db, int update_every)
+static void mssql_transactions_chart(struct mssql_db_instance *mdi, const char *db, int update_every)
 {
     char id[RRD_ID_LENGTH_MAX + 1];
 
-    if (!mli->st_db_transactions) {
-        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_transactions", db, mli->parent->instanceID);
+    if (!mdi->st_db_transactions) {
+        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_transactions", db, mdi->parent->instanceID);
         netdata_fix_chart_name(id);
-        mli->st_db_transactions = rrdset_create_localhost(
+        mdi->st_db_transactions = rrdset_create_localhost(
             "mssql",
             id,
             NULL,
@@ -1036,33 +2470,29 @@ static void mssql_transactions_chart(struct mssql_db_instance *mli, const char *
             update_every,
             RRDSET_TYPE_LINE);
 
-        rrdlabels_add(mli->st_db_transactions->rrdlabels, "mssql_instance", mli->parent->instanceID, RRDLABEL_SRC_AUTO);
-        rrdlabels_add(mli->st_db_transactions->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_db_transactions->rrdlabels, "mssql_instance", mdi->parent->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_db_transactions->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+
+        mdi->rd_db_transactions =
+            rrddim_add(mdi->st_db_transactions, "transactions", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
     }
 
-    if (!mli->rd_db_transactions) {
-        mli->rd_db_transactions =
-            rrddim_add(mli->st_db_transactions, "transactions", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
-    }
+    rrddim_set_by_pointer(
+        mdi->st_db_transactions,
+        mdi->rd_db_transactions,
+        (collected_number)mdi->MSSQLDatabaseTransactions.current.Data);
 
-    if (mli->updated & (1 << NETDATA_MSSQL_ENUM_MDI_IDX_TRANSACTIONS)) {
-        rrddim_set_by_pointer(
-            mli->st_db_transactions,
-            mli->rd_db_transactions,
-            (collected_number)mli->MSSQLDatabaseTransactions.current.Data);
-    }
-
-    rrdset_done(mli->st_db_transactions);
+    rrdset_done(mdi->st_db_transactions);
 }
 
-static void mssql_write_transactions_chart(struct mssql_db_instance *mli, const char *db, int update_every)
+static void mssql_write_transactions_chart(struct mssql_db_instance *mdi, const char *db, int update_every)
 {
     char id[RRD_ID_LENGTH_MAX + 1];
 
-    if (!mli->st_db_write_transactions) {
-        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_write_transactions", db, mli->parent->instanceID);
+    if (!mdi->st_db_write_transactions) {
+        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_write_transactions", db, mdi->parent->instanceID);
         netdata_fix_chart_name(id);
-        mli->st_db_write_transactions = rrdset_create_localhost(
+        mdi->st_db_write_transactions = rrdset_create_localhost(
             "mssql",
             id,
             NULL,
@@ -1077,33 +2507,240 @@ static void mssql_write_transactions_chart(struct mssql_db_instance *mli, const 
             RRDSET_TYPE_LINE);
 
         rrdlabels_add(
-            mli->st_db_write_transactions->rrdlabels, "mssql_instance", mli->parent->instanceID, RRDLABEL_SRC_AUTO);
-        rrdlabels_add(mli->st_db_write_transactions->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+            mdi->st_db_write_transactions->rrdlabels, "mssql_instance", mdi->parent->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_db_write_transactions->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+
+        mdi->rd_db_write_transactions =
+            rrddim_add(mdi->st_db_write_transactions, "write", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
     }
 
-    if (!mli->rd_db_write_transactions) {
-        mli->rd_db_write_transactions =
-            rrddim_add(mli->st_db_write_transactions, "write", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
-    }
+    rrddim_set_by_pointer(
+        mdi->st_db_write_transactions,
+        mdi->rd_db_write_transactions,
+        (collected_number)mdi->MSSQLDatabaseWriteTransactions.current.Data);
 
-    if (mli->updated & (1 << NETDATA_MSSQL_ENUM_MDI_IDX_WRITE_TRANSACTIONS)) {
-        rrddim_set_by_pointer(
-            mli->st_db_write_transactions,
-            mli->rd_db_write_transactions,
-            (collected_number)mli->MSSQLDatabaseWriteTransactions.current.Data);
-    }
-
-    rrdset_done(mli->st_db_write_transactions);
+    rrdset_done(mdi->st_db_write_transactions);
 }
 
-static void mssql_active_transactions_chart(struct mssql_db_instance *mli, const char *db, int update_every)
+static void mssql_lockwait_chart(struct mssql_db_instance *mdi, const char *db, int update_every)
 {
     char id[RRD_ID_LENGTH_MAX + 1];
 
-    if (!mli->st_db_active_transactions) {
-        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_active_transactions", db, mli->parent->instanceID);
+    if (!mdi->st_db_lockwait) {
+        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_lockwait", db, mdi->parent->instanceID);
         netdata_fix_chart_name(id);
-        mli->st_db_active_transactions = rrdset_create_localhost(
+        mdi->st_db_lockwait = rrdset_create_localhost(
+            "mssql",
+            id,
+            NULL,
+            "locks",
+            "mssql.database_lockwait",
+            "Lock requests that required the caller to wait.",
+            "locks/s",
+            PLUGIN_WINDOWS_NAME,
+            "PerflibMSSQL",
+            PRIO_MSSQL_DATABASE_LOCKWAIT_PER_SECOND,
+            update_every,
+            RRDSET_TYPE_LINE);
+
+        rrdlabels_add(mdi->st_db_lockwait->rrdlabels, "mssql_instance", mdi->parent->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_db_lockwait->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+
+        mdi->rd_db_lockwait = rrddim_add(mdi->st_db_lockwait, "lock", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+    }
+
+    rrddim_set_by_pointer(
+        mdi->st_db_lockwait, mdi->rd_db_lockwait, (collected_number)mdi->MSSQLDatabaseLockWaitSec.current.Data);
+
+    rrdset_done(mdi->st_db_lockwait);
+}
+
+static void mssql_deadlock_chart(struct mssql_db_instance *mdi, const char *db, int update_every)
+{
+    char id[RRD_ID_LENGTH_MAX + 1];
+
+    if (!mdi->st_db_deadlock) {
+        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_deadlocks", db, mdi->parent->instanceID);
+        netdata_fix_chart_name(id);
+        mdi->st_db_deadlock = rrdset_create_localhost(
+            "mssql",
+            id,
+            NULL,
+            "locks",
+            "mssql.database_deadlocks",
+            "Lock requests that resulted in deadlock.",
+            "deadlocks/s",
+            PLUGIN_WINDOWS_NAME,
+            "PerflibMSSQL",
+            PRIO_MSSQL_DATABASE_DEADLOCKS_PER_SECOND,
+            update_every,
+            RRDSET_TYPE_LINE);
+
+        rrdlabels_add(mdi->st_db_deadlock->rrdlabels, "mssql_instance", mdi->parent->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_db_deadlock->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+
+        mdi->rd_db_deadlock = rrddim_add(mdi->st_db_deadlock, "deadlocks", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+    }
+
+    rrddim_set_by_pointer(
+        mdi->st_db_deadlock, mdi->rd_db_deadlock, (collected_number)mdi->MSSQLDatabaseDeadLockSec.current.Data);
+
+    rrdset_done(mdi->st_db_deadlock);
+}
+
+static void mssql_is_readonly_chart(struct mssql_db_instance *mdi, const char *db, int update_every)
+{
+    if (!mdi->st_db_readonly) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_readonly", db, mdi->parent->instanceID);
+        netdata_fix_chart_name(id);
+        mdi->st_db_readonly = rrdset_create_localhost(
+                "mssql",
+                id,
+                NULL,
+                "locks",
+                "mssql.database_readonly",
+                "Current database write status.",
+                "status",
+                PLUGIN_WINDOWS_NAME,
+                "PerflibMSSQL",
+                PRIO_MSSQL_DATABASE_READONLY,
+                update_every,
+                RRDSET_TYPE_LINE);
+
+        rrdlabels_add(mdi->st_db_readonly->rrdlabels, "mssql_instance", mdi->parent->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_db_readonly->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+
+        mdi->rd_db_readonly_yes = rrddim_add(mdi->st_db_readonly, "writable", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+        mdi->rd_db_readonly_no = rrddim_add(mdi->st_db_readonly, "readonly", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+    }
+
+    rrddim_set_by_pointer(
+            mdi->st_db_readonly, mdi->rd_db_readonly_no, (collected_number)mdi->MSSQLDBIsReadonly.current.Data);
+
+    collected_number opposite = (mdi->MSSQLDBIsReadonly.current.Data) ? 0 : 1;
+    rrddim_set_by_pointer(
+            mdi->st_db_readonly, mdi->rd_db_readonly_yes, (collected_number)opposite);
+
+    rrdset_done(mdi->st_db_readonly);
+}
+
+static void mssql_db_states_chart(struct mssql_db_instance *mdi, const char *db, int update_every)
+{
+    if (!mdi->st_db_state) {
+        char id[RRD_ID_LENGTH_MAX + 1];
+        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_state", db, mdi->parent->instanceID);
+        netdata_fix_chart_name(id);
+        mdi->st_db_state = rrdset_create_localhost(
+                "mssql",
+                id,
+                NULL,
+                "locks",
+                "mssql.database_state",
+                "Current database state.",
+                "status",
+                PLUGIN_WINDOWS_NAME,
+                "PerflibMSSQL",
+                PRIO_MSSQL_DATABASE_STATE,
+                update_every,
+                RRDSET_TYPE_LINE);
+
+        rrdlabels_add(mdi->st_db_state->rrdlabels, "mssql_instance", mdi->parent->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_db_state->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+
+        mdi->rd_db_state[0] = rrddim_add(mdi->st_db_state, "online", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+        mdi->rd_db_state[1] = rrddim_add(mdi->st_db_state, "restoring", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+        mdi->rd_db_state[2] = rrddim_add(mdi->st_db_state, "recovering", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+        mdi->rd_db_state[3] = rrddim_add(mdi->st_db_state, "recovering_pending", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+        mdi->rd_db_state[4] = rrddim_add(mdi->st_db_state, "suspect", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+        mdi->rd_db_state[5] = rrddim_add(mdi->st_db_state, "offline", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+    }
+}
+
+static void mssql_db_state_chart_loop(struct mssql_db_instance *mdi, const char *db, int update_every)
+{
+    collected_number set_value = (mdi->MSSQLDBState.current.Data < 5) ? (collected_number) mdi->MSSQLDBState.current.Data : 5;
+    mssql_db_states_chart(mdi, db, update_every);
+    for (collected_number i; i < NETDATA_DB_STATES; i++) {
+        rrddim_set_by_pointer(mdi->st_db_state, mdi->rd_db_state[i], i == set_value);
+    }
+    rrdset_done(mdi->st_db_state);
+}
+
+static void mssql_lock_request_chart(struct mssql_db_instance *mdi, const char *db, int update_every)
+{
+    char id[RRD_ID_LENGTH_MAX + 1];
+
+    if (!mdi->st_lock_requests) {
+        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_lock_requests", db, mdi->parent->instanceID);
+        netdata_fix_chart_name(id);
+        mdi->st_lock_requests = rrdset_create_localhost(
+            "mssql",
+            id,
+            NULL,
+            "locks",
+            "mssql.database_lock_requests",
+            "Number of new locks and lock conversions requested.",
+            "requests/s",
+            PLUGIN_WINDOWS_NAME,
+            "PerflibMSSQL",
+            PRIO_MSSQL_DATABASE_LOCK_REQUESTS_SEC,
+            update_every,
+            RRDSET_TYPE_LINE);
+
+        rrdlabels_add(mdi->st_lock_requests->rrdlabels, "mssql_instance", mdi->parent->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_lock_requests->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+
+        mdi->rd_lock_requests = rrddim_add(mdi->st_lock_requests, "requests", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+    }
+
+    rrddim_set_by_pointer(
+        mdi->st_lock_requests, mdi->rd_lock_requests, (collected_number)mdi->MSSQLDatabaseLockRequestsSec.current.Data);
+
+    rrdset_done(mdi->st_lock_requests);
+}
+
+static void mssql_lock_timeout_chart(struct mssql_db_instance *mdi, const char *db, int update_every)
+{
+    char id[RRD_ID_LENGTH_MAX + 1];
+
+    if (!mdi->st_lock_timeouts) {
+        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_lock_timeouts", db, mdi->parent->instanceID);
+        netdata_fix_chart_name(id);
+        mdi->st_lock_timeouts = rrdset_create_localhost(
+            "mssql",
+            id,
+            NULL,
+            "locks",
+            "mssql.database_lock_timeouts",
+            "Lock that timed out.",
+            "timeouts/s",
+            PLUGIN_WINDOWS_NAME,
+            "PerflibMSSQL",
+            PRIO_MSSQL_DATABASE_LOCKS_TIMEOUT_PER_SECOND,
+            update_every,
+            RRDSET_TYPE_LINE);
+
+        rrdlabels_add(mdi->st_lock_timeouts->rrdlabels, "mssql_instance", mdi->parent->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_lock_timeouts->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+
+        mdi->rd_lock_timeouts = rrddim_add(mdi->st_lock_timeouts, "timeouts", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+    }
+
+    rrddim_set_by_pointer(
+        mdi->st_lock_timeouts, mdi->rd_lock_timeouts, (collected_number)mdi->MSSQLDatabaseLockTimeoutsSec.current.Data);
+
+    rrdset_done(mdi->st_lock_timeouts);
+}
+
+static void mssql_active_transactions_chart(struct mssql_db_instance *mdi, const char *db, int update_every)
+{
+    char id[RRD_ID_LENGTH_MAX + 1];
+
+    if (!mdi->st_db_active_transactions) {
+        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_active_transactions", db, mdi->parent->instanceID);
+        netdata_fix_chart_name(id);
+        mdi->st_db_active_transactions = rrdset_create_localhost(
             "mssql",
             id,
             NULL,
@@ -1118,33 +2755,29 @@ static void mssql_active_transactions_chart(struct mssql_db_instance *mli, const
             RRDSET_TYPE_LINE);
 
         rrdlabels_add(
-            mli->st_db_active_transactions->rrdlabels, "mssql_instance", mli->parent->instanceID, RRDLABEL_SRC_AUTO);
-        rrdlabels_add(mli->st_db_active_transactions->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+            mdi->st_db_active_transactions->rrdlabels, "mssql_instance", mdi->parent->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_db_active_transactions->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+
+        mdi->rd_db_active_transactions =
+            rrddim_add(mdi->st_db_active_transactions, "active", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
     }
 
-    if (!mli->rd_db_active_transactions) {
-        mli->rd_db_active_transactions =
-            rrddim_add(mli->st_db_active_transactions, "active", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
-    }
+    rrddim_set_by_pointer(
+        mdi->st_db_active_transactions,
+        mdi->rd_db_active_transactions,
+        (collected_number)mdi->MSSQLDatabaseActiveTransactions.current.Data);
 
-    if (mli->updated & (1 << NETDATA_MSSQL_ENUM_MDI_IDX_ACTIVE_TRANSACTIONS)) {
-        rrddim_set_by_pointer(
-            mli->st_db_active_transactions,
-            mli->rd_db_active_transactions,
-            (collected_number)mli->MSSQLDatabaseActiveTransactions.current.Data);
-    }
-
-    rrdset_done(mli->st_db_active_transactions);
+    rrdset_done(mdi->st_db_active_transactions);
 }
 
-static inline void mssql_data_file_size_chart(struct mssql_db_instance *mli, const char *db, int update_every)
+static inline void mssql_data_file_size_chart(struct mssql_db_instance *mdi, const char *db, int update_every)
 {
     char id[RRD_ID_LENGTH_MAX + 1];
 
-    if (!mli->st_db_data_file_size) {
-        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_data_files_size", db, mli->parent->instanceID);
+    if (unlikely(!mdi->st_db_data_file_size)) {
+        snprintfz(id, RRD_ID_LENGTH_MAX, "db_%s_instance_%s_data_files_size", db, mdi->parent->instanceID);
         netdata_fix_chart_name(id);
-        mli->st_db_data_file_size = rrdset_create_localhost(
+        mdi->st_db_data_file_size = rrdset_create_localhost(
             "mssql",
             id,
             NULL,
@@ -1159,54 +2792,62 @@ static inline void mssql_data_file_size_chart(struct mssql_db_instance *mli, con
             RRDSET_TYPE_LINE);
 
         rrdlabels_add(
-            mli->st_db_data_file_size->rrdlabels, "mssql_instance", mli->parent->instanceID, RRDLABEL_SRC_AUTO);
-        rrdlabels_add(mli->st_db_data_file_size->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+            mdi->st_db_data_file_size->rrdlabels, "mssql_instance", mdi->parent->instanceID, RRDLABEL_SRC_AUTO);
+        rrdlabels_add(mdi->st_db_data_file_size->rrdlabels, "database", db, RRDLABEL_SRC_AUTO);
+
+        mdi->rd_db_data_file_size = rrddim_add(mdi->st_db_data_file_size, "size", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
     }
 
-    if (!mli->rd_db_data_file_size) {
-        mli->rd_db_data_file_size = rrddim_add(mli->st_db_data_file_size, "size", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
-    }
+    collected_number data = mdi->MSSQLDatabaseDataFileSize.current.Data;
+    rrddim_set_by_pointer(mdi->st_db_data_file_size, mdi->rd_db_data_file_size, data);
 
-    // FIXME: If the value cannot be retrieved, remove the chart instead of displaying a 0 value.
-    collected_number data =
-        (mli->updated & (1 << NETDATA_MSSQL_ENUM_MDI_IDX_FILE_SIZE)) ? mli->MSSQLDatabaseDataFileSize.current.Data : 0;
-    rrddim_set_by_pointer(mli->st_db_data_file_size, mli->rd_db_data_file_size, data);
-
-    rrdset_done(mli->st_db_data_file_size);
+    rrdset_done(mdi->st_db_data_file_size);
 }
 
 int dict_mssql_databases_charts_cb(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused)
 {
-    struct mssql_db_instance *mli = value;
+    struct mssql_db_instance *mdi = value;
     const char *db = dictionary_acquired_item_name((DICTIONARY_ITEM *)item);
+
+    if (!mdi->collecting_data) {
+        goto endchartcb;
+    }
 
     int *update_every = data;
 
     void (*transaction_chart[])(struct mssql_db_instance *, const char *, int) = {
-        // FIXME: allegedly Netdata collects negative values (MSSQLDatabaseDataFileSize).
-        // something is wrong, perflibdump shows correct values.
-        // mssql_data_file_size_chart,
-        mssql_transactions_chart,
-        mssql_database_backup_restore_chart,
-        mssql_database_log_flushed_chart,
-        mssql_database_log_flushes_chart,
-        mssql_active_transactions_chart,
-        mssql_write_transactions_chart,
+            mssql_data_file_size_chart,
+            mssql_transactions_chart,
+            mssql_database_backup_restore_chart,
+            mssql_database_log_flushed_chart,
+            mssql_database_log_flushes_chart,
+            mssql_active_transactions_chart,
+            mssql_write_transactions_chart,
+            mssql_lockwait_chart,
+            mssql_deadlock_chart,
+            mssql_is_readonly_chart,
+            mssql_db_state_chart_loop,
+            mssql_lock_timeout_chart,
+            mssql_lock_request_chart,
 
         // Last function pointer must be NULL
         NULL};
 
     int i;
     for (i = 0; transaction_chart[i]; i++) {
-        transaction_chart[i](mli, db, *update_every);
+        transaction_chart[i](mdi, db, *update_every);
     }
 
+endchartcb:
     return 1;
 }
 
-static void do_mssql_databases(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *p, int update_every)
+static void do_mssql_databases(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *mi, int update_every)
 {
-    PERF_OBJECT_TYPE *pObjectType = perflibFindObjectTypeByName(pDataBlock, p->objectName[NETDATA_MSSQL_DATABASE]);
+    if (!pDataBlock)
+        goto end_mssql_databases;
+
+    PERF_OBJECT_TYPE *pObjectType = perflibFindObjectTypeByName(pDataBlock, mi->objectName[NETDATA_MSSQL_DATABASE]);
     if (!pObjectType)
         return;
 
@@ -1222,56 +2863,35 @@ static void do_mssql_databases(PERF_DATA_BLOCK *pDataBlock, struct mssql_instanc
         if (!strcasecmp(windows_shared_buffer, "_Total"))
             continue;
 
-        struct mssql_db_instance *mdi = dictionary_set(p->databases, windows_shared_buffer, NULL, sizeof(*mdi));
+        struct mssql_db_instance *mdi = dictionary_set(mi->databases, windows_shared_buffer, NULL, sizeof(*mdi));
         if (!mdi)
             continue;
 
-        mdi->updated = 0;
         if (!mdi->parent) {
-            mdi->parent = p;
+            mdi->parent = mi;
         }
 
-        if (perflibGetObjectCounter(pDataBlock, pObjectType, &mdi->MSSQLDatabaseDataFileSize)) {
-            LONGLONG value = (LONGLONG)mdi->MSSQLDatabaseDataFileSize.current.Data;
-            if (value > 0)
-                mdi->updated |= (1 << NETDATA_MSSQL_ENUM_MDI_IDX_FILE_SIZE);
-        }
-
-        if (perflibGetObjectCounter(pDataBlock, pObjectType, &mdi->MSSQLDatabaseActiveTransactions))
-            mdi->updated |= (1 << NETDATA_MSSQL_ENUM_MDI_IDX_ACTIVE_TRANSACTIONS);
-
-        if (perflibGetObjectCounter(pDataBlock, pObjectType, &mdi->MSSQLDatabaseBackupRestoreOperations))
-            mdi->updated |= (1 << NETDATA_MSSQL_ENUM_MDI_IDX_BACKUP_RESTORE_OP);
-
-        if (perflibGetObjectCounter(pDataBlock, pObjectType, &mdi->MSSQLDatabaseLogFlushed))
-            mdi->updated |= (1 << NETDATA_MSSQL_ENUM_MDI_IDX_LOG_FLUSHED);
-
-        if (perflibGetObjectCounter(pDataBlock, pObjectType, &mdi->MSSQLDatabaseLogFlushes))
-            mdi->updated |= (1 << NETDATA_MSSQL_ENUM_MDI_IDX_LOG_FLUSHES);
-
-        if (perflibGetObjectCounter(pDataBlock, pObjectType, &mdi->MSSQLDatabaseTransactions))
-            mdi->updated |= (1 << NETDATA_MSSQL_ENUM_MDI_IDX_TRANSACTIONS);
-
-        if (perflibGetObjectCounter(pDataBlock, pObjectType, &mdi->MSSQLDatabaseWriteTransactions))
-            mdi->updated |= (1 << NETDATA_MSSQL_ENUM_MDI_IDX_WRITE_TRANSACTIONS);
+        if (!i)
+            mdi->collect_instance = true;
     }
 
-    dictionary_sorted_walkthrough_read(p->databases, dict_mssql_databases_charts_cb, &update_every);
+end_mssql_databases:
+    dictionary_sorted_walkthrough_read(mi->databases, dict_mssql_databases_charts_cb, &update_every);
 }
 
-static void do_mssql_memory_mgr(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *p, int update_every)
+static void do_mssql_memory_mgr(PERF_DATA_BLOCK *pDataBlock, struct mssql_instance *mi, int update_every)
 {
     char id[RRD_ID_LENGTH_MAX + 1];
 
-    PERF_OBJECT_TYPE *pObjectType = perflibFindObjectTypeByName(pDataBlock, p->objectName[NETDATA_MSSQL_MEMORY]);
+    PERF_OBJECT_TYPE *pObjectType = perflibFindObjectTypeByName(pDataBlock, mi->objectName[NETDATA_MSSQL_MEMORY]);
     if (!pObjectType)
         return;
 
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLConnectionMemoryBytes)) {
-        if (!p->st_conn_memory) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_memmgr_connection_memory_bytes", p->instanceID);
+    if (perflibGetObjectCounter(pDataBlock, pObjectType, &mi->MSSQLConnectionMemoryBytes)) {
+        if (!mi->st_conn_memory) {
+            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_memmgr_connection_memory_bytes", mi->instanceID);
             netdata_fix_chart_name(id);
-            p->st_conn_memory = rrdset_create_localhost(
+            mi->st_conn_memory = rrdset_create_localhost(
                 "mssql",
                 id,
                 NULL,
@@ -1285,23 +2905,23 @@ static void do_mssql_memory_mgr(PERF_DATA_BLOCK *pDataBlock, struct mssql_instan
                 update_every,
                 RRDSET_TYPE_LINE);
 
-            p->rd_conn_memory = rrddim_add(p->st_conn_memory, "memory", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+            mi->rd_conn_memory = rrddim_add(mi->st_conn_memory, "memory", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
 
-            rrdlabels_add(p->st_conn_memory->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
+            rrdlabels_add(mi->st_conn_memory->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
         }
 
         rrddim_set_by_pointer(
-            p->st_conn_memory,
-            p->rd_conn_memory,
-            (collected_number)(p->MSSQLConnectionMemoryBytes.current.Data * 1024));
-        rrdset_done(p->st_conn_memory);
+            mi->st_conn_memory,
+            mi->rd_conn_memory,
+            (collected_number)(mi->MSSQLConnectionMemoryBytes.current.Data * 1024));
+        rrdset_done(mi->st_conn_memory);
     }
 
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLExternalBenefitOfMemory)) {
-        if (!p->st_ext_benefit_mem) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_memmgr_external_benefit_of_memory", p->instanceID);
+    if (perflibGetObjectCounter(pDataBlock, pObjectType, &mi->MSSQLExternalBenefitOfMemory)) {
+        if (!mi->st_ext_benefit_mem) {
+            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_memmgr_external_benefit_of_memory", mi->instanceID);
             netdata_fix_chart_name(id);
-            p->st_ext_benefit_mem = rrdset_create_localhost(
+            mi->st_ext_benefit_mem = rrdset_create_localhost(
                 "mssql",
                 id,
                 NULL,
@@ -1315,23 +2935,23 @@ static void do_mssql_memory_mgr(PERF_DATA_BLOCK *pDataBlock, struct mssql_instan
                 update_every,
                 RRDSET_TYPE_LINE);
 
-            p->rd_ext_benefit_mem = rrddim_add(p->st_ext_benefit_mem, "benefit", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+            mi->rd_ext_benefit_mem = rrddim_add(mi->st_ext_benefit_mem, "benefit", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
 
-            rrdlabels_add(p->st_ext_benefit_mem->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
+            rrdlabels_add(mi->st_ext_benefit_mem->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
         }
 
         rrddim_set_by_pointer(
-            p->st_ext_benefit_mem,
-            p->rd_ext_benefit_mem,
-            (collected_number)p->MSSQLExternalBenefitOfMemory.current.Data);
-        rrdset_done(p->st_ext_benefit_mem);
+            mi->st_ext_benefit_mem,
+            mi->rd_ext_benefit_mem,
+            (collected_number)mi->MSSQLExternalBenefitOfMemory.current.Data);
+        rrdset_done(mi->st_ext_benefit_mem);
     }
 
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLPendingMemoryGrants)) {
-        if (!p->st_pending_mem_grant) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_memmgr_pending_memory_grants", p->instanceID);
+    if (perflibGetObjectCounter(pDataBlock, pObjectType, &mi->MSSQLPendingMemoryGrants)) {
+        if (!mi->st_pending_mem_grant) {
+            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_memmgr_pending_memory_grants", mi->instanceID);
             netdata_fix_chart_name(id);
-            p->st_pending_mem_grant = rrdset_create_localhost(
+            mi->st_pending_mem_grant = rrdset_create_localhost(
                 "mssql",
                 id,
                 NULL,
@@ -1345,25 +2965,25 @@ static void do_mssql_memory_mgr(PERF_DATA_BLOCK *pDataBlock, struct mssql_instan
                 update_every,
                 RRDSET_TYPE_LINE);
 
-            p->rd_pending_mem_grant =
-                rrddim_add(p->st_pending_mem_grant, "pending", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+            mi->rd_pending_mem_grant =
+                rrddim_add(mi->st_pending_mem_grant, "pending", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
 
-            rrdlabels_add(p->st_pending_mem_grant->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
+            rrdlabels_add(mi->st_pending_mem_grant->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
         }
 
         rrddim_set_by_pointer(
-            p->st_pending_mem_grant,
-            p->rd_pending_mem_grant,
-            (collected_number)p->MSSQLPendingMemoryGrants.current.Data);
+            mi->st_pending_mem_grant,
+            mi->rd_pending_mem_grant,
+            (collected_number)mi->MSSQLPendingMemoryGrants.current.Data);
 
-        rrdset_done(p->st_pending_mem_grant);
+        rrdset_done(mi->st_pending_mem_grant);
     }
 
-    if (perflibGetObjectCounter(pDataBlock, pObjectType, &p->MSSQLTotalServerMemory)) {
-        if (!p->st_mem_tot_server) {
-            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_memmgr_server_memory", p->instanceID);
+    if (perflibGetObjectCounter(pDataBlock, pObjectType, &mi->MSSQLTotalServerMemory)) {
+        if (!mi->st_mem_tot_server) {
+            snprintfz(id, RRD_ID_LENGTH_MAX, "instance_%s_memmgr_server_memory", mi->instanceID);
             netdata_fix_chart_name(id);
-            p->st_mem_tot_server = rrdset_create_localhost(
+            mi->st_mem_tot_server = rrdset_create_localhost(
                 "mssql",
                 id,
                 NULL,
@@ -1377,60 +2997,92 @@ static void do_mssql_memory_mgr(PERF_DATA_BLOCK *pDataBlock, struct mssql_instan
                 update_every,
                 RRDSET_TYPE_LINE);
 
-            p->rd_mem_tot_server = rrddim_add(p->st_mem_tot_server, "memory", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
+            mi->rd_mem_tot_server = rrddim_add(mi->st_mem_tot_server, "memory", NULL, 1, 1, RRD_ALGORITHM_ABSOLUTE);
 
-            rrdlabels_add(p->st_mem_tot_server->rrdlabels, "mssql_instance", p->instanceID, RRDLABEL_SRC_AUTO);
+            rrdlabels_add(mi->st_mem_tot_server->rrdlabels, "mssql_instance", mi->instanceID, RRDLABEL_SRC_AUTO);
         }
 
         rrddim_set_by_pointer(
-            p->st_mem_tot_server,
-            p->rd_mem_tot_server,
-            (collected_number)(p->MSSQLTotalServerMemory.current.Data * 1024));
+            mi->st_mem_tot_server,
+            mi->rd_mem_tot_server,
+            (collected_number)(mi->MSSQLTotalServerMemory.current.Data * 1024));
 
-        rrdset_done(p->st_mem_tot_server);
+        rrdset_done(mi->st_mem_tot_server);
     }
+}
+
+static inline PERF_DATA_BLOCK *
+netdata_mssql_get_perf_data_block(bool *collect_perflib, struct mssql_instance *mi, DWORD idx)
+{
+    DWORD id = RegistryFindIDByName(mi->objectName[idx]);
+    if (id == PERFLIB_REGISTRY_NAME_NOT_FOUND) {
+        collect_perflib[idx] = false;
+        return NULL;
+    }
+
+    PERF_DATA_BLOCK *pDataBlock = perflibGetPerformanceData(id);
+    if (!pDataBlock) {
+        collect_perflib[idx] = true;
+        return NULL;
+    }
+
+    return pDataBlock;
 }
 
 int dict_mssql_charts_cb(const DICTIONARY_ITEM *item __maybe_unused, void *value, void *data __maybe_unused)
 {
-    struct mssql_instance *p = value;
+    struct mssql_instance *mi = value;
     int *update_every = data;
 
     static void (*doMSSQL[])(PERF_DATA_BLOCK *, struct mssql_instance *, int) = {
-        do_mssql_general_stats,
-        do_mssql_errors,
-        do_mssql_databases,
-        do_mssql_locks,
-        do_mssql_memory_mgr,
-        do_mssql_buffer_management,
-        do_mssql_sql_statistics,
-        do_mssql_access_methods};
+            do_mssql_general_stats,
+            do_mssql_errors,
+            do_mssql_memory_mgr,
+            do_mssql_statistics_perflib,
+            do_mssql_access_methods,
+
+            do_mssql_databases,
+            do_mssql_locks,
+            do_mssql_waits,
+            do_mssql_bufferman_stats_sql,
+            do_mssql_job_status_sql,
+
+            NULL};
 
     DWORD i;
-    for (i = 0; i < NETDATA_MSSQL_METRICS_END; i++) {
-        if (!doMSSQL[i])
+    PERF_DATA_BLOCK *pDataBlock;
+    static bool collect_perflib[NETDATA_MSSQL_METRICS_END] = {true, true, true, true, true, true, true, true, true, true};
+    for (i = 0; i < NETDATA_MSSQL_ACCESS_METHODS; i++) {
+        if (!collect_perflib[i])
             continue;
 
-        DWORD id = RegistryFindIDByName(p->objectName[i]);
-        if (id == PERFLIB_REGISTRY_NAME_NOT_FOUND)
-            return -1;
-
-        PERF_DATA_BLOCK *pDataBlock = perflibGetPerformanceData(id);
+        pDataBlock = netdata_mssql_get_perf_data_block(collect_perflib, mi, i);
         if (!pDataBlock)
-            return -1;
+            continue;
 
-        doMSSQL[i](pDataBlock, p, *update_every);
+        doMSSQL[i](pDataBlock, mi, *update_every);
+    }
+
+    if (unlikely(!mi->conn || !mi->conn->is_connected))
+        return 1;
+
+    for (i = NETDATA_MSSQL_DATABASE; doMSSQL[i]; i++) {
+        pDataBlock = (collect_perflib[i]) ? netdata_mssql_get_perf_data_block(collect_perflib, mi, i): NULL;
+
+        doMSSQL[i](pDataBlock, mi, *update_every);
     }
 
     return 1;
 }
+
+// Entry point
 
 int do_PerflibMSSQL(int update_every, usec_t dt __maybe_unused)
 {
     static bool initialized = false;
 
     if (unlikely(!initialized)) {
-        if (initialize())
+        if (initialize(update_every))
             return -1;
 
         initialized = true;
@@ -1439,4 +3091,10 @@ int do_PerflibMSSQL(int update_every, usec_t dt __maybe_unused)
     dictionary_sorted_walkthrough_read(mssql_instances, dict_mssql_charts_cb, &update_every);
 
     return 0;
+}
+
+void do_PerflibMSSQL_cleanup()
+{
+    if (nd_thread_join(mssql_queries_thread))
+        nd_log_daemon(NDLP_ERR, "Failed to join mssql queries thread");
 }

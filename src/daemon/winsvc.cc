@@ -86,7 +86,7 @@ static HANDLE CreateEventHandle(const char *msg)
     return h;
 }
 
-static void *call_netdata_cleanup(void *arg)
+static void call_netdata_cleanup(void *arg)
 {
     DWORD controlCode = *((DWORD *)arg);
 
@@ -118,8 +118,6 @@ static void *call_netdata_cleanup(void *arg)
     // Set status to stopped
     netdata_service_log("Reporting the service as stopped...");
     ReportSvcStatus(SERVICE_STOPPED, 0, 0, 0);
-
-    return nullptr;
 }
 
 static void WINAPI ServiceControlHandler(DWORD controlCode)
@@ -141,7 +139,7 @@ static void WINAPI ServiceControlHandler(DWORD controlCode)
             netdata_service_log("Creating cleanup thread...");
             char tag[NETDATA_THREAD_TAG_MAX + 1];
             snprintfz(tag, NETDATA_THREAD_TAG_MAX, "%s", "CLEANUP");
-            cleanup_thread = nd_thread_create(tag, NETDATA_THREAD_OPTION_JOINABLE, call_netdata_cleanup, &controlCode);
+            cleanup_thread = nd_thread_create(tag, NETDATA_THREAD_OPTION_DEFAULT, call_netdata_cleanup, &controlCode);
 
             // Signal the stop request
             netdata_service_log("Signalling the cleanup thread...");

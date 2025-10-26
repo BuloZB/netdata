@@ -8,10 +8,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/logs"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/stm"
-
+	"github.com/netdata/netdata/go/plugins/pkg/stm"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/logs"
 )
 
 func (c *Collector) logPanicStackIfAny() {
@@ -125,7 +124,7 @@ func (c *Collector) collectHTTPCode() {
 
 	code := c.line.httpCode
 	switch {
-	case code >= 100 && code < 300, code == 0, code == 304, code == 401:
+	case code >= 100 && code < 300, code == 0, code == 304, code == 401, code == 429:
 		c.mx.ReqSuccess.Inc()
 	case code >= 300 && code < 400:
 		c.mx.ReqRedirect.Inc()

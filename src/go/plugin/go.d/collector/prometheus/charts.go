@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/prometheus"
-
 	"github.com/prometheus/prometheus/model/labels"
+
+	"github.com/netdata/netdata/go/plugins/pkg/prometheus"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
 )
 
 const (
@@ -253,7 +253,7 @@ func getChartTitle(name, help string) string {
 		return fmt.Sprintf("Metric \"%s\"", name)
 	}
 
-	help = strings.Replace(help, "'", "", -1)
+	help = strings.ReplaceAll(help, "'", "")
 	help = strings.TrimSuffix(help, ".")
 
 	return help
@@ -317,7 +317,7 @@ func getChartUnits(metric string) string {
 		return "events"
 	}
 	switch suffix := metric[idx:]; suffix {
-	case "_total", "_sum", "_count":
+	case "_total", "_sum", "_count", "_ratio":
 		return getChartUnits(metric[:idx])
 	}
 	switch units := metric[idx+1:]; units {

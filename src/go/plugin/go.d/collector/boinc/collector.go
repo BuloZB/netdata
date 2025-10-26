@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/netdata/netdata/go/plugins/logger"
+	"github.com/netdata/netdata/go/plugins/pkg/confopt"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/confopt"
 )
 
 //go:embed "config_schema.json"
@@ -36,11 +36,12 @@ func New() *Collector {
 }
 
 type Config struct {
-	Vnode       string           `yaml:"vnode,omitempty" json:"vnode"`
-	UpdateEvery int              `yaml:"update_every,omitempty" json:"update_every"`
-	Address     string           `yaml:"address" json:"address"`
-	Timeout     confopt.Duration `yaml:"timeout" json:"timeout"`
-	Password    string           `yaml:"password" json:"password"`
+	Vnode              string           `yaml:"vnode,omitempty" json:"vnode"`
+	UpdateEvery        int              `yaml:"update_every,omitempty" json:"update_every"`
+	AutoDetectionRetry int              `yaml:"autodetection_retry,omitempty" json:"autodetection_retry"`
+	Address            string           `yaml:"address" json:"address"`
+	Timeout            confopt.Duration `yaml:"timeout" json:"timeout"`
+	Password           string           `yaml:"password" json:"password"`
 }
 
 type Collector struct {

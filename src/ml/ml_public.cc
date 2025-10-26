@@ -48,7 +48,7 @@ void ml_host_new(RRDHOST *rh)
     host->queue = Cfg.workers[times_called++ % Cfg.num_worker_threads].queue;
 
     netdata_mutex_init(&host->mutex);
-    spinlock_init(&host->type_anomaly_rate_spinlock);
+    spinlock_init(&host->context_anomaly_rate_spinlock);
 
     host->ml_running = false;
     rh->ml_host = (rrd_ml_host_t *) host;
@@ -109,9 +109,6 @@ void ml_host_stop(RRDHOST *rh) {
             dim->mt = METRIC_TYPE_CONSTANT;
             dim->ts = TRAINING_STATUS_UNTRAINED;
 
-            // TODO: Check if we can remove this field.
-            dim->last_training_time = 0;
-
             dim->suppression_anomaly_counter = 0;
             dim->suppression_window_counter = 0;
             dim->cns.clear();
@@ -141,16 +138,16 @@ void ml_host_get_info(RRDHOST *rh, BUFFER *wb)
 
     buffer_json_member_add_boolean(wb, "enabled", Cfg.enable_anomaly_detection);
 
-    buffer_json_member_add_uint64(wb, "min-train-samples", Cfg.min_train_samples);
-    buffer_json_member_add_uint64(wb, "max-train-samples", Cfg.max_train_samples);
+    buffer_json_member_add_uint64(wb, "training-window", Cfg.training_window);
+    buffer_json_member_add_uint64(wb, "min-training-window", Cfg.min_training_window);
+    buffer_json_member_add_uint64(wb, "max-training-vectors", Cfg.max_training_vectors);
+    buffer_json_member_add_uint64(wb, "max-samples-to-smooth", Cfg.max_samples_to_smooth);
     buffer_json_member_add_uint64(wb, "train-every", Cfg.train_every);
 
     buffer_json_member_add_uint64(wb, "diff-n", Cfg.diff_n);
-    buffer_json_member_add_uint64(wb, "smooth-n", Cfg.smooth_n);
     buffer_json_member_add_uint64(wb, "lag-n", Cfg.lag_n);
 
-    buffer_json_member_add_double(wb, "random-sampling-ratio", Cfg.random_sampling_ratio);
-    buffer_json_member_add_uint64(wb, "max-kmeans-iters", Cfg.random_sampling_ratio);
+    buffer_json_member_add_uint64(wb, "max-kmeans-iters", Cfg.max_kmeans_iters);
 
     buffer_json_member_add_double(wb, "dimension-anomaly-score-threshold", Cfg.dimension_anomaly_score_threshold);
 
@@ -273,9 +270,9 @@ void ml_dimension_new(RRDDIM *rd)
 
     dim->mt = METRIC_TYPE_CONSTANT;
     dim->ts = TRAINING_STATUS_UNTRAINED;
-    dim->last_training_time = 0;
     dim->suppression_anomaly_counter = 0;
     dim->suppression_window_counter = 0;
+    dim->training_in_progress = false;
 
     ml_kmeans_init(&dim->kmeans);
 
@@ -369,8 +366,8 @@ void ml_init()
     std::random_device RD;
     std::mt19937 Gen(RD());
 
-    Cfg.random_nums.reserve(Cfg.max_train_samples);
-    for (size_t Idx = 0; Idx != Cfg.max_train_samples; Idx++)
+    Cfg.random_nums.reserve(Cfg.max_training_vectors);
+    for (size_t Idx = 0; Idx != Cfg.max_training_vectors; Idx++)
         Cfg.random_nums.push_back(Gen());
 
     // init training thread-specific data
@@ -378,7 +375,10 @@ void ml_init()
     for (size_t idx = 0; idx != Cfg.num_worker_threads; idx++) {
         ml_worker_t *worker = &Cfg.workers[idx];
 
-        size_t max_elements_needed_for_training = (size_t) Cfg.max_train_samples * (size_t) (Cfg.lag_n + 1);
+        // Calculate max elements needed based on the highest frequency metrics
+        // For 1-second metrics: training_window samples
+        // We allocate for worst case (1-second update frequency)
+        size_t max_elements_needed_for_training = (size_t) Cfg.training_window * (size_t) (Cfg.lag_n + 1);
         worker->training_cns = new calculated_number_t[max_elements_needed_for_training]();
         worker->scratch_training_cns = new calculated_number_t[max_elements_needed_for_training]();
 
@@ -443,14 +443,12 @@ void ml_start_threads() {
     char tag[NETDATA_THREAD_TAG_MAX + 1];
 
     snprintfz(tag, NETDATA_THREAD_TAG_MAX, "%s", "PREDICT");
-    Cfg.detection_thread = nd_thread_create(tag, NETDATA_THREAD_OPTION_JOINABLE,
-                                            ml_detect_main, NULL);
+    Cfg.detection_thread = nd_thread_create(tag, NETDATA_THREAD_OPTION_DEFAULT, ml_detect_main, NULL);
 
     for (size_t idx = 0; idx != Cfg.num_worker_threads; idx++) {
         ml_worker_t *worker = &Cfg.workers[idx];
         snprintfz(tag, NETDATA_THREAD_TAG_MAX, "TRAIN[%zu]", worker->id);
-        worker->nd_thread = nd_thread_create(tag, NETDATA_THREAD_OPTION_JOINABLE,
-                                                      ml_train_main, worker);
+        worker->nd_thread = nd_thread_create(tag, NETDATA_THREAD_OPTION_DEFAULT, ml_train_main, worker);
     }
 }
 
@@ -502,4 +500,12 @@ bool ml_model_received_from_child(RRDHOST *host, const char *json)
     }
 
     return ok;
+}
+
+void ml_host_disconnected(RRDHOST *rh) {
+    ml_host_t *host = (ml_host_t *) rh->ml_host;
+    if (!host)
+        return;
+
+    __atomic_store_n(&host->reset_pointers, true, __ATOMIC_RELAXED);
 }

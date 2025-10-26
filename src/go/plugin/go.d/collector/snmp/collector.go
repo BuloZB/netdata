@@ -5,15 +5,19 @@ package snmp
 import (
 	"context"
 	_ "embed"
-	"errors"
 	"fmt"
-
-	"github.com/netdata/netdata/go/plugins/pkg/matcher"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/discovery/sd/discoverer/snmpsd"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
-	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/vnodes"
+	"time"
 
 	"github.com/gosnmp/gosnmp"
+
+	"github.com/netdata/netdata/go/plugins/logger"
+	"github.com/netdata/netdata/go/plugins/pkg/confopt"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/module"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/agent/vnodes"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/ping"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp/ddsnmp"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp/ddsnmp/ddsnmpcollector"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/pkg/snmputils"
 )
 
 //go:embed "config_schema.json"
@@ -33,9 +37,10 @@ func init() {
 func New() *Collector {
 	return &Collector{
 		Config: Config{
-			CreateVnode: true,
-			Community:   "public",
-			Options: Options{
+			CreateVnode:              true,
+			VnodeDeviceDownThreshold: 3,
+			Community:                "public",
+			Options: OptionsConfig{
 				Port:           161,
 				Retries:        1,
 				Timeout:        5,
@@ -43,92 +48,101 @@ func New() *Collector {
 				MaxOIDs:        60,
 				MaxRepetitions: 25,
 			},
-			User: User{
+			User: UserConfig{
 				SecurityLevel: "authPriv",
 				AuthProto:     "sha512",
 				PrivProto:     "aes192c",
 			},
+			Ping: PingConfig{
+				Enabled: true,
+				ProberConfig: ping.ProberConfig{
+					Privileged: true,
+					Packets:    3,
+					Interval:   confopt.Duration(time.Millisecond * 100),
+				},
+			},
 		},
 
-		newSnmpClient: gosnmp.NewHandler,
+		charts:            &module.Charts{},
+		seenScalarMetrics: make(map[string]bool),
+		seenTableMetrics:  make(map[string]bool),
 
-		checkMaxReps:  true,
-		collectIfMib:  true,
-		netInterfaces: make(map[string]*netInterface),
+		newProber:     ping.NewProber,
+		newSnmpClient: gosnmp.NewHandler,
+		newDdSnmpColl: func(cfg ddsnmpcollector.Config) ddCollector {
+			return ddsnmpcollector.New(cfg)
+		},
 	}
 }
 
-type Collector struct {
-	module.Base
-	Config `yaml:",inline" json:""`
+type (
+	Collector struct {
+		module.Base
+		Config `yaml:",inline" json:""`
 
-	vnode *vnodes.VirtualNode
+		vnode *vnodes.VirtualNode
 
-	charts *module.Charts
+		charts            *module.Charts
+		seenScalarMetrics map[string]bool
+		seenTableMetrics  map[string]bool
 
-	newSnmpClient func() gosnmp.Handler
-	snmpClient    gosnmp.Handler
+		prober    ping.Prober
+		newProber func(ping.ProberConfig, *logger.Logger) ping.Prober
 
-	netIfaceFilterByName matcher.Matcher
-	netIfaceFilterByType matcher.Matcher
+		snmpClient    gosnmp.Handler
+		newSnmpClient func() gosnmp.Handler
 
-	checkMaxReps bool
-	collectIfMib bool
+		ddSnmpColl    ddCollector
+		newDdSnmpColl func(ddsnmpcollector.Config) ddCollector
 
-	netInterfaces map[string]*netInterface
+		sysInfo      *snmputils.SysInfo
+		snmpProfiles []*ddsnmp.Profile
 
-	sysInfo *snmpsd.SysInfo
+		adjMaxRepetitions uint32
 
-	customOids []string
-}
+		disableBulkWalk bool
+	}
+	ddCollector interface {
+		Collect() ([]*ddsnmp.ProfileMetrics, error)
+		CollectDeviceMetadata() (map[string]ddsnmp.MetaTag, error)
+	}
+)
 
 func (c *Collector) Configuration() any {
 	return c.Config
 }
 
 func (c *Collector) Init(context.Context) error {
-	err := c.validateConfig()
-	if err != nil {
+	if err := c.validateConfig(); err != nil {
 		return fmt.Errorf("config validation failed: %v", err)
 	}
 
-	snmpClient, err := c.initSNMPClient()
-	if err != nil {
+	if _, err := c.initSNMPClient(); err != nil {
 		return fmt.Errorf("failed to initialize SNMP client: %v", err)
 	}
 
-	err = snmpClient.Connect()
-	if err != nil {
-		return fmt.Errorf("SNMP client connection failed: %v", err)
+	if c.Ping.Enabled {
+		pr, err := c.initProber()
+		if err != nil {
+			return fmt.Errorf("failed to initialize ping prober: %v", err)
+		}
+		c.prober = pr
 	}
-	c.snmpClient = snmpClient
-
-	byName, byType, err := c.initNetIfaceFilters()
-	if err != nil {
-		return fmt.Errorf("failed to initialize network interface filters: %v", err)
-	}
-	c.netIfaceFilterByName = byName
-	c.netIfaceFilterByType = byType
-
-	charts, err := newUserInputCharts(c.ChartsInput)
-	if err != nil {
-		return fmt.Errorf("failed to create user charts: %v", err)
-	}
-	c.charts = charts
-
-	c.customOids = c.initOIDs()
 
 	return nil
 }
 
 func (c *Collector) Check(context.Context) error {
-	mx, err := c.collect()
-	if err != nil {
-		return err
+	if c.snmpClient == nil {
+		snmpClient, err := c.initAndConnectSNMPClient()
+		if err != nil {
+			return fmt.Errorf("failed to init and connect SNMP client: %v", err)
+		}
+		c.snmpClient = snmpClient
 	}
 
-	if len(mx) == 0 {
-		return errors.New("no metrics collected")
+	if _, err := snmputils.GetSysInfo(c.snmpClient); err != nil {
+		return err
 	}
 
 	return nil
@@ -138,7 +152,7 @@ func (c *Collector) Charts() *module.Charts {
 	return c.charts
 }
 
-func (c *Collector) Collect(context.Context) map[string]int64 {
+func (c *Collector) Collect(ctx context.Context) map[string]int64 {
 	mx, err := c.collect()
 	if err != nil {
 		c.Error(err)

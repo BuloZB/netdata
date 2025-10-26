@@ -23,7 +23,7 @@ DEFAULT_PLUGIN_PACKAGES=""
 REPOCONFIG_DEB_VERSION="5-1"
 REPOCONFIG_RPM_VERSION="5-1"
 START_TIME="$(date +%s)"
-STATIC_INSTALL_ARCHES="x86_64 armv7l armv6l aarch64 ppc64le"
+STATIC_INSTALL_ARCHES="x86_64 armv7l armv6l aarch64"
 
 # ======================================================================
 # Properly sort out inconsistencies in `$PATH` across distros
@@ -362,7 +362,7 @@ trap_handler() {
     0) printf >&2 "%s\n" "This is almost certainly the result of a bug. If you have time, please report it at ${AGENT_BUG_REPORT_URL}." ;;
     *)
       printf >&2 "%s\n" "This is probably a result of a transient issue on your system. Things should work correctly if you try again."
-      printf >&2 "%s\n" "If you continue to experience this issue, you can reacn out to us for support on:"
+      printf >&2 "%s\n" "If you continue to experience this issue, you can reach out to us for support on:"
       support_list
       ;;
   esac
@@ -1505,7 +1505,7 @@ netdata_avail_check() {
       ;;
     centos|fedora|ol|amzn)
       # shellcheck disable=SC2086
-      LC_ALL=C ${pm_cmd} search --nogpgcheck -v netdata | grep -qE 'Repo *: netdata(-edge)?$'
+      LC_ALL=C ${pm_cmd} info --nogpgcheck netdata | grep -qE '^(Repo(sitory)?|From repo) *: *netdata(-edge)?(/.*)?$'
       return $?
       ;;
     opensuse)

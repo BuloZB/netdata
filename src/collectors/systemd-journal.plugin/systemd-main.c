@@ -5,7 +5,16 @@
 
 #define ND_SD_JOURNAL_WORKER_THREADS 5
 
-netdata_mutex_t stdout_mutex = NETDATA_MUTEX_INITIALIZER;
+netdata_mutex_t stdout_mutex;
+
+static void __attribute__((constructor)) init_mutex(void) {
+    netdata_mutex_init(&stdout_mutex);
+}
+
+static void __attribute__((destructor)) destroy_mutex(void) {
+    netdata_mutex_destroy(&stdout_mutex);
+}
+
 static bool plugin_should_exit = false;
 
 static bool journal_data_directories_exist()
@@ -54,15 +63,6 @@ int main(int argc __maybe_unused, char **argv __maybe_unused)
         function_systemd_journal("123", buf, &stop_monotonic_ut, &cancelled, NULL, HTTP_ACCESS_ALL, NULL, NULL);
         exit(1);
     }
-#ifdef ENABLE_SYSTEMD_DBUS
-    if (argc == 2 && strcmp(argv[1], "debug-units") == 0) {
-        bool cancelled = false;
-        usec_t stop_monotonic_ut = now_monotonic_usec() + 600 * USEC_PER_SEC;
-        function_systemd_units(
-            "123", "systemd-units", &stop_monotonic_ut, &cancelled, NULL, HTTP_ACCESS_ALL, NULL, NULL);
-        exit(1);
-    }
-#endif
 
     // ------------------------------------------------------------------------
     // watcher thread
@@ -77,11 +77,6 @@ int main(int argc __maybe_unused, char **argv __maybe_unused)
 
     functions_evloop_add_function(
         wg, ND_SD_JOURNAL_FUNCTION_NAME, function_systemd_journal, ND_SD_JOURNAL_DEFAULT_TIMEOUT, NULL);
-
-#ifdef ENABLE_SYSTEMD_DBUS
-    functions_evloop_add_function(
-        wg, ND_SD_UNITS_FUNCTION_NAME, function_systemd_units, ND_SD_UNITS_DEFAULT_TIMEOUT, NULL);
-#endif
 
     nd_systemd_journal_dyncfg_init(wg);
 
@@ -98,17 +93,6 @@ int main(int argc __maybe_unused, char **argv __maybe_unused)
         ND_SD_JOURNAL_FUNCTION_DESCRIPTION,
         (HTTP_ACCESS_FORMAT_CAST)(HTTP_ACCESS_SIGNED_ID | HTTP_ACCESS_SAME_SPACE | HTTP_ACCESS_SENSITIVE_DATA),
         RRDFUNCTIONS_PRIORITY_DEFAULT);
-
-#ifdef ENABLE_SYSTEMD_DBUS
-    fprintf(
-        stdout,
-        PLUGINSD_KEYWORD_FUNCTION " GLOBAL \"%s\" %d \"%s\" \"top\" " HTTP_ACCESS_FORMAT " %d\n",
-        ND_SD_UNITS_FUNCTION_NAME,
-        ND_SD_UNITS_DEFAULT_TIMEOUT,
-        ND_SD_UNITS_FUNCTION_DESCRIPTION,
-        (HTTP_ACCESS_FORMAT_CAST)(HTTP_ACCESS_SIGNED_ID | HTTP_ACCESS_SAME_SPACE | HTTP_ACCESS_SENSITIVE_DATA),
-        RRDFUNCTIONS_PRIORITY_DEFAULT);
-#endif
 
     fflush(stdout);
     netdata_mutex_unlock(&stdout_mutex);

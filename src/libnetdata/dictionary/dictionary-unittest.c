@@ -573,7 +573,7 @@ struct thread_unittest {
     struct dictionary_stats stats;
 };
 
-static void *unittest_dict_thread(void *arg) {
+static void unittest_dict_thread(void *arg) {
     struct thread_unittest *tu = arg;
     for(; 1 ;) {
         if(__atomic_load_n(&tu->join, __ATOMIC_RELAXED))
@@ -661,8 +661,6 @@ static void *unittest_dict_thread(void *arg) {
             }
         }
     }
-
-    return arg;
 }
 
 static int dictionary_unittest_threads() {
@@ -690,11 +688,7 @@ static int dictionary_unittest_threads() {
 
         char buf[100 + 1];
         snprintf(buf, 100, "dict%d", i);
-        tu[i].thread = nd_thread_create(
-            buf,
-            NETDATA_THREAD_OPTION_DONT_LOG | NETDATA_THREAD_OPTION_JOINABLE,
-            unittest_dict_thread,
-            &tu[i]);
+        tu[i].thread = nd_thread_create(buf, NETDATA_THREAD_OPTION_DONT_LOG, unittest_dict_thread, &tu[i]);
     }
 
     sleep_usec(seconds_to_run * USEC_PER_SEC);
@@ -771,7 +765,7 @@ struct thread_view_unittest {
     int dups;
 };
 
-static void *unittest_dict_master_thread(void *arg) {
+static void unittest_dict_master_thread(void *arg) {
     struct thread_view_unittest *tv = arg;
 
     DICTIONARY_ITEM *item = NULL;
@@ -807,11 +801,9 @@ static void *unittest_dict_master_thread(void *arg) {
         item = NULL;
         loops = 0;
     }
-
-    return arg;
 }
 
-static void *unittest_dict_view_thread(void *arg) {
+static void unittest_dict_view_thread(void *arg) {
     struct thread_view_unittest *tv = arg;
 
     DICTIONARY_ITEM *m_item = NULL;
@@ -841,8 +833,6 @@ static void *unittest_dict_view_thread(void *arg) {
 
         dictionary_acquired_item_release(tv->view, v_item);
     }
-
-    return arg;
 }
 
 static struct dictionary_stats stats_master = { 0 };
@@ -871,17 +861,9 @@ static int dictionary_unittest_view_threads() {
     ND_THREAD *master_thread, *view_thread;
     tv.join = 0;
 
-    master_thread = nd_thread_create(
-        "master",
-        NETDATA_THREAD_OPTION_DONT_LOG | NETDATA_THREAD_OPTION_JOINABLE,
-        unittest_dict_master_thread,
-        &tv);
+    master_thread = nd_thread_create("master", NETDATA_THREAD_OPTION_DONT_LOG, unittest_dict_master_thread, &tv);
 
-    view_thread = nd_thread_create(
-        "view",
-        NETDATA_THREAD_OPTION_DONT_LOG | NETDATA_THREAD_OPTION_JOINABLE,
-        unittest_dict_view_thread,
-        &tv);
+    view_thread = nd_thread_create("view", NETDATA_THREAD_OPTION_DONT_LOG, unittest_dict_view_thread, &tv);
 
     sleep_usec(seconds_to_run * USEC_PER_SEC);
 
@@ -1025,6 +1007,25 @@ size_t dictionary_unittest_views(void) {
     dictionary_destroy(master);
     dictionary_destroy(view);
     return errors;
+}
+
+bool dictionary_traverse_or_destroy_unittest(void) {
+    DICTIONARY *dict = dictionary_create(DICT_OPTION_SINGLE_THREADED);
+    dictionary_set(dict, "KEY 1", "VALUE1", strlen("VALUE1") + 1);
+    dictionary_set(dict, "KEY 2", "VALUE2", strlen("VALUE2") + 1);
+    dictionary_set(dict, "KEY 3", "VALUE3", strlen("VALUE3") + 1);
+
+    size_t counted = 0;
+    const char *s;
+    dfe_start_read(dict, s) {
+        if(!counted)
+            dictionary_destroy(dict);
+
+        counted++;
+    }
+    dfe_done(s);
+
+    return counted == 1;
 }
 
 /*
@@ -1183,7 +1184,21 @@ int dictionary_unittest(size_t entries) {
     errors += dictionary_unittest_threads();
     errors += dictionary_unittest_view_threads();
 
-    cleanup_destroyed_dictionaries();
+    if(!dictionary_traverse_or_destroy_unittest()) {
+        fprintf(stderr, "Destroy on traversal test failed\n");
+        errors++;
+    }
+    else
+        fprintf(stderr, "Destroy on traversal test OK\n");
+
+    cleanup_destroyed_dictionaries(false);
+
+    size_t delayed = dictionary_destroy_delayed_count();
+    if(delayed != 0) {
+        fprintf(stderr, "WARNING: There are %zu dictionaries that cannot be destroyed\n", delayed);
+    }
+    else
+        fprintf(stderr, "All dictionaries have been freed: OK\n");
 
     fprintf(stderr, "\n%zu errors found\n", errors);
     return  errors ? 1 : 0;

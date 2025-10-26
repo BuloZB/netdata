@@ -38,7 +38,11 @@ This collector only supports collecting metrics from a single instance of this i
 
 #### Auto-Detection
 
-The collector automatically detects all of the metrics, no further configuration is required.
+The collector automatically discovers and monitors standard SQL Server metrics without additional setup. However, for transaction-level metrics,
+the size of all the data files, and the wait stats in the database you must:
+
+- Complete the "Configure SQL Server for Monitoring" steps in the Setup -> Prerequisites section.
+- Configure a database connection (see Setup → Configuration → Examples).
 
 
 #### Limits
@@ -48,7 +52,6 @@ The default configuration for this integration does not impose any limits on dat
 #### Performance Impact
 
 The default configuration for this integration is not expected to impose a significant performance impact on the system.
-
 
 ## Metrics
 
@@ -84,13 +87,72 @@ Metrics:
 | mssql.instance_bufman_iops | read, written | pages/s |
 | mssql.instance_bufman_checkpoint_pages | log | pages/s |
 | mssql.instance_bufman_page_life_expectancy | life_expectancy | seconds |
+| mssql.instance_bufman_lazy_write | writes | writes/s |
+| mssql.instance_bufman_page_lookups | lookups | lookups/s |
 | mssql.instance_memmgr_server_memory | memory | bytes |
+| mssql.database_readonly | writable, readonly | status |
+| mssql.database_state | online, restoring, recovering, recovering_pending, suspect, offline | status |
 | mssql.instance_memmgr_connection_memory_bytes | memory | bytes |
 | mssql.instance_memmgr_pending_memory_grants | pending | processes |
 | mssql.instance_memmgr_external_benefit_of_memory | benefit | bytes |
-| mssql.instance_locks_deadlocks | alloc_unit, application, database, extent, file, hobt, key, metadata, oib, object, page, rid, row_group, xact | deadlocks/s |
-| mssql.instance_locks_lock_wait | alloc_unit, application, database, extent, file, hobt, key, metadata, oib, object, page, rid, row_group, xact | locks/s |
 | mssql.instance_blocked_processes | blocked | processes |
+
+### Per MSSQL Jobs
+
+These metrics refer to the Microsoft SQL Servers jobs on host.
+
+Labels:
+
+| Label      | Description     |
+|:-----------|:----------------|
+| mssql_instance | The instance name. |
+| job_name | The job name. |
+
+Metrics:
+
+| Metric | Dimensions | Unit |
+|:------|:----------|:----|
+| mssql.instance_jobs_status | enabled, disabled | jobs |
+
+### Per MSSQL Resource Locks
+
+Monitors SQL Server resource locks by type. SQL Server uses locks to manage concurrent access to database resources during transactions, preventing conflicts when multiple users access the same data simultaneously. This metric tracks locks on different [resource types](https://learn.microsoft.com/en-us/sql/relational-databases/performance-monitor/sql-server-locks-object?view=sql-server-ver17) like rows, pages, tables, and databases.
+
+Labels:
+
+| Label      | Description     |
+|:-----------|:----------------|
+| mssql_instance | The SQL Server instance name (e.g., 'MSSQLSERVER' for default instance or named instance like 'INSTANCE01'). |
+| resource | The specific resource type being locked (e.g., 'Database', 'Table', 'Page', 'Row', 'Key', 'Extent', 'RID', 'Application', 'Metadata', 'Allocation_Unit'). |
+
+Metrics:
+
+| Metric | Dimensions | Unit |
+|:------|:----------|:----|
+| mssql.instance_resource_deadlocks | locks | deadlock/s |
+| mssql.instance_resource_lock_waits | locks | lock/s |
+
+### Per MSSQL Waits
+
+These metrics refer to the Microsoft SQL Server instances defined on the host and their associated wait events.
+
+Labels:
+
+| Label      | Description     |
+|:-----------|:----------------|
+| mssql_instance | The instance name. |
+| wait_type | A wait defined in https://learn.microsoft.com/en-us/sql/relational-databases/system-dynamic-management-views/sys-dm-os-wait-stats-transact-sql?view=sql-server-ver16#WaitTypes. |
+| wait_category | Wait categories are groupings of specific wait types that indicate the reason a SQL Server worker is waiting. |
+
+Metrics:
+
+| Metric | Dimensions | Unit |
+|:------|:----------|:----|
+| mssql.instance_total_wait_time | duration | ms |
+| mssql.instance_resource_wait_time | duration | ms |
+| mssql.instance_signal_wait_time | duration | ms |
+| mssql.instance_max_wait_time | duration | ms |
+| mssql.instance_waits | waits | waits/s |
 
 ### Per Database
 
@@ -110,9 +172,14 @@ Metrics:
 | mssql.database_active_transactions | active | transactions |
 | mssql.database_transactions | transactions | transactions/s |
 | mssql.database_write_transactions | write | transactions/s |
+| mssql.database_lockwait | lock | locks/s |
+| mssql.database_deadlocks | deadlocks | deadlocks/s |
+| mssql.database_lock_timeouts | timeouts | timeouts/s |
+| mssql.database_lock_requests | requests | requests/s |
 | mssql.database_backup_restore_operations | backup | operations/s |
 | mssql.database_log_flushes | log | flushes/s |
 | mssql.database_log_flushed | flushed | bytes/s |
+| mssql.database_data_files_size | size | bytes |
 
 
 
@@ -123,16 +190,113 @@ There are no alerts configured by default for this integration.
 
 ## Setup
 
+
 ### Prerequisites
 
-No action required.
+#### Configure SQL Server for Monitoring
+
+For **each SQL Server** instance you want to monitor, complete the following steps:
+
+1. **Create Monitoring User**
+
+   Create an SQL Server user with the necessary permissions to collect monitoring data:
+
+   ```tsql
+   USE master;
+   CREATE LOGIN netdata_user WITH PASSWORD = '1ReallyStrongPasswordShouldBeInsertedHere';
+   CREATE USER netdata_user FOR LOGIN netdata_user;
+   GRANT CONNECT SQL TO netdata_user;
+   GRANT VIEW SERVER STATE TO netdata_user;
+   GO
+   ```
+
+2. **Enable Query Store**
+
+   Enable the [Query Store](https://learn.microsoft.com/en-us/sql/relational-databases/performance/monitoring-performance-by-using-the-query-store?view=sql-server-ver16) and grant access               to    the monitoring user on all relevant databases:
+
+   ```tsql
+   DECLARE @dbname NVARCHAR(max)
+   DECLARE nd_user_cursor CURSOR FOR SELECT name
+                       FROM master.dbo.sysdatabases
+                       WHERE name NOT IN ('master')
+
+   OPEN nd_user_cursor
+   FETCH NEXT FROM nd_user_cursor INTO @dbname
+   WHILE @@FETCH_STATUS = 0
+   BEGIN
+     EXECUTE ("USE "+ @dbname+"; CREATE USER netdata_user FOR LOGIN netdata_user; ALTER DATABASE "+@dbname+" SET QUERY_STORE = ON ( QUERY_CAPTURE_MODE = ALL, DATA_FLUSH_INTERVAL_SECONDS               =    900 )");
+     FETCH next FROM nd_user_cursor INTO @dbname;
+   END
+   CLOSE nd_user_cursor
+   DEALLOCATE nd_user_cursor
+   GO
+   ```
+
+3. **Enable Query Job status**
+
+   Connect to your database and grant `SELECT` permission to `netdata_user`:
+
+  ```tsql
+  USE msdb;
+  GO
+  GRANT SELECT ON SCHEMA::[dbo] TO netdata_user;
+  GO
+  ```
+
+4. **Configure SQL Server Network Settings**
+
+   Enable SQL Server to accept TCP connections:
+
+  - Open `SQL Server Configuration Manager`
+  - Expand `SQL Server Network Configuration`
+  - Select `Protocols for <instance name>` in the console panel
+  - Double-click the `TCP` protocol in the details panel and set `Enabled` to `Yes`
+  - Go to the `IP Address` tab and locate the `IPAII` section:
+    - Clear any value from the `TCP Dynamic Ports` field
+    - Enter a port number in the `TCP Port` field (default is `1433`)
+  - Select `SQL Server Services` and restart your SQL Server instance
+
+5. **Configure SQL Server Authentication (Optional)**
+
+   If you're using SQL Server authentication (rather than Windows authentication):
+
+  - Open `SQL Server Management Studio`
+  - Right-click your server and select `Properties`
+  - Select `Security` in the left panel
+  - Choose `SQL Server and Windows Authentication mode` under `Server authentication`
+  - Click `OK`
+  - Right-click your server and select `Restart`
+
+
 
 ### Configuration
 
-#### File
+#### Options
+
+These options allow the collector to connect to your MSSQL instance and collect transaction data from it.
+
+
+
+| Option | Description | Default | Required |
+|:-----|:------------|:--------|:---------:|
+| update every | Data collection frequency. | 10 | no |
+| driver | ODBC driver used to connect to the SQL Server. | SQL Server | no |
+| instance | Instance name | empty | yes |
+| server | Server address or instance name. | empty | yes |
+| address | Alternative to `server`; supports named pipes if the server supports them. | empty | yes |
+| uid | SQL Server user identifier. | empty | yes |
+| pwd | Password for the specified user. | empty | yes |
+| additional instances | Number of additional SQL Server instances to monitor. | 0 | no |
+| windows authentication | Set to yes to use Windows credentials instead of SQL Server authentication. | no | no |
+| express | Set to yes when running SQL Express version. | no | no |
+
+
+
+
+#### via File
 
 The configuration file name for this integration is `netdata.conf`.
-Configuration for this specific integration is located in the `[plugin:windows]` section within that file.
+Configuration for this specific integration is located in the `[plugin:windows:PerflibMSSQL]` section within that file.
 
 The file format is a modified INI syntax. The general structure is:
 
@@ -151,15 +315,43 @@ Netdata [config directory](https://github.com/netdata/netdata/blob/master/docs/n
 cd /etc/netdata 2>/dev/null || cd /opt/netdata/etc/netdata
 sudo ./edit-config netdata.conf
 ```
-#### Options
 
+##### Examples
 
+###### Single Instance
 
-| Name | Description | Default | Required |
-|:----|:-----------|:-------|:--------:|
-| PerflibMSSQL | An option to enable or disable the data collection. | yes | no |
+An example configuration with one instance.
 
-#### Examples
-There are no configuration examples.
+```yaml
+[plugin:windows:PerflibMSSQL]
+   driver = SQL Server
+   instance = Dev
+   server = 127.0.0.1\\Dev, 1433
+   uid = netdata_user
+   pwd = 1ReallyStrongPasswordShouldBeInsertedHere
+   express = no
 
+```
+###### Multiple Instances
+
+An example configuration with two instances.
+
+```yaml
+[plugin:windows:PerflibMSSQL]
+  driver = SQL Server
+  server = 127.0.0.1\\Dev, 1433
+  instance = Dev
+  uid = netdata_user
+  pwd = 1ReallyStrongPasswordShouldBeInsertedHere
+  additional instances = 1
+  express = no
+[plugin:windows:PerflibMSSQL1]
+  driver = SQL Server
+  server = 127.0.0.1\\Production, 1434
+  instance = Production
+  uid = netdata_user
+  pwd = AnotherReallyStrongPasswordShouldBeInsertedHere2
+  express = no
+
+```
 

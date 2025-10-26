@@ -164,7 +164,10 @@ static inline PARSER_RC pluginsd_host_dictionary(char **words, size_t num_words,
         return PLUGINSD_DISABLE_PLUGIN(parser, keyword, "host is not defined, send " PLUGINSD_KEYWORD_HOST_DEFINE " before this");
 
     rrdlabels_add(labels, name, value, RRDLABEL_SRC_CONFIG);
-
+    if (strcmp(name, "_node_stale_after_seconds") == 0) {
+        uint32_t seconds = str2u(value);
+        parser->user.host_define.node_stale_after_seconds = seconds;
+    }
     return PARSER_RC_OK;
 }
 
@@ -190,6 +193,8 @@ static inline void pluginsd_update_host_ephemerality(RRDHOST *host) {
         rrdlabels_add(host->rrdlabels, HOST_LABEL_IS_EPHEMERAL, value, RRDLABEL_SRC_CONFIG);
 }
 
+#define VNODE_BASE_EPOCH (1704067200L)  // Jan 1, 2024 00:00:00 UTC
+
 static inline PARSER_RC pluginsd_host_define_end(char **words __maybe_unused, size_t num_words __maybe_unused, PARSER *parser) {
     if(!parser->user.host_define.parsing_host)
         return PLUGINSD_DISABLE_PLUGIN(parser, PLUGINSD_KEYWORD_HOST_DEFINE_END, "missing initialization, send " PLUGINSD_KEYWORD_HOST_DEFINE " before this");
@@ -200,7 +205,7 @@ static inline PARSER_RC pluginsd_host_define_end(char **words __maybe_unused, si
         string2str(parser->user.host_define.hostname),
         string2str(parser->user.host_define.hostname),
         parser->user.host_define.machine_guid_str,
-        "Netdata Virtual Host 1.0",
+        NETDATA_VIRTUAL_HOST,
         netdata_configured_timezone,
         netdata_configured_abbrev_timezone,
         netdata_configured_utc_offset,
@@ -226,7 +231,6 @@ static inline PARSER_RC pluginsd_host_define_end(char **words __maybe_unused, si
     rrdhost_flag_set(host, RRDHOST_FLAG_COLLECTOR_ONLINE);
     object_state_activate_if_not_activated(&host->state_id);
     ml_host_start(host);
-    dyncfg_host_init(host);
     pulse_host_status(host, 0, 0); // this will detect the receiver status
 
     if(host->rrdlabels) {
@@ -245,19 +249,62 @@ static inline PARSER_RC pluginsd_host_define_end(char **words __maybe_unused, si
 
     rrdhost_flag_clear(host, RRDHOST_FLAG_ORPHAN);
     rrdcontext_host_child_connected(host);
-    if (host->aclk_config)
+    struct aclk_sync_cfg_t *aclk_host_config = __atomic_load_n(&host->aclk_host_config, __ATOMIC_RELAXED);
+    if (aclk_host_config)
         aclk_queue_node_info(host, true);
     else
         schedule_node_state_update(host, 100);
 
+    rrdhost_flag_set(host, RRDHOST_FLAG_METADATA_LABELS | RRDHOST_FLAG_METADATA_UPDATE);
+    uint32_t *Pvalue = (uint32_t *) JudyLIns(&parser->user.vnodes.JudyL, (Word_t) host, PJE0);
+    if (Pvalue != PJERR)
+        *Pvalue = (uint32_t) (now_realtime_sec() - VNODE_BASE_EPOCH);
+    else
+        nd_log_daemon(NDLP_ERR, "VNODE: Cannot track virtual host \"%s\" for staleness - JudyLIns error", rrdhost_hostname(host));
+    host->node_stale_after_seconds = parser->user.host_define.node_stale_after_seconds;
+    nd_log_daemon(NDLP_INFO, "VNODE: Configuring node stale after %u seconds for host \"%s\"", host->node_stale_after_seconds, rrdhost_hostname(host));
     return PARSER_RC_OK;
 }
 
-static inline PARSER_RC pluginsd_host(char **words, size_t num_words, PARSER *parser) {
+static inline PARSER_RC pluginsd_host(char **words, size_t num_words, PARSER *parser)
+{
+    static time_t last_host_stale_check = 0;
     char *guid = get_word(words, num_words, 1);
 
     if(!guid || !*guid || strcmp(guid, "localhost") == 0) {
         parser->user.host = localhost;
+        // Check if we need to switch any nodes to stale
+        uint32_t min_check_interval = UINT_MAX;
+        time_t now = now_realtime_sec();
+        if (last_host_stale_check < now) {
+            Word_t Index = 0;
+            bool first_then_next = true;
+            uint32_t *Pvalue;
+            while ((Pvalue = (uint32_t *) JudyLFirstThenNext(parser->user.vnodes.JudyL, &Index, &first_then_next))) {
+                RRDHOST *virtual_host = (RRDHOST *) Index;
+                uint32_t stale_after_seconds = virtual_host->node_stale_after_seconds;
+                if (!stale_after_seconds)
+                    continue;
+
+                min_check_interval = MIN(min_check_interval, stale_after_seconds);
+                if (rrdhost_option_check(virtual_host, RRDHOST_OPTION_VIRTUAL_HOST)) {
+                    time_t last_seen = (*Pvalue + VNODE_BASE_EPOCH);
+                    uint32_t seen_seconds_ago = (uint32_t) (now - last_seen);
+
+                    if (seen_seconds_ago >= stale_after_seconds) {
+                        rrdhost_option_clear(virtual_host, RRDHOST_OPTION_VIRTUAL_HOST);
+                        rrdhost_flag_clear(virtual_host, RRDHOST_FLAG_COLLECTOR_ONLINE);
+                        nd_log_daemon(NDLP_INFO, "VNODE: Marking node \"%s\" as STALE, last seen %u seconds ago", rrdhost_hostname(virtual_host), seen_seconds_ago);
+                        schedule_node_state_update(virtual_host, 1000);
+                        stream_sender_signal_to_stop_and_wait(virtual_host, STREAM_HANDSHAKE_SND_VNODE_IS_STALE, false);
+                    }
+                }
+            }
+            if (min_check_interval == UINT_MAX)
+                min_check_interval = 60;
+
+            last_host_stale_check = now_realtime_sec() + min_check_interval;
+        }
         return PARSER_RC_OK;
     }
 
@@ -271,7 +318,17 @@ static inline PARSER_RC pluginsd_host(char **words, size_t num_words, PARSER *pa
         return PLUGINSD_DISABLE_PLUGIN(parser, PLUGINSD_KEYWORD_HOST, "cannot find a host with this machine guid - have you created it?");
 
     parser->user.host = host;
-
+    uint32_t *Pvalue = (uint32_t *) JudyLGet(parser->user.vnodes.JudyL, (Word_t) host, PJE0);
+    if (Pvalue) {
+        *Pvalue = (uint32_t) (now_realtime_sec() - VNODE_BASE_EPOCH);
+        // Check if we need to enable
+        if (!rrdhost_option_check(host, RRDHOST_OPTION_VIRTUAL_HOST)) {
+            rrdhost_option_set(host, RRDHOST_OPTION_VIRTUAL_HOST);
+            rrdhost_flag_set(host, RRDHOST_FLAG_COLLECTOR_ONLINE);
+            nd_log_daemon(NDLP_INFO, "VNODE: Re-enabling virtual host \"%s\"", rrdhost_hostname(host));
+            schedule_node_state_update(host, 1000);
+        }
+    }
     return PARSER_RC_OK;
 }
 
@@ -381,10 +438,8 @@ static inline PARSER_RC pluginsd_chart(char **words, size_t num_words, PARSER *p
             else
                 rrdset_flag_clear(st, RRDSET_FLAG_STORE_FIRST);
         }
-        else {
-            rrdset_isnot_obsolete___safe_from_collector_thread(st);
+        else
             rrdset_flag_clear(st, RRDSET_FLAG_STORE_FIRST);
-        }
 
         if(!pluginsd_set_scope_chart(parser, st, PLUGINSD_KEYWORD_CHART))
             return PLUGINSD_DISABLE_PLUGIN(parser, NULL, NULL);
@@ -672,13 +727,13 @@ static inline PARSER_RC pluginsd_clabel(char **words, size_t num_words, PARSER *
         return PLUGINSD_DISABLE_PLUGIN(parser, NULL, NULL);
     }
 
-    if(unlikely(!parser->user.chart_rrdlabels_linked_temporarily)) {
-        RRDSET *st = pluginsd_get_scope_chart(parser);
-        parser->user.chart_rrdlabels_linked_temporarily = st->rrdlabels;
-        rrdlabels_unmark_all(parser->user.chart_rrdlabels_linked_temporarily);
-    }
+    RRDSET *st = pluginsd_get_scope_chart(parser);
+    if(!st) return PLUGINSD_DISABLE_PLUGIN(parser, PLUGINSD_KEYWORD_CLABEL, "Got CHART LABEL without a chart");
 
-    rrdlabels_add(parser->user.chart_rrdlabels_linked_temporarily, name, value, str2l(label_source));
+    if(unlikely(parser->user.clabel_count++ == 0))
+        rrdlabels_unmark_all(st->rrdlabels);
+
+    rrdlabels_add(st->rrdlabels, name, value, str2l(label_source));
 
     return PARSER_RC_OK;
 }
@@ -692,18 +747,19 @@ static inline PARSER_RC pluginsd_clabel_commit(char **words __maybe_unused, size
 
     netdata_log_debug(D_PLUGINSD, "requested to commit chart labels");
 
-    if(!parser->user.chart_rrdlabels_linked_temporarily) {
+    if(!parser->user.clabel_count) {
         netdata_log_error("PLUGINSD: 'host:%s' got CLABEL_COMMIT, without a CHART or BEGIN. Ignoring it.", rrdhost_hostname(host));
         return PLUGINSD_DISABLE_PLUGIN(parser, NULL, NULL);
     }
 
-    rrdlabels_remove_all_unmarked(parser->user.chart_rrdlabels_linked_temporarily);
+    rrdlabels_remove_all_unmarked(st->rrdlabels);
 
     rrdset_flag_set(st, RRDSET_FLAG_METADATA_UPDATE);
     rrdhost_flag_set(st->rrdhost, RRDHOST_FLAG_METADATA_UPDATE);
     rrdset_metadata_updated(st);
 
-    parser->user.chart_rrdlabels_linked_temporarily = NULL;
+    parser->user.clabel_count = 0;
+
     return PARSER_RC_OK;
 }
 
@@ -734,8 +790,13 @@ static ALWAYS_INLINE PARSER_RC pluginsd_begin_v2(char **words, size_t num_words,
     if(!pluginsd_set_scope_chart(parser, st, PLUGINSD_KEYWORD_BEGIN_V2))
         return PLUGINSD_DISABLE_PLUGIN(parser, NULL, NULL);
 
-    if(unlikely(rrdset_flag_check(st, RRDSET_FLAG_OBSOLETE)))
+    if(unlikely(rrdset_flag_check(st, RRDSET_FLAG_OBSOLETE))) {
+        if(!spinlock_trylock(&st->destroy_lock))
+            fatal("PLUGINSD: chart '%s' of host '%s' is being collected while is being destroyed.", rrdset_id(st), rrdhost_hostname(st->rrdhost));
+
         rrdset_isnot_obsolete___safe_from_collector_thread(st);
+        spinlock_unlock(&st->destroy_lock);
+    }
 
     timing_step(TIMING_STEP_BEGIN2_FIND_CHART);
 
@@ -875,8 +936,13 @@ static ALWAYS_INLINE PARSER_RC pluginsd_set_v2(char **words, size_t num_words, P
 
     st->pluginsd.set = true;
 
-    if(unlikely(rrddim_flag_check(rd, RRDDIM_FLAG_OBSOLETE | RRDDIM_FLAG_ARCHIVED)))
+    if(unlikely(rrddim_flag_check(rd, RRDDIM_FLAG_OBSOLETE))) {
+        if(!spinlock_trylock(&rd->destroy_lock))
+            fatal("PLUGINSD: dimension '%s' of chart '%s' is being collected while is being destroyed.", rrddim_id(rd), rrdset_id(st));
+
         rrddim_isnot_obsolete___safe_from_collector_thread(st, rd);
+        spinlock_unlock(&rd->destroy_lock);
+    }
 
     timing_step(TIMING_STEP_SET2_LOOKUP_DIMENSION);
 
@@ -1059,9 +1125,30 @@ static ALWAYS_INLINE PARSER_RC pluginsd_end_v2(char **words __maybe_unused, size
     return PARSER_RC_OK;
 }
 
+static inline PARSER_RC pluginsd_trust_durations(char **words, size_t num_words, PARSER *parser) {
+    char *value = get_word(words, num_words, 1);
+
+    if (!value || !*value)
+        return PLUGINSD_DISABLE_PLUGIN(parser, PLUGINSD_KEYWORD_TRUST_DURATIONS, "missing parameter");
+
+    int trusted = str2i(value);
+    if (trusted != 0 && trusted != 1)
+        return PLUGINSD_DISABLE_PLUGIN(parser, PLUGINSD_KEYWORD_TRUST_DURATIONS, "parameter must be 0 or 1");
+
+    parser->user.trust_durations = trusted;
+
+    netdata_log_debug(D_PLUGINSD, "PLUGINSD: trust durations set to %d", trusted);
+
+    return PARSER_RC_OK;
+}
+
 static inline PARSER_RC pluginsd_exit(char **words __maybe_unused, size_t num_words __maybe_unused, PARSER *parser __maybe_unused) {
     netdata_log_info("PLUGINSD: plugin called EXIT.");
     return PARSER_RC_STOP;
+}
+
+static inline PARSER_RC pluginsd_plugin_keepalive(char **words __maybe_unused, size_t num_words __maybe_unused, PARSER *parser __maybe_unused) {
+    return PARSER_RC_OK;
 }
 
 static void pluginsd_json_stream_paths(PARSER *parser, void *action_data __maybe_unused) {
@@ -1115,13 +1202,10 @@ void pluginsd_process_cleanup(PARSER *parser) {
     pluginsd_cleanup_v2(parser);
     pluginsd_host_define_cleanup(parser);
 
-    parser_destroy(parser);
-}
+    rrdlabels_destroy(parser->user.new_host_labels);
+    parser->user.clabel_count = 0;
 
-void pluginsd_process_thread_cleanup(void *pptr) {
-    PARSER *parser = CLEANUP_FUNCTION_GET_PTR(pptr);
-    pluginsd_process_cleanup(parser);
-    rrd_collector_finished();
+    parser_destroy(parser);
 }
 
 bool parser_reconstruct_node(BUFFER *wb, void *ptr) {
@@ -1187,7 +1271,6 @@ inline size_t pluginsd_process(RRDHOST *host, struct plugind *cd, int fd_input, 
     };
     ND_LOG_STACK_PUSH(lgs);
 
-    CLEANUP_FUNCTION_REGISTER(pluginsd_process_thread_cleanup) cleanup_parser = parser;
     buffered_reader_init(&parser->reader);
     CLEAN_BUFFER *buffer = buffer_create(sizeof(parser->reader.read_buffer) + 2, NULL);
     bool send_quit = true;
@@ -1199,7 +1282,7 @@ inline size_t pluginsd_process(RRDHOST *host, struct plugind *cd, int fd_input, 
                     2 * 60 * MSEC_PER_SEC, true);
 
             if(unlikely(ret != BUFFERED_READER_READ_OK)) {
-                nd_log(NDLS_COLLECTORS, NDLP_INFO, "PLUGINSD: buffered reader not OK (%u)", (unsigned)ret);
+                nd_log(NDLS_COLLECTORS, NDLP_INFO, "PLUGINSD: buffered reader not OK (%d)", ret);
                 if(ret == BUFFERED_READER_READ_POLLERR || ret == BUFFERED_READER_READ_POLLHUP)
                     send_quit = false;
                 break;
@@ -1232,6 +1315,33 @@ inline size_t pluginsd_process(RRDHOST *host, struct plugind *cd, int fd_input, 
     }
     else
         cd->serial_failures++;
+
+    {
+        Word_t Index = 0;
+        bool first_then_next = true;
+        while (JudyLFirstThenNext(parser->user.vnodes.JudyL, &Index, &first_then_next)) {
+            RRDHOST *virtual_host = (RRDHOST *) Index;
+            nd_log_daemon(NDLP_INFO, "PLUGINSD: Checking virtual status for %s", rrdhost_hostname(virtual_host));
+            if (rrdhost_option_check(virtual_host, RRDHOST_OPTION_VIRTUAL_HOST)) {
+                nd_log_daemon(NDLP_INFO, "PLUGINSD: Reseting virtual host status for %s", rrdhost_hostname(virtual_host));
+                rrdhost_option_clear(virtual_host, RRDHOST_OPTION_VIRTUAL_HOST);
+                rrdhost_flag_clear(virtual_host, RRDHOST_FLAG_COLLECTOR_ONLINE);
+                schedule_node_state_update(virtual_host, 1000);
+            }
+        }
+        (void) JudyLFreeArray(&parser->user.vnodes.JudyL, PJE0);
+    }
+
+    // mark all charts of this plugin as obsolete
+    RRDSET *st;
+    rrdset_foreach_read(st, localhost) {
+        if(st->collector_tid == gettid_cached())
+            rrdset_is_obsolete___safe_from_collector_thread(st);
+    }
+    rrdset_foreach_done(st);
+
+    pluginsd_process_cleanup(parser);
+    rrd_collector_finished();
 
     return count;
 }
@@ -1306,6 +1416,10 @@ ALWAYS_INLINE PARSER_RC parser_execute(PARSER *parser, const PARSER_KEYWORD *key
             return pluginsd_exit(words, num_words, parser);
         case PLUGINSD_KEYWORD_ID_CONFIG:
             return pluginsd_config(words, num_words, parser);
+        case PLUGINSD_KEYWORD_ID_TRUST_DURATIONS:
+            return pluginsd_trust_durations(words, num_words, parser);
+        case PLUGINSD_KEYWORD_ID_PLUGIN_KEEPALIVE:
+            return pluginsd_plugin_keepalive(words, num_words, parser);
 
         case PLUGINSD_KEYWORD_ID_DYNCFG_ENABLE:
         case PLUGINSD_KEYWORD_ID_DYNCFG_REGISTER_MODULE:
