@@ -94,33 +94,10 @@ progress "Attempt to create user/group netdata/netadata"
 NETDATA_WANTED_GROUPS="docker nginx varnish haproxy adm nsd proxy squid ceph nobody I2C"
 NETDATA_ADDED_TO_GROUPS=""
 # Default user/group
-NETDATA_USER="root"
-NETDATA_GROUP="root"
+NETDATA_USER="netdata"
+NETDATA_GROUP="netdata"
 
-if portable_add_group netdata; then
-  if portable_add_user netdata "/opt/netdata"; then
-    progress "Add user netdata to required user groups"
-    for g in ${NETDATA_WANTED_GROUPS}; do
-      # shellcheck disable=SC2086
-      if portable_add_user_to_group ${g} netdata; then
-        NETDATA_ADDED_TO_GROUPS="${NETDATA_ADDED_TO_GROUPS} ${g}"
-      else
-        run_failed "Failed to add netdata user to secondary groups"
-      fi
-    done
-    # Netdata must be able to read /etc/pve/qemu-server/* and /etc/pve/lxc/*
-    # for reading VMs/containers names, CPU and memory limits on Proxmox.
-    if [ -d "/etc/pve" ]; then
-      portable_add_user_to_group "www-data" netdata && NETDATA_ADDED_TO_GROUPS="${NETDATA_ADDED_TO_GROUPS} www-data"
-    fi
-    NETDATA_USER="netdata"
-    NETDATA_GROUP="netdata"
-  else
-    run_failed "I could not add user netdata, will be using root"
-  fi
-else
-  run_failed "I could not add group netdata, so no user netdata will be created as well. Netdata run as root:root"
-fi
+create_netdata_accounts
 
 # -----------------------------------------------------------------------------
 progress "Install logrotate configuration for netdata"
@@ -192,7 +169,8 @@ progress "fix permissions"
 
 run chmod g+rx,o+rx /opt
 run find /opt/netdata -type d -exec chmod go+rx '{}' \+
-run chown -R ${NETDATA_USER}:${NETDATA_GROUP} /opt/netdata/var
+
+install_netdata_dirs
 
 if [ -d /opt/netdata/usr/libexec/netdata/plugins.d/ebpf.d ]; then
   run chown -R root:${NETDATA_GROUP} /opt/netdata/usr/libexec/netdata/plugins.d/ebpf.d
@@ -202,7 +180,7 @@ fi
 
 progress "changing plugins ownership and permissions"
 
-for x in ndsudo apps.plugin perf.plugin slabinfo.plugin debugfs.plugin freeipmi.plugin ioping cgroup-network local-listeners network-viewer.plugin ebpf.plugin nfacct.plugin xenstat.plugin python.d.plugin charts.d.plugin go.d.plugin ioping.plugin cgroup-network-helper.sh; do
+for x in ndsudo apps.plugin perf.plugin slabinfo.plugin debugfs.plugin freeipmi.plugin ioping cgroup-network local-listeners network-viewer.plugin ebpf.plugin nfacct.plugin xenstat.plugin python.d.plugin charts.d.plugin go.d.plugin ioping.plugin cgroup-network-helper.sh otel-plugin otel-signal-viewer-plugin; do
   f="usr/libexec/netdata/plugins.d/${x}"
   if [ -f "${f}" ]; then
     run chown root:${NETDATA_GROUP} "${f}"
@@ -231,11 +209,19 @@ if command -v setcap >/dev/null 2>&1; then
   if ! run setcap "${perf_caps}" "usr/libexec/netdata/plugins.d/perf.plugin"; then
     run chmod 4750 "usr/libexec/netdata/plugins.d/perf.plugin"
   fi
+  if [ -f "usr/libexec/netdata/plugins.d/otel-signal-viewer-plugin" ]; then
+    if ! run setcap "cap_dac_read_search=eip" "usr/libexec/netdata/plugins.d/otel-signal-viewer-plugin"; then
+      run chmod 4750 "usr/libexec/netdata/plugins.d/otel-signal-viewer-plugin"
+    fi
+  fi
 else
   for x in apps.plugin perf.plugin slabinfo.plugin debugfs.plugin; do
     f="usr/libexec/netdata/plugins.d/${x}"
     run chmod 4750 "${f}"
   done
+  if [ -f "usr/libexec/netdata/plugins.d/otel-signal-viewer-plugin" ]; then
+    run chmod 4750 "usr/libexec/netdata/plugins.d/otel-signal-viewer-plugin"
+  fi
 fi
 
 for x in ndsudo freeipmi.plugin ioping cgroup-network local-listeners network-viewer.plugin ebpf.plugin nfacct.plugin xenstat.plugin; do

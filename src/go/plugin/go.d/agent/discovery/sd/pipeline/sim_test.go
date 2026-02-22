@@ -23,6 +23,9 @@ type discoverySim struct {
 	wantClassifyCalls int
 	wantComposeCalls  int
 	wantConfGroups    []*confgroup.Group
+
+	// New: when true (or when cfg.Services is non-empty), run with services engine only.
+	useServices bool
 }
 
 func (sim discoverySim) run(t *testing.T) {
@@ -32,15 +35,6 @@ func (sim discoverySim) run(t *testing.T) {
 	err := yaml.Unmarshal([]byte(sim.config), &cfg)
 	require.Nilf(t, err, "cfg unmarshal")
 
-	clr, err := newTargetClassificator(cfg.Classify)
-	require.Nil(t, err, "newTargetClassificator")
-
-	cmr, err := newConfigComposer(cfg.Compose)
-	require.Nil(t, err, "newConfigComposer")
-
-	mockClr := &mockClassificator{clr: clr}
-	mockCmr := &mockComposer{cmr: cmr}
-
 	accum := newAccumulator()
 	accum.sendEvery = time.Second * 2
 
@@ -48,14 +42,30 @@ func (sim discoverySim) run(t *testing.T) {
 		Logger:      logger.New(),
 		discoverers: sim.discoverers,
 		accum:       accum,
-		clr:         mockClr,
-		cmr:         mockCmr,
 		configs:     make(map[string]map[uint64][]confgroup.Config),
 	}
-
 	pl.accum.Logger = pl.Logger
-	clr.Logger = pl.Logger
-	cmr.Logger = pl.Logger
+
+	// Prefer services when either explicitly requested or present in config.
+	if sim.useServices || len(cfg.Services) > 0 {
+		// --- services-only path ---
+		svr, err := newServiceEngine(cfg.Services)
+		require.Nil(t, err, "newServiceEngine")
+
+		mockSvr := &mockComposer{cmr: svr} // reuse mock to count compose()
+		pl.svr = mockSvr                   // set services engine
+		svr.Logger = pl.Logger
+
+		groups := sim.collectGroups(t, pl)
+		sortConfigGroups(groups)
+		sortConfigGroups(sim.wantConfGroups)
+
+		assert.Equal(t, sim.wantConfGroups, groups)
+		// When services is used, classify is not called.
+		assert.Equalf(t, 0, sim.wantClassifyCalls, "classify calls should be zero in services mode")
+		assert.Equalf(t, sim.wantComposeCalls, mockSvr.calls, "compose (services) calls")
+		return
+	}
 
 	groups := sim.collectGroups(t, pl)
 
@@ -63,8 +73,6 @@ func (sim discoverySim) run(t *testing.T) {
 	sortConfigGroups(sim.wantConfGroups)
 
 	assert.Equal(t, sim.wantConfGroups, groups)
-	assert.Equalf(t, sim.wantClassifyCalls, mockClr.calls, "classify calls")
-	assert.Equalf(t, sim.wantComposeCalls, mockCmr.calls, "compose calls")
 }
 
 func (sim discoverySim) collectGroups(t *testing.T, pl *Pipeline) []*confgroup.Group {
@@ -97,19 +105,9 @@ func (sim discoverySim) collectGroups(t *testing.T, pl *Pipeline) []*confgroup.G
 	return groups
 }
 
-type mockClassificator struct {
-	calls int
-	clr   *targetClassificator
-}
-
-func (m *mockClassificator) classify(tgt model.Target) model.Tags {
-	m.calls++
-	return m.clr.classify(tgt)
-}
-
 type mockComposer struct {
 	calls int
-	cmr   *configComposer
+	cmr   composer
 }
 
 func (m *mockComposer) compose(tgt model.Target) []confgroup.Config {

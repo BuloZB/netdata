@@ -16,18 +16,6 @@ func newDiscoveredConfigsCache() *discoveredConfigs {
 	}
 }
 
-func newSeenConfigCache() *seenConfigs {
-	return &seenConfigs{
-		items: make(map[string]*seenConfig),
-	}
-}
-
-func newExposedConfigCache() *exposedConfigs {
-	return &exposedConfigs{
-		items: make(map[string]*seenConfig),
-	}
-}
-
 func newRunningJobsCache() *runningJobs {
 	return &runningJobs{
 		mux:   sync.Mutex{},
@@ -45,19 +33,6 @@ type (
 	discoveredConfigs struct {
 		// [Source][Hash]
 		items map[string]map[uint64]confgroup.Config
-	}
-
-	seenConfigs struct {
-		// [cfg.UID()]
-		items map[string]*seenConfig
-	}
-	exposedConfigs struct {
-		// [cfg.FullName()]
-		items map[string]*seenConfig
-	}
-	seenConfig struct {
-		cfg    confgroup.Config
-		status dyncfgStatus
 	}
 
 	runningJobs struct {
@@ -111,37 +86,6 @@ func (c *discoveredConfigs) add(group *confgroup.Group) (added, removed []confgr
 	}
 
 	return added, removed
-}
-
-func (c *seenConfigs) add(sj *seenConfig) {
-	c.items[sj.cfg.UID()] = sj
-}
-func (c *seenConfigs) remove(cfg confgroup.Config) {
-	delete(c.items, cfg.UID())
-}
-func (c *seenConfigs) lookup(cfg confgroup.Config) (*seenConfig, bool) {
-	v, ok := c.items[cfg.UID()]
-	return v, ok
-}
-
-func (c *exposedConfigs) add(sj *seenConfig) {
-	c.items[sj.cfg.FullName()] = sj
-}
-func (c *exposedConfigs) remove(cfg confgroup.Config) {
-	delete(c.items, cfg.FullName())
-}
-func (c *exposedConfigs) lookup(cfg confgroup.Config) (*seenConfig, bool) {
-	v, ok := c.items[cfg.FullName()]
-	return v, ok
-}
-
-func (c *exposedConfigs) lookupByName(module, job string) (*seenConfig, bool) {
-	key := module + "_" + job
-	if module == job {
-		key = job
-	}
-	v, ok := c.items[key]
-	return v, ok
 }
 
 func (c *runningJobs) lock() {

@@ -371,8 +371,12 @@ static int remove_ephemeral_host(BUFFER *wb, RRDHOST *host, bool report_error, b
     sql_set_host_label(&host->host_id.uuid, "_is_ephemeral", "true");
     pulse_host_status(host, 0, 0);
 
-    if(unregister) {
-        aclk_host_state_update(host, 0, 0);
+    if (marked)
+        send_node_info_with_wait(host);
+
+    if (unregister) {
+        send_node_update_with_wait(host, 0, 0);
+
         unregister_node(host->machine_guid);
         host->node_id = UUID_ZERO;
         buffer_sprintf(wb, "Node '%s' (machine guid: %s) has been unregistered",
@@ -382,12 +386,14 @@ static int remove_ephemeral_host(BUFFER *wb, RRDHOST *host, bool report_error, b
         rrd_wrunlock();
         return 1;
     }
-    else if(marked) {
+
+    if (marked) {
         buffer_sprintf(wb, "Node '%s' (machine guid: %s) has been marked ephemeral",
                        rrdhost_hostname(host), host->machine_guid);
         return 1;
     }
-    else if (report_error) {
+
+    if (report_error) {
         buffer_sprintf(wb, "Node '%s' (machine guid: %s) is already ephemeral - not changing it",
                        rrdhost_hostname(host), host->machine_guid);
     }
@@ -602,7 +608,8 @@ cmd_status_t execute_command(cmd_t idx, char *args, char **message)
     if (command_server_initialized >= command_info_array[idx].init_status)
         status = command_info_array[idx].func(args, message);
     else {
-        *message = strdupz("Agent is initializing");
+        if (message)
+            *message = strdupz("Agent is initializing");
         status = CMD_STATUS_SUCCESS;
     }
     cmd_unlock_by_type[type](idx);
@@ -896,6 +903,7 @@ void commands_init(void)
 
 after_error:
     netdata_log_error("Failed to initialize command server. The netdata cli tool will be unable to send commands.");
+    command_server_initialized = CMD_INIT_STATUS_OFF;
 }
 
 void commands_exit(void)

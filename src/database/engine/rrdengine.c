@@ -333,6 +333,7 @@ struct page_descr_with_data *page_descriptor_get(void) {
 }
 
 static inline void page_descriptor_release(struct page_descr_with_data *descr) {
+    uuidmap_free(descr->uuid_id);
     aral_freez(rrdeng_main.descriptors.ar, descr);
 }
 
@@ -692,8 +693,12 @@ extent_flush_to_open(struct rrdengine_instance *ctx, struct extent_io_descriptor
 
     bool still_running = ctx_is_available_for_queries(ctx);
 
+    usec_t max_end_time_ut = 0;
     for (i = 0 ; i < xt_io_descr->descr_count ; ++i) {
         descr = xt_io_descr->descr_array[i];
+
+        if (descr->end_time_ut > max_end_time_ut)
+            max_end_time_ut = descr->end_time_ut;
 
         if (likely(still_running && !have_error))
             pgc_open_add_hot_page(
@@ -707,6 +712,18 @@ extent_flush_to_open(struct rrdengine_instance *ctx, struct extent_io_descriptor
                 xt_io_descr->bytes);
 
         page_descriptor_release(descr);
+    }
+
+    if (!have_error) {
+        if (max_end_time_ut > 0) {
+            time_t new_last_time_s = (time_t)(max_end_time_ut / USEC_PER_SEC);
+
+            // Atomically update to keep the maximum
+            spinlock_lock(&datafile->journalfile->data_spinlock);
+            if (new_last_time_s > datafile->journalfile->v2.last_time_s)
+                datafile->journalfile->v2.last_time_s = new_last_time_s;
+            spinlock_unlock(&datafile->journalfile->data_spinlock);
+        }
     }
 
     posix_memalign_freez(xt_io_descr->buf);
@@ -724,7 +741,7 @@ extent_flush_to_open(struct rrdengine_instance *ctx, struct extent_io_descriptor
 
 // Main event loop callback
 
-static bool datafile_is_full(struct rrdengine_instance *ctx, struct rrdengine_datafile *datafile) {
+static bool datafile_is_full(struct rrdengine_instance *ctx, struct rrdengine_datafile *datafile, uint64_t extent_size) {
     bool ret = false;
 
     spinlock_lock(&datafile->writers.spinlock);
@@ -732,14 +749,14 @@ static bool datafile_is_full(struct rrdengine_instance *ctx, struct rrdengine_da
 #ifdef OS_WINDOWS
     time_t now = now_realtime_sec();
     if (now - datafile->writers.last_sync_time > 60) {
-        nd_log_daemon(NDLP_INFO, "DBENGINE: datafile %d, last sync time: %ld, now: %ld", datafile->fileno, datafile->writers.last_sync_time, now);
         sync_uv_file_data(datafile->file);
         sync_uv_file_data(datafile->journalfile->file);
         datafile->writers.last_sync_time = now_realtime_sec();
     }
 #endif
 
-    if(datafile->pos > rrdeng_target_data_file_size(ctx))
+    // Check if adding this extent would exceed the target size
+    if(datafile->pos + extent_size > rrdeng_target_data_file_size(ctx))
         ret = true;
 
     spinlock_unlock(&datafile->writers.spinlock);
@@ -832,8 +849,13 @@ static void __attribute__((destructor)) destroy_mutex(void) {
     netdata_mutex_destroy(&mutex);
 }
 
-static struct rrdengine_datafile *get_datafile_to_write_extent(struct rrdengine_instance *ctx) {
+static struct rrdengine_datafile *get_datafile_to_write_extent(struct rrdengine_instance *ctx, uint64_t extent_size) {
     struct rrdengine_datafile *datafile;
+
+    // Acquire the mutex at the beginning to make the entire check-and-act atomic
+    // This prevents the race condition where multiple threads pass the "is full" check
+    // before any of them increments the position, causing files to grow beyond limits
+    netdata_mutex_lock(&mutex);
 
     // get the latest datafile
     netdata_rwlock_rdlock(&ctx->datafiles.rwlock);
@@ -845,23 +867,15 @@ static struct rrdengine_datafile *get_datafile_to_write_extent(struct rrdengine_
     spinlock_unlock(&datafile->writers.spinlock);
     netdata_rwlock_rdunlock(&ctx->datafiles.rwlock);
 
-    if(datafile_is_full(ctx, datafile)) {
+    if(datafile_is_full(ctx, datafile, extent_size)) {
         // remember the datafile we have become writers to
         struct rrdengine_datafile *old_datafile = datafile;
 
-        // only 1 datafile creation at a time
-
-        netdata_mutex_lock(&mutex);
-
-        // take the latest datafile again - without this, multiple threads may create multiple files
-        datafile = get_last_ctx_datafile(ctx, false);
-
-        if(datafile_is_full(ctx, datafile) && create_new_datafile_pair(ctx) == 0)
+        // Create a new datafile - since we hold the mutex, no other thread can interfere
+        if(create_new_datafile_pair(ctx) == 0)
             __atomic_store_n(&ctx->atomic.needs_indexing, true, __ATOMIC_RELAXED);
 
-        netdata_mutex_unlock(&mutex);
-
-        // get the new latest datafile again, like above
+        // get the new datafile
         netdata_rwlock_rdlock(&ctx->datafiles.rwlock);
         datafile = get_last_ctx_datafile(ctx, true);
         // become a writer on this datafile, to prevent it from vanishing
@@ -881,6 +895,8 @@ static struct rrdengine_datafile *get_datafile_to_write_extent(struct rrdengine_
 #endif
         spinlock_unlock(&old_datafile->writers.spinlock);
     }
+
+    netdata_mutex_unlock(&mutex);
 
     return datafile;
 }
@@ -935,7 +951,7 @@ datafile_extent_build(struct rrdengine_instance *ctx, struct page_descr_with_dat
     for (i = 0 ; i < count ; ++i) {
         descr = xt_io_descr->descr_array[i];
         header->descr[i].type = descr->type;
-        uuid_copy(*(nd_uuid_t *)header->descr[i].uuid, *descr->id);
+        uuid_copy(*(nd_uuid_t *)header->descr[i].uuid, *uuidmap_uuid_ptr(descr->uuid_id));
         header->descr[i].page_length = descr->page_length;
         header->descr[i].start_time_ut = descr->start_time_ut;
 
@@ -992,7 +1008,8 @@ datafile_extent_build(struct rrdengine_instance *ctx, struct page_descr_with_dat
 
     real_io_size = ALIGN_BYTES_CEILING(size_bytes);
 
-    datafile = get_datafile_to_write_extent(ctx);
+    // Pass the extent size so the check can determine if this extent will fit
+    datafile = get_datafile_to_write_extent(ctx, real_io_size);
     spinlock_lock(&datafile->writers.spinlock);
     xt_io_descr->datafile = datafile;
     xt_io_descr->pos = datafile->pos;
@@ -1355,8 +1372,11 @@ static void update_metrics_first_time_s(struct rrdengine_instance *ctx, struct r
         added++;
     }
 
-    netdata_log_info("DBENGINE: recalculating tier %d retention for %zu metrics starting with datafile %u",
-         ctx->config.tier, count, first_datafile_remaining->fileno);
+    netdata_log_info(
+        "DBENGINE: recalculating tier %d retention for %zu metrics starting with datafile %u",
+        ctx->config.tier,
+        count,
+        first_datafile_remaining ? first_datafile_remaining->fileno : 0);
 
     journalfile_v2_data_release(journalfile);
 
@@ -1458,6 +1478,7 @@ void datafile_delete(
         worker_is_busy(UV_EVENT_DBENGINE_DATAFILE_DELETE_WAIT);
 
     bool datafile_got_for_deletion = datafile_acquire_for_deletion(datafile, false);
+    size_t attempts = 0;
 
     while (!datafile_got_for_deletion) {
         if(worker)
@@ -1466,6 +1487,20 @@ void datafile_delete(
         datafile_got_for_deletion = datafile_acquire_for_deletion(datafile, false);
 
         if (!datafile_got_for_deletion) {
+            if(++attempts >= 30) {
+                // pending_deletion is already set, blocking new acquires.
+                // Bail out and let the next rotation cycle retry - lockers
+                // will drain over time since no new ones can be added.
+                netdata_log_error("DBENGINE: datafile %u of tier %d could not be acquired for deletion "
+                                  "after %zu attempts (%u lockers remain) - will retry on next rotation",
+                                  datafile->fileno, ctx->config.tier, attempts, datafile->users.lockers);
+
+                if(worker)
+                    worker_is_idle();
+
+                return;
+            }
+
             netdata_log_info("DBENGINE: waiting for data file '%s/"
                          DATAFILE_PREFIX RRDENG_FILE_NUMBER_PRINT_TMPL DATAFILE_EXTENSION
                          "' to be available for deletion, "
@@ -1483,7 +1518,7 @@ void datafile_delete(
                      ctx->config.dbfiles_path, datafile->tier, datafile->fileno);
 
     if (update_retention)
-        update_metrics_first_time_s(ctx, datafile, get_next_datafile(datafile, NULL, true), worker);
+        update_metrics_first_time_s(ctx, datafile, get_next_datafile(datafile, NULL, false), worker);
 
 //    if (!ctx_is_available_for_queries(ctx)) {
 //        // agent is shutting down, we cannot continue
@@ -1586,43 +1621,41 @@ static void *flush_dirty_pages_of_section_tp_worker(struct rrdengine_instance *c
 }
 
 struct mrg_load_thread {
-    int max_threads;
-    ND_THREAD *thread;
     uv_sem_t *sem;
-    int tier;
     struct rrdengine_datafile *datafile;
-    bool busy;
-    bool finished;
+    size_t *total;
+    size_t *populated_datafiles;
 };
-
-size_t max_running_threads = 0;
-size_t running_threads = 0;
 
 void journalfile_v2_populate_retention_to_mrg_worker(void *arg)
 {
     struct mrg_load_thread *mlt = arg;
-    uv_sem_wait(mlt->sem);
-
     struct rrdengine_instance *ctx = mlt->datafile->ctx;
-
-    size_t current_threads = __atomic_add_fetch(&running_threads, 1, __ATOMIC_RELAXED);
-    size_t prev_max;
-    do {
-        prev_max = __atomic_load_n(&max_running_threads, __ATOMIC_RELAXED);
-        if (current_threads <= prev_max) {
-            break;
-        }
-    } while (!__atomic_compare_exchange_n(
-        &max_running_threads, &prev_max, current_threads, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
 
     journalfile_v2_populate_retention_to_mrg(ctx, mlt->datafile->journalfile);
 
-    __atomic_sub_fetch(&running_threads, 1, __ATOMIC_RELAXED);
     uv_sem_post(mlt->sem);
-
-    // Signal completion - this needs to be last
-    __atomic_store_n(&mlt->finished, true, __ATOMIC_RELEASE);
 }
+
+static void *tier_mrg_load(
+    struct rrdengine_instance *ctx __maybe_unused,
+    void *data,
+    struct completion *completion __maybe_unused,
+    uv_work_t *req __maybe_unused)
+{
+    worker_is_busy(UV_EVENT_DBENGINE_MRG_LOAD);
+    struct mrg_load_thread *mlt = data;
+    journalfile_v2_populate_retention_to_mrg_worker(mlt);
+    mlt->datafile->populate_mrg.populated = true;
+    spinlock_unlock(&mlt->datafile->populate_mrg.spinlock);
+
+    __atomic_add_fetch(mlt->populated_datafiles, 1, __ATOMIC_RELAXED);
+    __atomic_sub_fetch(mlt->total, 1, __ATOMIC_RELEASE);
+    freez(mlt);
+    worker_is_idle();
+    return NULL;
+}
+
 
 static void after_populate_mrg(struct rrdengine_instance *ctx __maybe_unused, void *data __maybe_unused, struct completion *completion __maybe_unused, uv_work_t* req __maybe_unused, int status __maybe_unused) {
     if (completion)
@@ -1638,11 +1671,7 @@ static void *populate_mrg_tp_worker(
     worker_is_busy(UV_EVENT_DBENGINE_POPULATE_MRG);
 
     struct mrg_load_thread *mlt = data;
-    size_t max_threads = mlt->max_threads;
     int tier = ctx->config.tier;
-
-    size_t thread_index = 0;
-    int rc;
 
     netdata_rwlock_rdlock(&ctx->datafiles.rwlock);
 
@@ -1662,6 +1691,7 @@ static void *populate_mrg_tp_worker(
         return data;
     }
 
+    size_t total = 0;
     do {
         struct rrdengine_datafile *datafile = NULL;
 
@@ -1689,96 +1719,29 @@ static void *populate_mrg_tp_worker(
         if(!datafile)
             break;
 
-        // Datafile populate mrg spinlock is acquired
-        // Find an available thread slot or join finished threads
-        bool thread_slot_found = false;
-
-        while (!thread_slot_found) {
-            // First, check for any finished threads to clean up
-            for (size_t index = 0; index < max_threads; index++) {
-                if (__atomic_load_n(&mlt[index].finished, __ATOMIC_RELAXED) &&
-                    __atomic_load_n(&mlt[index].tier, __ATOMIC_ACQUIRE) == tier) {
-
-                    rc = nd_thread_join(mlt[index].thread);
-                    if (rc)
-                        nd_log_daemon(NDLP_WARNING, "Failed to join thread, rc = %d", rc);
-
-                    __atomic_store_n(&mlt[index].busy, false, __ATOMIC_RELEASE);
-                    __atomic_store_n(&mlt[index].finished, false, __ATOMIC_RELEASE);
-                    mlt[index].datafile->populate_mrg.populated = true;
-                    populated_datafiles++;
-                    spinlock_unlock(&mlt[index].datafile->populate_mrg.spinlock);
-
-                    // We've cleaned up a thread slot, but we'll still look for a free one
-                }
-            }
-
-            // Look for a free thread slot
-            for (size_t index = 0; index < max_threads; index++) {
-                bool expected = false;
-                if (__atomic_compare_exchange_n(&(mlt[index].busy), &expected, true, false,
-                                                __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
-                    thread_index = index;
-                    thread_slot_found = true;
-                    break;
-                }
-            }
-
-            if (!thread_slot_found) {
-                // If we couldn't find a free slot after cleanup, wait a bit and try again
-                sleep_usec(10 * USEC_PER_MS);
-            }
-        }
-
-        // We have a thread slot (thread_index) and a datafile to process
-        __atomic_store_n(&mlt[thread_index].tier, tier, __ATOMIC_RELAXED);
-        mlt[thread_index].datafile = datafile;
-
-        mlt[thread_index].thread = nd_thread_create("MRGLOAD", NETDATA_THREAD_OPTION_DEFAULT, journalfile_v2_populate_retention_to_mrg_worker,
-                                                    &mlt[thread_index]);
-
-        if (!mlt[thread_index].thread) {
-            nd_log_daemon(NDLP_WARNING, "Failed to create thread for MRG population");
-            __atomic_store_n(&mlt[thread_index].busy, false, __ATOMIC_RELEASE);
-            spinlock_unlock(&datafile->populate_mrg.spinlock);
-        }
+        uv_sem_wait(mlt->sem);
+        struct mrg_load_thread *local_mlt = callocz(1, sizeof(struct mrg_load_thread));
+        local_mlt->datafile = datafile;
+        local_mlt->sem = mlt->sem;
+        local_mlt->total = &total;
+        local_mlt->populated_datafiles = &populated_datafiles;
+        __atomic_add_fetch(local_mlt->total, 1, __ATOMIC_RELAXED);
+        rrdeng_enq_cmd(ctx, RRDENG_OPCODE_MRG_LOAD, local_mlt, NULL, STORAGE_PRIORITY_INTERNAL_DBENGINE, NULL, NULL);
         nd_log_limit_static_thread_var(erl, 10, 0);
         nd_log_limit(&erl, NDLS_DAEMON, NDLP_INFO, "DBENGINE: Tier %d MRG population completed: %.2f%% (%zu/%zu)", tier, (populated_datafiles * 100.0) / total_datafiles,
                      populated_datafiles, total_datafiles);
     } while(1);
 
     // We've processed all datafiles. Now wait for all our threads to complete
-    bool threads_still_running;
+    size_t pending;
     do {
-        threads_still_running = false;
-
-        for (size_t index = 0; index < max_threads; index++) {
-            if (__atomic_load_n(&mlt[index].busy, __ATOMIC_ACQUIRE) &&
-                __atomic_load_n(&mlt[index].tier, __ATOMIC_ACQUIRE) == tier) {
-
-                if (__atomic_load_n(&mlt[index].finished, __ATOMIC_RELAXED)) {
-                    // Thread is finished, join it
-                    rc = nd_thread_join((mlt[index].thread));
-                    if (rc)
-                        nd_log_daemon(NDLP_WARNING, "Failed to join thread, rc = %d", rc);
-
-                    __atomic_store_n(&mlt[index].busy, false, __ATOMIC_RELEASE);
-                    __atomic_store_n(&mlt[index].finished, false, __ATOMIC_RELEASE);
-                    mlt[index].datafile->populate_mrg.populated = true;
-                    spinlock_unlock(&mlt[index].datafile->populate_mrg.spinlock);
-                } else {
-                    // Thread is still running
-                    threads_still_running = true;
-                }
-            }
-        }
-
-        if (threads_still_running) {
-            // Wait a bit before checking again
+        pending = __atomic_load_n(&total, __ATOMIC_ACQUIRE);
+        if (pending) {
+            nd_log_limit_static_thread_var(erl, 10, 0);
+            nd_log_limit(&erl, NDLS_DAEMON, NDLP_INFO, "DBENGINE: Tier %d Waiting for %zu threads", tier, total);
             sleep_usec(10 * USEC_PER_MS);
         }
-
-    } while (threads_still_running);
+    } while (pending > 0);
 
     worker_is_idle();
     return data;
@@ -1864,23 +1827,6 @@ uint64_t rrdeng_target_data_file_size(struct rrdengine_instance *ctx) {
     return target_size;
 }
 
-time_t get_datafile_end_time(struct rrdengine_instance *ctx)
-{
-    time_t last_time_s = 0;
-
-    netdata_rwlock_rdlock(&ctx->datafiles.rwlock);
-    struct rrdengine_datafile *datafile = get_last_ctx_datafile(ctx, true);
-
-    if (datafile) {
-        last_time_s = datafile->journalfile->v2.last_time_s;
-        if (!last_time_s)
-            last_time_s = datafile->journalfile->v2.first_time_s;
-    }
-
-    netdata_rwlock_rdunlock(&ctx->datafiles.rwlock);
-    return last_time_s;
-}
-
 /* return 0 on success */
 int init_rrd_files(struct rrdengine_instance *ctx)
 {
@@ -1897,9 +1843,6 @@ uint64_t last_async_callback;
 
 void async_cb(uv_async_t *handle)
 {
-    uv_stop(handle->loop);
-    uv_update_time(handle->loop);
-
     last_async_callback = uv_hrtime();
 
     netdata_log_debug(D_RRDENGINE, "%s called, active=%d.", __func__, uv_is_active((uv_handle_t *)handle));
@@ -1915,10 +1858,8 @@ static void async_closed_cb(uv_handle_t *handle)
     __atomic_store_n(&main->async_ready, true, __ATOMIC_RELEASE);
 }
 #else
-void async_cb(uv_async_t *handle)
+void async_cb(uv_async_t *handle __maybe_unused)
 {
-    uv_stop(handle->loop);
-    uv_update_time(handle->loop);
     netdata_log_debug(D_RRDENGINE, "%s called, active=%d.", __func__, uv_is_active((uv_handle_t *)handle));
 }
 #endif
@@ -2151,23 +2092,12 @@ uint64_t rrdeng_get_used_disk_space(struct rrdengine_instance *ctx, bool having_
     return estimated_disk_space;
 }
 
-static time_t get_tier_retention(struct rrdengine_instance *ctx)
-{
-    time_t retention = 0;
-    if (localhost) {
-        STORAGE_ENGINE *eng = localhost->db[ctx->config.tier].eng;
-        if (eng) {
-            time_t first_time_s = get_datafile_end_time(ctx);
-            if (first_time_s)
-                retention = now_realtime_sec() - first_time_s;
-        }
-    }
-    return retention;
-}
-
 // Check if disk or retention time cap reached
 bool rrdeng_ctx_tier_cap_exceeded(struct rrdengine_instance *ctx)
 {
+    bool trigger_time_retention = false;
+    uint64_t estimated_disk_space = 0;
+
     netdata_rwlock_rdlock(&ctx->datafiles.rwlock);
     struct rrdengine_datafile *first_datafile = get_first_ctx_datafile(ctx, true);
 
@@ -2176,16 +2106,25 @@ bool rrdeng_ctx_tier_cap_exceeded(struct rrdengine_instance *ctx)
         return false;
     }
 
-    uint64_t estimated_disk_space = rrdeng_get_used_disk_space(ctx, true);
+    if (ctx->config.max_retention_s) {
+        time_t last_time_s = first_datafile->journalfile->v2.last_time_s;
+        if (!last_time_s)
+            last_time_s = first_datafile->journalfile->v2.first_time_s;
+
+        time_t cutoff_before_time_s = now_realtime_sec() - ctx->config.max_retention_s;
+        trigger_time_retention = (last_time_s && last_time_s <= cutoff_before_time_s);
+    }
+
+    // avoid disk calculation if we will trigger time retention
+    // calculate estimated disk space only if we have a disk cap
+    if (false == trigger_time_retention && ctx->config.max_disk_space)
+        estimated_disk_space = rrdeng_get_used_disk_space(ctx, true);
 
     netdata_rwlock_rdunlock(&ctx->datafiles.rwlock);
 
-    if (ctx->config.max_retention_s) {
-        time_t retention = get_tier_retention(ctx);
-        if (retention > ctx->config.max_retention_s) {
-            __atomic_store_n(&ctx->datafiles.disk_time, false, __ATOMIC_RELAXED);
-            return true;
-        }
+    if (trigger_time_retention) {
+        __atomic_store_n(&ctx->datafiles.disk_time, false, __ATOMIC_RELAXED);
+        return true;
     }
 
     if (ctx->config.max_disk_space && estimated_disk_space > ctx->config.max_disk_space) {
@@ -2392,6 +2331,7 @@ void dbengine_event_loop(void* arg) {
     worker_register_job_name(RRDENG_OPCODE_CTX_QUIESCE,                              "ctx quiesce");
     worker_register_job_name(RRDENG_OPCODE_SHUTDOWN_EVLOOP,                          "dbengine shutdown");
     worker_register_job_name(RRDENG_OPCODE_PARALLEL_WEIGHT,                          "parallel weight");
+    worker_register_job_name(RRDENG_OPCODE_MRG_LOAD,                                 "mrg tier load");
 
 
     worker_register_job_name(RRDENG_OPCODE_MAX,                                      "get opcode");
@@ -2407,6 +2347,7 @@ void dbengine_event_loop(void* arg) {
     worker_register_job_name(RRDENG_OPCODE_MAX + RRDENG_OPCODE_CTX_FLUSH_DIRTY,      "ctx flush dirty cb");
     worker_register_job_name(RRDENG_OPCODE_MAX + RRDENG_OPCODE_CTX_QUIESCE,          "ctx quiesce cb");
     worker_register_job_name(RRDENG_OPCODE_MAX + RRDENG_OPCODE_PARALLEL_WEIGHT,      "parallel weight cb");
+    worker_register_job_name(RRDENG_OPCODE_MAX + RRDENG_OPCODE_MRG_LOAD,             "mrg tier load cb");
 
     // special jobs
     worker_register_job_name(RRDENG_RETENTION_TIMER_CB,                              "retention timer");
@@ -2431,9 +2372,6 @@ void dbengine_event_loop(void* arg) {
     struct mrg_load_thread *mlt = callocz(cpus, sizeof(*mlt));
     for (size_t i = 0; i < cpus; i++) {
         mlt[i].sem = &sem;
-        mlt[i].max_threads = cpus;
-        mlt[i].busy = false;
-        mlt[i].finished = false;
     }
 
 #if defined(OS_WINDOWS)
@@ -2452,6 +2390,10 @@ void dbengine_event_loop(void* arg) {
             worker_is_busy(opcode);
 
             switch (opcode) {
+                case RRDENG_OPCODE_MRG_LOAD:
+                    work_dispatch(NULL, cmd.data, cmd.completion, cmd.opcode, tier_mrg_load, NULL);
+                    break;
+
                 case RRDENG_OPCODE_PARALLEL_WEIGHT:;
 
                     work_dispatch(NULL, cmd.data, cmd.completion, cmd.opcode, weights_worker, after_weights_worker);
