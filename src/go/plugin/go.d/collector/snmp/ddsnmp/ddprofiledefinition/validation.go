@@ -62,19 +62,25 @@ const (
 	ColumnSymbol
 	MetricTagSymbol
 	MetadataSymbol
+	TopologyScalarSymbol
+	TopologyColumnSymbol
 )
 
 // ValidateEnrichProfile validates a profile and normalizes it.
 func ValidateEnrichProfile(p *ProfileDefinition) error {
 	normalizeMetrics(p.Metrics)
+	normalizeTopology(p.Topology)
+	normalizeLicensing(p.Licensing)
 
 	errs := []error{
 		validateEnrichLegacySelector(p),
 		validateEnrichMetadata(p.Metadata),
 		validateEnrichSysobjectIDMetadata(p.SysobjectIDMetadata),
 		validateEnrichMetrics(p.Metrics),
-		validateEnrichMetricTags(p.MetricTags),
-		validateEnrichVirtualMetrics(p.Metrics, p.VirtualMetrics),
+		validateEnrichTopology(p.Topology),
+		validateEnrichLicensing(p.Licensing),
+		validateEnrichGlobalMetricTags(p.MetricTags),
+		validateEnrichVirtualMetrics(p.Metrics, p.Topology, p.VirtualMetrics),
 	}
 
 	return errors.Join(errs...)
@@ -85,15 +91,76 @@ func ValidateEnrichProfile(p *ProfileDefinition) error {
 // metric.Name and metric.OID info are moved to metric.Symbol.Name and metric.Symbol.OID
 func normalizeMetrics(metrics []MetricsConfig) {
 	for i := range metrics {
-		metric := &metrics[i]
+		normalizeMetric(&metrics[i])
+	}
+}
 
-		// converts old symbol syntax to new symbol syntax
-		if metric.Symbol.Name == "" && metric.Symbol.OID == "" && metric.Name != "" && metric.OID != "" {
-			metric.Symbol.Name = metric.Name
-			metric.Symbol.OID = metric.OID
-			metric.Name = ""
-			metric.OID = ""
-		}
+func normalizeTopology(topology []TopologyConfig) {
+	for i := range topology {
+		normalizeMetric(&topology[i].MetricsConfig)
+	}
+}
+
+func normalizeLicensing(licensing []LicensingConfig) {
+	for i := range licensing {
+		normalizeLicenseValue(&licensing[i].Identity.ID)
+		normalizeLicenseValue(&licensing[i].Identity.Name)
+		normalizeLicenseValue(&licensing[i].Identity.Feature)
+		normalizeLicenseValue(&licensing[i].Identity.Component)
+		normalizeLicenseValue(&licensing[i].Descriptors.Type)
+		normalizeLicenseValue(&licensing[i].Descriptors.Impact)
+		normalizeLicenseValue(&licensing[i].Descriptors.Perpetual)
+		normalizeLicenseValue(&licensing[i].Descriptors.Unlimited)
+		normalizeLicenseValue(&licensing[i].State.LicenseValueConfig)
+		normalizeLicenseSignals(&licensing[i].Signals)
+	}
+}
+
+func normalizeLicenseSignals(signals *LicenseSignalsConfig) {
+	normalizeLicenseTimerSignals(&signals.Expiry)
+	normalizeLicenseTimerSignals(&signals.Authorization)
+	normalizeLicenseTimerSignals(&signals.Certificate)
+	normalizeLicenseTimerSignals(&signals.Grace)
+	normalizeLicenseValue(&signals.Usage.Used)
+	normalizeLicenseValue(&signals.Usage.Capacity)
+	normalizeLicenseValue(&signals.Usage.Available)
+	normalizeLicenseValue(&signals.Usage.Percent)
+}
+
+func normalizeLicenseTimerSignals(signals *LicenseTimerSignalsConfig) {
+	normalizeLicenseValue(&signals.LicenseValueConfig)
+	normalizeLicenseValue(&signals.Timestamp)
+	normalizeLicenseValue(&signals.Remaining)
+}
+
+func normalizeLicenseValue(value *LicenseValueConfig) {
+	if value.Symbol.Name == "" && value.Symbol.OID == "" && value.Name != "" && value.OID != "" {
+		value.Symbol.Name = value.Name
+		value.Symbol.OID = value.OID
+		value.Name = ""
+		value.OID = ""
+	}
+	if value.Symbol.Format == "" {
+		value.Symbol.Format = value.Format
+		value.Format = ""
+	}
+}
+
+func normalizeMetric(metric *MetricsConfig) {
+	if metric == nil {
+		return
+	}
+
+	// converts old symbol syntax to new symbol syntax
+	if metric.Symbol.Name == "" && metric.Symbol.OID == "" && metric.Name != "" && metric.OID != "" {
+		metric.Symbol.Name = metric.Name
+		metric.Symbol.OID = metric.OID
+		metric.Name = ""
+		metric.OID = ""
+	}
+	if metric.Symbol.MetricType == "" {
+		metric.Symbol.MetricType = metric.MetricType
+		metric.MetricType = ""
 	}
 }
 
@@ -146,6 +213,7 @@ func validateEnrichMetadata(metadata MetadataConfig) error {
 					continue
 				}
 				field := res.Fields[fieldName]
+				errs = append(errs, validateConsumers(fmt.Sprintf("metadata.%s.fields.%s.consumers", resName, fieldName), field.Consumers))
 				for i := range field.Symbols {
 					errs = append(errs, validateEnrichSymbol(&field.Symbols[i], MetadataSymbol))
 				}
@@ -200,6 +268,7 @@ func validateEnrichSysobjectIDMetadata(entries []SysobjectIDMetadataEntryConfig)
 			if field.Value == "" && field.Symbol.OID == "" && len(field.Symbols) == 0 {
 				errs = append(errs, fmt.Errorf("sysobjectid_metadata[%d].%s: must have either value or symbol(s)", i, fieldName))
 			}
+			errs = append(errs, validateConsumers(fmt.Sprintf("sysobjectid_metadata[%d].%s.consumers", i, fieldName), field.Consumers))
 
 			// Can't have both value and symbols
 			if field.Value != "" && (field.Symbol.OID != "" || len(field.Symbols) > 0) {
@@ -283,6 +352,473 @@ func validateEnrichMetrics(metrics []MetricsConfig) error {
 		}
 	}
 
+	return errors.Join(errs...)
+}
+
+func validateEnrichTopology(topology []TopologyConfig) error {
+	var errs []error
+
+	for i := range topology {
+		topo := &topology[i]
+		metricConfig := &topo.MetricsConfig
+
+		if topo.Kind == "" {
+			errs = append(errs, fmt.Errorf("topology[%d]: missing kind", i))
+		} else if !IsValidTopologyKind(topo.Kind) {
+			errs = append(errs, fmt.Errorf("topology[%d]: invalid kind %q", i, topo.Kind))
+		}
+		if !metricConfig.IsScalar() && !metricConfig.IsColumn() {
+			errs = append(errs, fmt.Errorf("topology[%d]: either a table symbol or a scalar symbol must be provided: %#v", i, metricConfig))
+		}
+		if metricConfig.IsScalar() && metricConfig.IsColumn() {
+			errs = append(errs, fmt.Errorf("topology[%d]: table symbol and scalar symbol cannot be both provided: %#v", i, metricConfig))
+		}
+		if metricConfig.Options != (MetricsConfigOption{}) {
+			errs = append(errs, fmt.Errorf("topology[%d]: options cannot be used in topology rows", i))
+		}
+		if metricConfig.IsScalar() {
+			errs = append(errs, validateEnrichTopologySymbol(i, &metricConfig.Symbol, TopologyScalarSymbol))
+			for j := range metricConfig.MetricTags {
+				metricTag := &metricConfig.MetricTags[j]
+				errs = append(errs, validateEnrichMetricTag(metricTag))
+				if metricTag.Table != "" {
+					errs = append(errs, fmt.Errorf("topology[%d].metric_tags[%d]: scalar metric_tags do not support `table` lookups (tag=%q, table=%q)", i, j, metricTag.Tag, metricTag.Table))
+				}
+				if metricTag.Index != 0 {
+					errs = append(errs, fmt.Errorf("topology[%d].metric_tags[%d]: scalar metric_tags do not support `index` lookups (tag=%q, index=%d)", i, j, metricTag.Tag, metricTag.Index))
+				}
+				if len(metricTag.IndexTransform) > 0 {
+					errs = append(errs, fmt.Errorf("topology[%d].metric_tags[%d]: scalar metric_tags do not support `index_transform` (tag=%q)", i, j, metricTag.Tag))
+				}
+				if metricTag.Symbol.OID == "" {
+					errs = append(errs, fmt.Errorf("topology[%d].metric_tags[%d]: scalar metric_tags require `symbol.OID` (tag=%q)", i, j, metricTag.Tag))
+				}
+			}
+		}
+		if metricConfig.IsColumn() {
+			for j := range metricConfig.Symbols {
+				errs = append(errs, validateEnrichTopologySymbol(i, &metricConfig.Symbols[j], TopologyColumnSymbol))
+			}
+			for j := range metricConfig.MetricTags {
+				errs = append(errs, validateEnrichMetricTag(&metricConfig.MetricTags[j]))
+			}
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+func validateEnrichLicensing(licensing []LicensingConfig) error {
+	var errs []error
+	seenSignals := make(map[licenseSignalValidationKey]string)
+
+	for i := range licensing {
+		row := &licensing[i]
+		isTable := row.Table.OID != ""
+		errs = append(errs, validateEnrichLicenseRowShape(i, row))
+		errs = append(errs, validateEnrichLicenseValue(fmt.Sprintf("licensing[%d].identity.id", i), &row.Identity.ID, isTable))
+		errs = append(errs, validateEnrichLicenseValue(fmt.Sprintf("licensing[%d].identity.name", i), &row.Identity.Name, isTable))
+		errs = append(errs, validateEnrichLicenseValue(fmt.Sprintf("licensing[%d].identity.feature", i), &row.Identity.Feature, isTable))
+		errs = append(errs, validateEnrichLicenseValue(fmt.Sprintf("licensing[%d].identity.component", i), &row.Identity.Component, isTable))
+		errs = append(errs, validateEnrichLicenseValue(fmt.Sprintf("licensing[%d].descriptors.type", i), &row.Descriptors.Type, isTable))
+		errs = append(errs, validateEnrichLicenseValue(fmt.Sprintf("licensing[%d].descriptors.impact", i), &row.Descriptors.Impact, isTable))
+		errs = append(errs, validateEnrichLicenseValue(fmt.Sprintf("licensing[%d].descriptors.perpetual", i), &row.Descriptors.Perpetual, isTable))
+		errs = append(errs, validateEnrichLicenseValue(fmt.Sprintf("licensing[%d].descriptors.unlimited", i), &row.Descriptors.Unlimited, isTable))
+		errs = append(errs, validateEnrichLicenseState(i, &row.State, isTable))
+		errs = append(errs, validateEnrichLicenseSignals(i, &row.Signals, isTable))
+		errs = append(errs, validateLicenseFromReferences(i, row))
+		errs = append(errs, validateLicenseSignalDuplicates(i, row, seenSignals))
+		for j := range row.MetricTags {
+			errs = append(errs, validateEnrichMetricTag(&row.MetricTags[j]))
+			if !isTable {
+				metricTag := &row.MetricTags[j]
+				if metricTag.Table != "" {
+					errs = append(errs, fmt.Errorf("licensing[%d].metric_tags[%d]: scalar metric_tags do not support `table` lookups (tag=%q, table=%q)", i, j, metricTag.Tag, metricTag.Table))
+				}
+				if metricTag.Index != 0 {
+					errs = append(errs, fmt.Errorf("licensing[%d].metric_tags[%d]: scalar metric_tags do not support `index` lookups (tag=%q, index=%d)", i, j, metricTag.Tag, metricTag.Index))
+				}
+				if len(metricTag.IndexTransform) > 0 {
+					errs = append(errs, fmt.Errorf("licensing[%d].metric_tags[%d]: scalar metric_tags do not support `index_transform` (tag=%q)", i, j, metricTag.Tag))
+				}
+				if metricTag.Symbol.OID == "" {
+					errs = append(errs, fmt.Errorf("licensing[%d].metric_tags[%d]: scalar metric_tags require `symbol.OID` (tag=%q)", i, j, metricTag.Tag))
+				}
+			}
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+func validateEnrichLicenseRowShape(rowIdx int, row *LicensingConfig) error {
+	var errs []error
+
+	if row.Table.Name != "" && row.Table.OID == "" {
+		errs = append(errs, fmt.Errorf("licensing[%d].table: table name %q requires table OID", rowIdx, row.Table.Name))
+	}
+	if row.Table.OID != "" && row.Table.Name == "" {
+		errs = append(errs, fmt.Errorf("licensing[%d].table: table OID %q requires table name", rowIdx, row.Table.OID))
+	}
+	if !licenseRowHasSignalConfigs(*row) {
+		errs = append(errs, fmt.Errorf("licensing[%d]: must define state or at least one signal", rowIdx))
+	}
+	if row.Table.OID == "" && row.ID == "" {
+		sourceOIDs := collectLicenseSignalSourceOIDs(*row)
+		switch {
+		case len(sourceOIDs) == 0:
+			errs = append(errs, fmt.Errorf("licensing[%d]: scalar rows without a signal source OID require explicit id", rowIdx))
+		case len(sourceOIDs) > 1:
+			errs = append(errs, fmt.Errorf("licensing[%d]: scalar rows with multiple signal source OIDs require explicit id", rowIdx))
+		}
+	}
+
+	return errors.Join(errs...)
+}
+
+func validateEnrichLicenseState(rowIdx int, state *LicenseStateConfig, isTable bool) error {
+	var errs []error
+	if state.Policy != "" && !IsValidLicenseStatePolicy(state.Policy) {
+		errs = append(errs, fmt.Errorf("licensing[%d].state.policy: invalid policy %q", rowIdx, state.Policy))
+	}
+	if state.Policy != "" && !state.LicenseValueConfig.IsSet() {
+		errs = append(errs, fmt.Errorf("licensing[%d].state.policy: policy requires state value source", rowIdx))
+	}
+	errs = append(errs, validateEnrichLicenseValueKind(fmt.Sprintf("licensing[%d].state", rowIdx), &state.LicenseValueConfig, LicenseSignalStateSeverity, isTable))
+	return errors.Join(errs...)
+}
+
+func validateEnrichLicenseSignals(rowIdx int, signals *LicenseSignalsConfig, isTable bool) error {
+	var errs []error
+	errs = append(errs, validateEnrichLicenseTimerSignals(rowIdx, "expiry", &signals.Expiry, LicenseSignalExpiryTimestamp, LicenseSignalExpiryRemaining, isTable))
+	errs = append(errs, validateEnrichLicenseTimerSignals(rowIdx, "authorization", &signals.Authorization, LicenseSignalAuthorizationTimestamp, LicenseSignalAuthorizationRemaining, isTable))
+	errs = append(errs, validateEnrichLicenseTimerSignals(rowIdx, "certificate", &signals.Certificate, LicenseSignalCertificateTimestamp, LicenseSignalCertificateRemaining, isTable))
+	errs = append(errs, validateEnrichLicenseTimerSignals(rowIdx, "grace", &signals.Grace, LicenseSignalGraceTimestamp, LicenseSignalGraceRemaining, isTable))
+	errs = append(errs, validateEnrichLicenseValueKind(fmt.Sprintf("licensing[%d].signals.usage.used", rowIdx), &signals.Usage.Used, LicenseSignalUsageUsed, isTable))
+	errs = append(errs, validateEnrichLicenseValueKind(fmt.Sprintf("licensing[%d].signals.usage.capacity", rowIdx), &signals.Usage.Capacity, LicenseSignalUsageCapacity, isTable))
+	errs = append(errs, validateEnrichLicenseValueKind(fmt.Sprintf("licensing[%d].signals.usage.available", rowIdx), &signals.Usage.Available, LicenseSignalUsageAvailable, isTable))
+	errs = append(errs, validateEnrichLicenseValueKind(fmt.Sprintf("licensing[%d].signals.usage.percent", rowIdx), &signals.Usage.Percent, LicenseSignalUsagePercent, isTable))
+	return errors.Join(errs...)
+}
+
+func validateEnrichLicenseTimerSignals(rowIdx int, name string, signals *LicenseTimerSignalsConfig, timestampKind, remainingKind LicenseSignalKind, isTable bool) error {
+	var errs []error
+	basePath := fmt.Sprintf("licensing[%d].signals.%s", rowIdx, name)
+	if signals.LicenseValueConfig.IsSet() && signals.Timestamp.IsSet() {
+		errs = append(errs, fmt.Errorf("%s: inline timestamp and timestamp cannot both be set", basePath))
+	}
+	if (signals.LicenseValueConfig.IsSet() || signals.Timestamp.IsSet()) && signals.Remaining.IsSet() {
+		errs = append(errs, fmt.Errorf("%s: timestamp and remaining cannot both be set", basePath))
+	}
+	errs = append(errs, validateEnrichLicenseValueKind(basePath, &signals.LicenseValueConfig, timestampKind, isTable))
+	errs = append(errs, validateEnrichLicenseValueKind(basePath+".timestamp", &signals.Timestamp, timestampKind, isTable))
+	errs = append(errs, validateEnrichLicenseValueKind(basePath+".remaining", &signals.Remaining, remainingKind, isTable))
+	return errors.Join(errs...)
+}
+
+func validateEnrichLicenseValueKind(path string, value *LicenseValueConfig, defaultKind LicenseSignalKind, isTable bool) error {
+	if !value.IsSet() {
+		return nil
+	}
+	if value.Kind == "" {
+		value.Kind = defaultKind
+	} else if value.Kind != defaultKind {
+		if !IsValidLicenseSignalKind(value.Kind) {
+			return fmt.Errorf("%s.kind: invalid kind %q", path, value.Kind)
+		}
+		return fmt.Errorf("%s.kind: expected %q, got %q", path, defaultKind, value.Kind)
+	}
+	return validateEnrichLicenseValue(path, value, isTable)
+}
+
+func validateEnrichLicenseValue(path string, value *LicenseValueConfig, isTable bool) error {
+	var errs []error
+	if !value.IsSet() {
+		return nil
+	}
+
+	if value.Kind != "" && !IsValidLicenseSignalKind(value.Kind) {
+		errs = append(errs, fmt.Errorf("%s.kind: invalid kind %q", path, value.Kind))
+	}
+	if !licenseValueHasSource(*value) {
+		errs = append(errs, fmt.Errorf("%s: must define value, from, symbol.OID, OID, index, or index_transform", path))
+	}
+	for i, policy := range value.Sentinel {
+		if !IsValidLicenseSentinelPolicy(policy) {
+			errs = append(errs, fmt.Errorf("%s.sentinel[%d]: invalid policy %q", path, i, policy))
+		}
+	}
+	errs = append(errs, validateMapping(value.Mapping, MetadataSymbol))
+
+	if strings.HasPrefix(value.Name, "_") {
+		errs = append(errs, fmt.Errorf("%s.name: name %q cannot be underscore-prefixed", path, value.Name))
+	}
+	if !isTable {
+		if value.Index != 0 {
+			errs = append(errs, fmt.Errorf("%s.index: scalar licensing values do not support `index` lookups", path))
+		}
+		if len(value.IndexTransform) > 0 {
+			errs = append(errs, fmt.Errorf("%s.index_transform: scalar licensing values do not support `index_transform`", path))
+		}
+	}
+	if value.Format != "" && !isValidLicenseValueFormat(value.Format) {
+		errs = append(errs, fmt.Errorf("%s.format: invalid format %q", path, value.Format))
+	}
+	if value.Symbol.Format != "" && !isValidLicenseValueFormat(value.Symbol.Format) {
+		errs = append(errs, fmt.Errorf("%s.symbol: invalid format %q", path, value.Symbol.Format))
+	}
+	if value.Symbol.OID != "" || value.Symbol.Name != "" {
+		errs = append(errs, validateEnrichLicenseSymbol(path, &value.Symbol))
+	}
+
+	return errors.Join(errs...)
+}
+
+func validateEnrichLicenseSymbol(path string, symbol *SymbolConfig) error {
+	var errs []error
+
+	errs = append(errs, validateEnrichSymbol(symbol, MetadataSymbol))
+	if strings.HasPrefix(symbol.Name, "_") {
+		errs = append(errs, fmt.Errorf("%s.symbol: name %q cannot be underscore-prefixed", path, symbol.Name))
+	}
+	if symbol.ChartMeta != (ChartMeta{}) {
+		errs = append(errs, fmt.Errorf("%s.symbol: chart_meta cannot be used in licensing rows", path))
+	}
+	if symbol.MetricType != "" {
+		errs = append(errs, fmt.Errorf("%s.symbol: metric_type cannot be used in licensing rows", path))
+	}
+	if symbol.Transform != "" {
+		errs = append(errs, fmt.Errorf("%s.symbol: transform cannot be used in licensing rows", path))
+	}
+	if symbol.ExtractValue != "" {
+		errs = append(errs, fmt.Errorf("%s.symbol: extract_value cannot be used in licensing rows", path))
+	}
+	if symbol.MatchPattern != "" {
+		errs = append(errs, fmt.Errorf("%s.symbol: match_pattern cannot be used in licensing rows", path))
+	}
+	if symbol.MatchValue != "" {
+		errs = append(errs, fmt.Errorf("%s.symbol: match_value cannot be used in licensing rows", path))
+	}
+	if symbol.ScaleFactor != 0 {
+		errs = append(errs, fmt.Errorf("%s.symbol: scale_factor cannot be used in licensing rows", path))
+	}
+	if symbol.ConstantValueOne {
+		errs = append(errs, fmt.Errorf("%s.symbol: constant_value_one cannot be used in licensing rows", path))
+	}
+
+	return errors.Join(errs...)
+}
+
+var validLicenseValueFormats = map[string]struct{}{
+	"hex":              {},
+	"ip_address":       {},
+	"mac_address":      {},
+	"snmp_dateandtime": {},
+	"text_date":        {},
+}
+
+func isValidLicenseValueFormat(format string) bool {
+	_, ok := validLicenseValueFormats[format]
+	return ok
+}
+
+type licenseSignalValidationKey struct {
+	identity string
+	kind     LicenseSignalKind
+}
+
+func validateLicenseSignalDuplicates(rowIdx int, row *LicensingConfig, seen map[licenseSignalValidationKey]string) error {
+	var errs []error
+	identity := LicenseStructuralIdentity(*row)
+	for _, sig := range collectLicenseSignalValues(*row) {
+		if sig.kind == "" || !sig.value.IsSet() {
+			continue
+		}
+		path := fmt.Sprintf("licensing[%d].%s", rowIdx, sig.path)
+		key := licenseSignalValidationKey{identity: identity, kind: sig.kind}
+		if prev, ok := seen[key]; ok {
+			errs = append(errs, fmt.Errorf("%s: duplicate signal kind %q for structural identity %q (first seen at %s)", path, sig.kind, identity, prev))
+			continue
+		}
+		seen[key] = path
+	}
+	return errors.Join(errs...)
+}
+
+func validateLicenseFromReferences(rowIdx int, row *LicensingConfig) error {
+	if row.Table.OID == "" {
+		return nil
+	}
+
+	var errs []error
+	tableOID := TrimLicenseOID(row.Table.OID)
+	for _, ref := range collectLicenseValueReferences(*row) {
+		if ref.value.From == "" {
+			continue
+		}
+		fromOID := TrimLicenseOID(ref.value.From)
+		if !oidHasPrefix(fromOID, tableOID) {
+			errs = append(errs, fmt.Errorf("licensing[%d].%s.from: OID %q is outside table %q", rowIdx, ref.path, ref.value.From, row.Table.OID))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+type licenseValueValidationRef struct {
+	path  string
+	value LicenseValueConfig
+}
+
+type licenseSignalValueValidationRef struct {
+	path  string
+	kind  LicenseSignalKind
+	value LicenseValueConfig
+}
+
+func collectLicenseSignalValues(row LicensingConfig) []licenseSignalValueValidationRef {
+	var values []licenseSignalValueValidationRef
+	add := func(path string, value LicenseValueConfig) {
+		if value.IsSet() {
+			values = append(values, licenseSignalValueValidationRef{path: path, kind: value.Kind, value: value})
+		}
+	}
+	add("state", row.State.LicenseValueConfig)
+	collectLicenseTimerSignalValues("signals.expiry", row.Signals.Expiry, add)
+	collectLicenseTimerSignalValues("signals.authorization", row.Signals.Authorization, add)
+	collectLicenseTimerSignalValues("signals.certificate", row.Signals.Certificate, add)
+	collectLicenseTimerSignalValues("signals.grace", row.Signals.Grace, add)
+	add("signals.usage.used", row.Signals.Usage.Used)
+	add("signals.usage.capacity", row.Signals.Usage.Capacity)
+	add("signals.usage.available", row.Signals.Usage.Available)
+	add("signals.usage.percent", row.Signals.Usage.Percent)
+	return values
+}
+
+func collectLicenseTimerSignalValues(path string, cfg LicenseTimerSignalsConfig, add func(string, LicenseValueConfig)) {
+	add(path, cfg.LicenseValueConfig)
+	add(path+".timestamp", cfg.Timestamp)
+	add(path+".remaining", cfg.Remaining)
+}
+
+func collectLicenseValueReferences(row LicensingConfig) []licenseValueValidationRef {
+	var values []licenseValueValidationRef
+	add := func(path string, value LicenseValueConfig) {
+		if value.IsSet() {
+			values = append(values, licenseValueValidationRef{path: path, value: value})
+		}
+	}
+	add("identity.id", row.Identity.ID)
+	add("identity.name", row.Identity.Name)
+	add("identity.feature", row.Identity.Feature)
+	add("identity.component", row.Identity.Component)
+	add("descriptors.type", row.Descriptors.Type)
+	add("descriptors.impact", row.Descriptors.Impact)
+	add("descriptors.perpetual", row.Descriptors.Perpetual)
+	add("descriptors.unlimited", row.Descriptors.Unlimited)
+	add("state", row.State.LicenseValueConfig)
+	collectLicenseTimerSignalValues("signals.expiry", row.Signals.Expiry, add)
+	collectLicenseTimerSignalValues("signals.authorization", row.Signals.Authorization, add)
+	collectLicenseTimerSignalValues("signals.certificate", row.Signals.Certificate, add)
+	collectLicenseTimerSignalValues("signals.grace", row.Signals.Grace, add)
+	add("signals.usage.used", row.Signals.Usage.Used)
+	add("signals.usage.capacity", row.Signals.Usage.Capacity)
+	add("signals.usage.available", row.Signals.Usage.Available)
+	add("signals.usage.percent", row.Signals.Usage.Percent)
+	return values
+}
+
+func licenseRowHasSignalConfigs(row LicensingConfig) bool {
+	if row.State.LicenseValueConfig.IsSet() {
+		return true
+	}
+	for _, sig := range collectLicenseSignalValues(row) {
+		if sig.value.IsSet() {
+			return true
+		}
+	}
+	return false
+}
+
+func collectLicenseSignalSourceOIDs(row LicensingConfig) map[string]struct{} {
+	oids := make(map[string]struct{})
+	for _, sig := range collectLicenseSignalValues(row) {
+		if oid := LicenseValueSourceOID(sig.value); oid != "" {
+			oids[TrimLicenseOID(oid)] = struct{}{}
+		}
+	}
+	return oids
+}
+
+func licenseValueHasSource(value LicenseValueConfig) bool {
+	return value.Value != "" ||
+		value.From != "" ||
+		value.Symbol.OID != "" ||
+		value.OID != "" ||
+		value.Index != 0 ||
+		len(value.IndexTransform) > 0
+}
+
+func oidHasPrefix(oid, prefix string) bool {
+	return oid == prefix || strings.HasPrefix(oid, prefix+".")
+}
+
+func validateEnrichTopologySymbol(topologyIdx int, symbol *SymbolConfig, symbolContext SymbolContext) error {
+	var errs []error
+
+	errs = append(errs, validateEnrichSymbol(symbol, symbolContext))
+	if strings.HasPrefix(symbol.Name, "_") {
+		errs = append(errs, fmt.Errorf("topology[%d]: symbol name %q cannot be underscore-prefixed", topologyIdx, symbol.Name))
+	}
+	if symbol.ChartMeta != (ChartMeta{}) {
+		errs = append(errs, fmt.Errorf("topology[%d]: chart_meta cannot be used in topology rows", topologyIdx))
+	}
+	if symbol.MetricType != "" {
+		errs = append(errs, fmt.Errorf("topology[%d]: metric_type cannot be used in topology rows", topologyIdx))
+	}
+	if symbol.Mapping.HasItems() || symbol.Mapping.Mode != "" {
+		errs = append(errs, fmt.Errorf("topology[%d]: mapping cannot be used in topology rows", topologyIdx))
+	}
+	if symbol.Transform != "" {
+		errs = append(errs, fmt.Errorf("topology[%d]: transform cannot be used in topology rows", topologyIdx))
+	}
+	if symbol.ScaleFactor != 0 {
+		errs = append(errs, fmt.Errorf("topology[%d]: scale_factor cannot be used in topology rows", topologyIdx))
+	}
+	if symbol.Format != "" {
+		errs = append(errs, fmt.Errorf("topology[%d]: format cannot be used in topology rows", topologyIdx))
+	}
+	if symbol.ConstantValueOne {
+		errs = append(errs, fmt.Errorf("topology[%d]: constant_value_one cannot be used in topology rows", topologyIdx))
+	}
+
+	return errors.Join(errs...)
+}
+
+func validateEnrichGlobalMetricTags(metricTags []GlobalMetricTagConfig) error {
+	var errs []error
+	for i := range metricTags {
+		errs = append(errs, validateEnrichMetricTag(&metricTags[i].MetricTagConfig))
+		errs = append(errs, validateConsumers(fmt.Sprintf("metric_tags[%d].consumers", i), metricTags[i].Consumers))
+	}
+	return errors.Join(errs...)
+}
+
+func validateConsumers(path string, consumers ConsumerSet) error {
+	var errs []error
+	seen := make(map[ProfileConsumer]int)
+	for i, consumer := range consumers {
+		switch consumer {
+		case ConsumerMetrics, ConsumerTopology, ConsumerLicensing:
+		default:
+			errs = append(errs, fmt.Errorf("%s[%d]: invalid consumer %q", path, i, consumer))
+			continue
+		}
+		if firstIdx, ok := seen[consumer]; ok {
+			errs = append(errs, fmt.Errorf("%s[%d]: duplicate consumer %q (first occurrence at index %d)", path, i, consumer, firstIdx))
+			continue
+		}
+		seen[consumer] = i
+	}
 	return errors.Join(errs...)
 }
 
@@ -418,7 +954,7 @@ func validateEnrichMetricTag(metricTag *MetricTagConfig) error {
 		if transform.DropRight != 0 && transform.End != 0 {
 			errs = append(errs, fmt.Errorf("transform rule cannot define both end and drop_right. Invalid rule: %#v", transform))
 		}
-		if transform.DropRight == 0 && transform.Start > transform.End {
+		if transform.DropRight == 0 && transform.Start > transform.End && transform.End != 0 {
 			errs = append(errs, fmt.Errorf("transform rule end should be greater than start. Invalid rule: %#v", transform))
 		}
 	}
@@ -477,10 +1013,11 @@ func validateMapping(mapping MappingConfig, symbolContext SymbolContext) error {
 	return errors.Join(errs...)
 }
 
-func validateEnrichVirtualMetrics(metrics []MetricsConfig, vmetrics []VirtualMetricConfig) error {
+func validateEnrichVirtualMetrics(metrics []MetricsConfig, topology []TopologyConfig, vmetrics []VirtualMetricConfig) error {
 	var errs []error
 
 	metricSources := collectVirtualMetricSourceSpecs(metrics)
+	topologySources := collectTopologyMetricSourceNames(topology)
 
 	seenNames := make(map[string]int)
 
@@ -521,6 +1058,7 @@ func validateEnrichVirtualMetrics(metrics []MetricsConfig, vmetrics []VirtualMet
 		case len(vm.Sources) == 0 && len(vm.Alternatives) == 0:
 			errs = append(errs, fmt.Errorf("virtual_metrics[%d]: must define sources or alternatives", i))
 		case len(vm.Alternatives) == 0:
+			errs = append(errs, validateVirtualMetricSourcesNotTopology(fmt.Sprintf("virtual_metrics[%d].sources", i), vm.Sources, topologySources))
 			errs = append(errs, validateVirtualMetricSources(fmt.Sprintf("virtual_metrics[%d].sources", i), vm.Sources, metricSources, grouped))
 		default:
 			for j, alt := range vm.Alternatives {
@@ -528,11 +1066,38 @@ func validateEnrichVirtualMetrics(metrics []MetricsConfig, vmetrics []VirtualMet
 					errs = append(errs, fmt.Errorf("virtual_metrics[%d].alternatives[%d]: must define sources", i, j))
 					continue
 				}
+				errs = append(errs, validateVirtualMetricSourcesNotTopology(fmt.Sprintf("virtual_metrics[%d].alternatives[%d].sources", i, j), alt.Sources, topologySources))
 				errs = append(errs, validateVirtualMetricSources(fmt.Sprintf("virtual_metrics[%d].alternatives[%d].sources", i, j), alt.Sources, metricSources, grouped))
 			}
 		}
 	}
 
+	return errors.Join(errs...)
+}
+
+func collectTopologyMetricSourceNames(topology []TopologyConfig) map[string]struct{} {
+	names := make(map[string]struct{})
+	for _, topo := range topology {
+		metric := &topo.MetricsConfig
+		switch {
+		case metric.IsScalar():
+			names[metric.Symbol.Name] = struct{}{}
+		case metric.IsColumn():
+			for _, sym := range metric.Symbols {
+				names[sym.Name] = struct{}{}
+			}
+		}
+	}
+	return names
+}
+
+func validateVirtualMetricSourcesNotTopology(path string, sources []VirtualMetricSourceConfig, topologySources map[string]struct{}) error {
+	var errs []error
+	for i, src := range sources {
+		if _, ok := topologySources[src.Metric]; ok {
+			errs = append(errs, fmt.Errorf("%s[%d]: topology metric source %q cannot be used by virtual_metrics", path, i, src.Metric))
+		}
+	}
 	return errors.Join(errs...)
 }
 

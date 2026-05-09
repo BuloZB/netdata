@@ -72,6 +72,8 @@ The repo holds 132 go.d modules and 24 internal C plugins. Maintainer patterns l
 
 When one collector talks to N targets (SNMP devices, remote DBs, cloud APIs, IPMI hosts, vCenter clusters), each target is a **vnode** so its metrics, alerts, and RBAC behave as if it were a separate node in Netdata Cloud. Every remote-target collector wires vnodes from the start.
 
+For Go v2 collectors that route one job's samples to multiple virtual nodes, use first-class `metrix.HostScope` rather than adding vnode identity as normal metric labels. Write per-resource metrics through scoped meters or vecs such as `meter.WithHostScope(scope)`, and leave metrics unscoped when they should follow the default job vnode or global host path. Scope keys must be stable for the virtual node identity; unbounded scope cardinality has the same operational cost profile as unbounded chart/cardinality growth.
+
 ### 1.10 Cardinality discipline
 
 - A chart with thousands of dimensions, or an instance list with thousands of entries, is unusable on the dashboard. The user cannot read it.
@@ -98,6 +100,12 @@ Source test data based on what you're collecting:
 - **Protocol parsing** (NetFlow / sFlow / IPFIX / OTEL / SNMP): vendor SDK samples, public dumps, fuzz-test corpora. NetFlow keeps fixtures under `src/crates/netflow-plugin/testdata/flows/` with sourcing recorded in `testdata/ATTRIBUTION.md` — do the same for any new fixtures with redistribution-sensitive provenance.
 
 Don't fabricate test data the parser passes by accident. Don't skip tests "because this protocol can't be tested locally" — that's exactly when fixtures matter most. Standard go.d test-function names: `Test_testDataIsValid`, `TestCollector_ConfigurationSerialize`, `TestCollector_Init`, `TestCollector_Check`, `TestCollector_Collect` — match the convention in adjacent collectors. Functions get a dedicated validator at `src/go/tools/functions-validation/` (E2E plus schema checks).
+
+For Go tests, prefer table-driven tests using `map[string]struct{}` keyed by
+test-case name when cases share setup and assertion shape. Use separate test
+functions only when setup or assertions are materially different. Prefer map
+keys over a `name` field in `[]struct{}` so case names stay prominent and
+order-independent.
 
 ### 2.2 Hot-path discipline
 
