@@ -201,7 +201,7 @@ cmake_dependent_option(ENABLE_PLUGIN_EBPF "Enable Linux eBPF metric collection" 
 cmake_dependent_option(ENABLE_LEGACY_EBPF_PROGRAMS "Enable eBPF programs for kernels without BTF support" True "ENABLE_PLUGIN_EBPF" False)
 mark_as_advanced(ENABLE_LEGACY_EBPF_PROGRAMS)
 cmake_dependent_option(ENABLE_PLUGIN_LOCAL_LISTENERS "Enable local listening socket tracking (including service auto-discovery support)" ${DEFAULT_FEATURE_STATE} "OS_LINUX" False)
-cmake_dependent_option(ENABLE_PLUGIN_NETWORK_VIEWER "Enable network viewer functionality" ${DEFAULT_FEATURE_STATE} "OS_LINUX" False)
+cmake_dependent_option(ENABLE_PLUGIN_NETWORK_VIEWER "Enable network viewer functionality" ${DEFAULT_FEATURE_STATE} "OS_LINUX OR OS_WINDOWS" False)
 cmake_dependent_option(ENABLE_PLUGIN_NFACCT "Enable Linux NFACCT metric collection" ${DEFAULT_FEATURE_STATE} "OS_LINUX" False)
 cmake_dependent_option(ENABLE_PLUGIN_PERF "Enable Linux performance counter monitoring" ${DEFAULT_FEATURE_STATE} "OS_LINUX" False)
 cmake_dependent_option(ENABLE_PLUGIN_SLABINFO "Enable Linux kernel SLAB allocator monitoring" ${DEFAULT_FEATURE_STATE} "OS_LINUX" False)
@@ -1012,7 +1012,6 @@ set(LIBNETDATA_FILES
         src/libnetdata/procfile/procfile.h
         src/libnetdata/query_progress/progress.c
         src/libnetdata/query_progress/progress.h
-        src/libnetdata/required_dummies.h
         src/libnetdata/socket/security.c
         src/libnetdata/socket/security.h
         src/libnetdata/simple_hashtable/simple_hashtable.h
@@ -1232,6 +1231,8 @@ set(LIBNETDATA_FILES
         src/libnetdata/os/mmap_limit.h
         src/libnetdata/signals/signals.c
         src/libnetdata/signals/signals.h
+        src/libnetdata/runtime-paths/runtime-paths.c
+        src/libnetdata/runtime-paths/runtime-paths.h
         src/libnetdata/os/machine_id.c
         src/libnetdata/os/machine_id.h
         src/libnetdata/os/process_memory.c
@@ -1839,6 +1840,8 @@ set(SYSTEMD_JOURNAL_PLUGIN_FILES
         src/collectors/systemd-journal.plugin/systemd-internals.h
         src/collectors/systemd-journal.plugin/systemd-main.c
         src/collectors/systemd-journal.plugin/systemd-journal.c
+        src/collectors/systemd-journal.plugin/systemd-journal-function.h
+        src/collectors/systemd-journal.plugin/systemd-journal-execute.h
         src/collectors/systemd-journal.plugin/systemd-journal-annotations.c
         src/collectors/systemd-journal.plugin/systemd-journal-files.c
         src/collectors/systemd-journal.plugin/systemd-journal-watcher.c
@@ -3132,10 +3135,18 @@ if(ENABLE_PLUGIN_NETWORK_VIEWER)
                 endif()
         endif()
 
-        set(NETWORK_VIEWER_FILES
-                src/libnetdata/local-sockets/local-sockets.h
-                src/collectors/network-viewer.plugin/network-viewer.c
-        )
+        set(NETWORK_VIEWER_FILES)
+        if(OS_LINUX)
+                list(APPEND NETWORK_VIEWER_FILES
+                        src/libnetdata/local-sockets/local-sockets.h
+                        src/collectors/network-viewer.plugin/network-viewer.c
+                )
+        endif()
+        if(OS_WINDOWS)
+                list(APPEND NETWORK_VIEWER_FILES
+                        src/collectors/network-viewer.plugin/network-viewer-windows.c
+                )
+        endif()
 
         add_executable(network-viewer.plugin ${NETWORK_VIEWER_FILES})
         if(USE_LTO AND CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_SIZEOF_VOID_P EQUAL 4)

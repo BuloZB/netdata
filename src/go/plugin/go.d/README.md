@@ -42,6 +42,7 @@ All capabilities are set automatically during Netdata installation using the [of
 | [bind](https://github.com/netdata/netdata/tree/master/src/go/plugin/go.d/collector/bind)                             |           ISC Bind            |
 | [boinc](https://github.com/netdata/netdata/tree/master/src/go/plugin/go.d/collector/boinc)                           |             BOINC             |
 | [cassandra](https://github.com/netdata/netdata/tree/master/src/go/plugin/go.d/collector/cassandra)                   |           Cassandra           |
+| [cato_networks](https://github.com/netdata/netdata/tree/master/src/go/plugin/go.d/collector/cato_networks)           |         Cato Networks         |
 | [ceph](https://github.com/netdata/netdata/tree/master/src/go/plugin/go.d/collector/ceph)                             |             Ceph              |
 | [chrony](https://github.com/netdata/netdata/tree/master/src/go/plugin/go.d/collector/chrony)                         |            Chrony             |
 | [clickhouse](https://github.com/netdata/netdata/tree/master/src/go/plugin/go.d/collector/clickhouse)                 |          ClickHouse           |
@@ -102,6 +103,7 @@ All capabilities are set automatically during Netdata installation using the [of
 | [openldap](https://github.com/netdata/netdata/tree/master/src/go/plugin/go.d/collector/openldap)                     |           OpenLDAP            |
 | [openvpn](https://github.com/netdata/netdata/tree/master/src/go/plugin/go.d/collector/openvpn)                       |            OpenVPN            |
 | [openvpn_status_log](https://github.com/netdata/netdata/tree/master/src/go/plugin/go.d/collector/openvpn_status_log) |            OpenVPN            |
+| [panos](https://github.com/netdata/netdata/tree/master/src/go/plugin/go.d/collector/panos)                           | Palo Alto Networks PAN-OS     |
 | [pgbouncer](https://github.com/netdata/netdata/tree/master/src/go/plugin/go.d/collector/pgbouncer)                   |           PgBouncer           |
 | [oracledb](https://github.com/netdata/netdata/tree/master/src/go/plugin/go.d/collector/oracledb)                     |           Oracle DB           |
 | [phpdaemon](https://github.com/netdata/netdata/tree/master/src/go/plugin/go.d/collector/phpdaemon)                   |           phpDaemon           |
