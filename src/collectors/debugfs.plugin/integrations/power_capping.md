@@ -74,7 +74,7 @@ The debugfs filesystem must be mounted on your host for plugin to collect data. 
 | Option | Description | Default | Required |
 |:-----|:------------|:--------|:---------:|
 | update every | Data collection frequency. | 1 | no |
-| command options | Additinal parameters for collector |  | no |
+| command options | Additional parameters for collector |  | no |
 
 
 </details>
@@ -134,5 +134,3 @@ Metrics:
 |:------|:----------|:----|
 | cpu.powercap_intel_rapl_zone | Power | Watts |
 | cpu.powercap_intel_rapl_subzones | dram, core, uncore | Watts |
-
-

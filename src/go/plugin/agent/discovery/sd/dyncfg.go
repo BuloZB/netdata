@@ -83,11 +83,11 @@ func (cb *sdCallbacks) ExtractKey(fn dyncfg.Function) (key, name string, ok bool
 	return dt + ":" + name, name, true
 }
 
-func (cb *sdCallbacks) ValidateJobName(name string) error {
+func (cb *sdCallbacks) ValidateConfigName(name string) error {
 	return dyncfg.JobNameRuleAllowDots(name)
 }
 
-func (cb *sdCallbacks) ParseAndValidate(fn dyncfg.Function, name string) (sdConfig, error) {
+func (cb *sdCallbacks) ParseAndValidate(_ context.Context, fn dyncfg.Function, name string) (sdConfig, error) {
 	dt, _, _ := cb.sd.extractDiscovererAndName(fn.ID())
 	if _, err := parseDyncfgPayload(fn.Payload(), dt, name, cb.sd.configDefaults, cb.sd.discovererRegistry(), true); err != nil {
 		return nil, err
@@ -100,7 +100,7 @@ func (cb *sdCallbacks) ParseAndValidate(fn dyncfg.Function, name string) (sdConf
 	return cfg, nil
 }
 
-func (cb *sdCallbacks) Start(cfg sdConfig) error {
+func (cb *sdCallbacks) Start(_ context.Context, cfg sdConfig) error {
 	pipelineCfg, err := cfg.ToPipelineConfig(cb.sd.configDefaults)
 	if err != nil {
 		return err
@@ -108,7 +108,7 @@ func (cb *sdCallbacks) Start(cfg sdConfig) error {
 	return cb.sd.mgr.Start(cb.sd.ctx, cfg.PipelineKey(), pipelineCfg)
 }
 
-func (cb *sdCallbacks) Update(oldCfg, newCfg sdConfig) error {
+func (cb *sdCallbacks) Update(_ context.Context, oldCfg, newCfg sdConfig) error {
 	pipelineCfg, err := newCfg.ToPipelineConfig(cb.sd.configDefaults)
 	if err != nil {
 		return dyncfg.MarkNonDisruptiveUpdate(err)
@@ -116,7 +116,7 @@ func (cb *sdCallbacks) Update(oldCfg, newCfg sdConfig) error {
 	return cb.sd.mgr.Restart(cb.sd.ctx, newCfg.PipelineKey(), pipelineCfg)
 }
 
-func (cb *sdCallbacks) Stop(cfg sdConfig) {
+func (cb *sdCallbacks) Stop(_ context.Context, cfg sdConfig) {
 	cb.sd.mgr.Stop(cfg.PipelineKey())
 }
 
@@ -125,6 +125,10 @@ func (cb *sdCallbacks) OnStatusChange(_ *dyncfg.Entry[sdConfig], _ dyncfg.Status
 
 func (cb *sdCallbacks) ConfigID(cfg sdConfig) string {
 	return cb.sd.dyncfgJobID(cfg.DiscovererType(), cfg.Name())
+}
+
+func (cb *sdCallbacks) ConfigType(sdConfig) dyncfg.ConfigType {
+	return dyncfg.ConfigTypeJob
 }
 
 // dyncfgConfig is the handler for dyncfg config commands.

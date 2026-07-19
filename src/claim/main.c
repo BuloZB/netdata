@@ -111,12 +111,12 @@ int nd_claim_parse_args(int argc, LPWSTR *argv)
                 continue;
 
             i++;
-            size_t length = wcslen(argv[i]);
+            size_t length = wcslen(argv[i]) + 1;
             char *tmp = calloc(sizeof(char), length);
             if (!tmp)
                 ExitProcess(1);
 
-            netdata_claim_convert_str(tmp, argv[i], length - 1);
+            netdata_claim_convert_str(tmp, argv[i], length);
             if (i < argc)
                 insecure = atoi(tmp);
             else
@@ -142,55 +142,69 @@ static int netdata_claim_prepare_strings()
     if (!aToken)
         return -1;
 
-    netdata_claim_convert_str(aToken, token, length - 1);
+    netdata_claim_convert_str(aToken, token, length);
 
     length = wcslen(room) + 1;
-    aRoom = calloc(sizeof(char), length - 1);
+    aRoom = calloc(sizeof(char), length);
     if (!aRoom)
         return -1;
 
-    netdata_claim_convert_str(aRoom, room, length - 1);
+    netdata_claim_convert_str(aRoom, room, length);
 
     if (proxy) {
         length = wcslen(proxy) + 1;
-        aProxy = calloc(sizeof(char), length - 1);
+        aProxy = calloc(sizeof(char), length);
         if (!aProxy)
             return -1;
 
-        netdata_claim_convert_str(aProxy, proxy, length - 1);
+        netdata_claim_convert_str(aProxy, proxy, length);
     }
 
     if (url) {
         length = wcslen(url) + 1;
-        aURL = calloc(sizeof(char), length - 1);
+        aURL = calloc(sizeof(char), length);
         if (!aURL)
             return -1;
 
-        netdata_claim_convert_str(aURL, url, length - 1);
+        netdata_claim_convert_str(aURL, url, length);
     }
     return 0;
 }
 
 static void netdata_claim_exit_callback(int signal)
 {
-    (void)signal;
-    if (aToken)
+    if (aToken) {
         free(aToken);
+        aToken = NULL;
+    }
 
-    if (aRoom)
+    if (aRoom) {
         free(aRoom);
+        aRoom = NULL;
+    }
 
-    if (aProxy)
+    if (aProxy) {
         free(aProxy);
+        aProxy = NULL;
+    }
 
-    if (aURL)
+    if (aURL) {
         free(aURL);
+        aURL = NULL;
+    }
 
-    if (argv)
+    if (argv) {
         LocalFree(argv);
+        argv = NULL;
+        token = NULL;
+        room = NULL;
+        proxy = NULL;
+        url = NULL;
+        extPath = NULL;
+    }
 
-    if (extPath)
-        LocalFree(extPath);
+    if (signal)
+        ExitProcess((UINT)signal);
 }
 
 static inline int netdata_claim_prepare_data(char *out, size_t length)
@@ -218,7 +232,7 @@ static int netdata_claim_get_path(char *path)
 	if (length >= WINDOWS_MAX_PATH) 
             return -1;
 
-        netdata_claim_convert_str(path, extPath, length - 1);
+        netdata_claim_convert_str(path, extPath, length);
 	return 0;
     }
 
@@ -253,20 +267,25 @@ static void netdata_claim_write_config(char *path)
         filename = path;
     }
 
+    int length = netdata_claim_prepare_data(data, WINDOWS_MAX_PATH);
+    if (length < 0 || length >= WINDOWS_MAX_PATH) {
+        MessageBoxW(NULL, L"Cannot write claim.conf.", L"Error", MB_OK|MB_ICONERROR);
+        return;
+    }
+
     HANDLE hf = CreateFileA(filename, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hf == INVALID_HANDLE_VALUE)
         netdata_claim_error_exit(L"CreateFileA");
 
-    DWORD length = netdata_claim_prepare_data(data, WINDOWS_MAX_PATH);
     DWORD written = 0;
 
-    BOOL ret = WriteFile(hf, data, length, &written, NULL);
+    BOOL ret = WriteFile(hf, data, (DWORD)length, &written, NULL);
     if (!ret) {
         CloseHandle(hf);
         netdata_claim_error_exit(L"WriteFileA");
     }
 
-    if (length != written)
+    if ((DWORD)length != written)
         MessageBoxW(NULL, L"Cannot write claim.conf.", L"Error", MB_OK|MB_ICONERROR);
 
     CloseHandle(hf);
@@ -278,8 +297,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     signal(SIGINT, netdata_claim_exit_callback);
     signal(SIGTERM, netdata_claim_exit_callback);
 
-    int argc;
-    LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    int argc = 0;
+    argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv)
+        netdata_claim_error_exit(L"CommandLineToArgvW");
+
     if (argc)
         argc = nd_claim_parse_args(argc, argv);
 

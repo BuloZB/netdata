@@ -2,6 +2,12 @@
 
 #include "cgroup-internals.h"
 #include "cgroup-netipc.h"
+#include "cgroup-snapshot-store.h"
+#include "cgroup-name-labels.h"
+
+// grace period added on top of the cgroup-name timeout: the helper self-bounds
+// at the operator timeout, this is the extra slack before discovery kills it
+#define CGROUP_NAME_GRACE_MS 2000
 
 // discovery cgroup thread worker jobs
 #define WORKER_DISCOVERY_INIT               0
@@ -29,7 +35,11 @@ static size_t discovery_walkdir_open_errors_count = 0;
 
 #define DISCOVERY_WALKDIR_OPEN_ERRORS_MAX 256
 
-// (legacy SHM globals removed — replaced by netipc in cgroup-netipc.c)
+// Legacy SHM globals removed; cgroup-netipc.c serves metadata via netipc.
+
+static RRDSET *cgroup_discovery_scans_st = NULL;
+static RRDDIM *cgroup_discovery_scans_natural_rd = NULL;
+static RRDDIM *cgroup_discovery_scans_opportunistic_rd = NULL;
 
 // ----------------------------------------------------------------------------
 
@@ -168,56 +178,12 @@ static inline void substitute_dots_in_id(char *s) {
 // ----------------------------------------------------------------------------
 // parse k8s labels
 
-#define CGROUP_NETDATA_CLOUD_LABEL_PREFIX "netdata.cloud/"
-#define CGROUP_RENAME_LABEL "cgroup.name="
-#define CGROUP_IGNORE_LABEL "ignore="
-
 static char *cgroup_parse_resolved_name_and_labels(struct cgroup *cg, char *data) {
     if (!cg->chart_labels)
         cg->chart_labels = rrdlabels_create();
 
-    rrdlabels_unmark_all(cg->chart_labels);
-
-    // the first word, up to the first space is the name
-    char *name = strsep_skip_consecutive_separators(&data, " ");
-
     bool ignored = false;
-
-    // the rest are key=value pairs separated by comma
-    while(data) {
-        char *pair = strsep_skip_consecutive_separators(&data, ",");
-
-        if(strncmp(pair, CGROUP_NETDATA_CLOUD_LABEL_PREFIX, sizeof(CGROUP_NETDATA_CLOUD_LABEL_PREFIX) - 1) == 0) {
-            // a netdata.cloud label
-            char *key = &pair[sizeof(CGROUP_NETDATA_CLOUD_LABEL_PREFIX) - 1];
-
-            if(strncmp(key, CGROUP_RENAME_LABEL, sizeof(CGROUP_RENAME_LABEL) - 1) == 0) {
-                char *n = &key[sizeof(CGROUP_RENAME_LABEL) - 1];
-                size_t len = strlen(n);
-                if(n[0] == '"' && n[len - 1] == '"') {
-                    n[len - 1] = '\0';
-                    n++;
-                }
-                if(*n) name = n;
-
-                // no need to add this label
-            }
-            else if(strncmp(key, CGROUP_IGNORE_LABEL, sizeof(CGROUP_IGNORE_LABEL) - 1) == 0) {
-                char *v = &key[sizeof(CGROUP_IGNORE_LABEL) - 1];
-                if(strcasecmp(v, "\"true\"") == 0 || strcasecmp(v, "\"yes\"") == 0)
-                    ignored = true;
-                else
-                    ignored = false;
-
-                // no need to add this label
-            }
-        }
-        else
-            // add the label as-is
-            rrdlabels_add_pair(cg->chart_labels, pair, RRDLABEL_SRC_AUTO | RRDLABEL_SRC_K8S);
-    }
-
-    rrdlabels_remove_all_unmarked(cg->chart_labels);
+    char *name = cgroup_parse_name_and_labels(cg->chart_labels, data, &ignored);
 
     if(ignored)
         cg->options |= CGROUP_OPTIONS_DISABLED_EXCLUDED;
@@ -244,26 +210,73 @@ static inline void discovery_rename_cgroup(struct cgroup *cg) {
         return;
     }
 
-    char buffer[8192]; // we need some size for labels
-    char *new_name = fgets(buffer, sizeof(buffer), spawn_popen_stdout(instance));
-    int exit_code = spawn_popen_wait(instance);
+    char buffer[CGROUP_NAME_LINE_MAX + 2]; // payload, newline, terminator
+    char *new_name = NULL;
 
-    switch (exit_code) {
-        case 0:
+    // Bound the wait for the helper's reply independently of whether the
+    // helper honors its own timeout: a wedged helper must not stall discovery.
+    // Wait up to the operator timeout plus a grace period for the helper to
+    // complete its framed line, then reclaim it. cgroup_name_timeout_ms == 0
+    // keeps the legacy unbounded behavior.
+    int wait_ms = -1;
+    if (cgroup_name_timeout_ms > 0)
+        wait_ms = cgroup_name_timeout_ms > INT_MAX - CGROUP_NAME_GRACE_MS ?
+                      INT_MAX :
+                      cgroup_name_timeout_ms + CGROUP_NAME_GRACE_MS;
+
+    CGROUP_NAME_READ_RESULT read_result = cgroup_name_read_response(
+        spawn_popen_read_fd(instance), buffer, sizeof(buffer), wait_ms);
+    if (read_result == CGROUP_NAME_READ_COMPLETE)
+        new_name = buffer;
+    else if (read_result == CGROUP_NAME_READ_INVALID)
+        collector_error("CGROUP: rename helper for '%s' produced an oversized or incomplete record.", cg->id);
+
+    int exit_code = -1;
+    if (read_result == CGROUP_NAME_READ_TIMEOUT || read_result == CGROUP_NAME_READ_ERROR) {
+        // timeout or poll error: the helper hung. Kill it, drop any partial
+        // output, and stop retrying this cgroup - re-running a helper that
+        // already hung would just block discovery again every cycle. The cgroup
+        // keeps its raw chart id.
+        if (read_result == CGROUP_NAME_READ_TIMEOUT)
+            collector_error(
+                "CGROUP: rename helper for '%s' did not respond within %d ms; killing it.", cg->id, wait_ms);
+        else
+            collector_error("CGROUP: cannot read rename helper response for '%s'; killing it.", cg->id);
+        spawn_popen_kill(instance, 0);
+        cg->pending_renames = 0;
+        new_name = NULL;
+    } else {
+        SPAWN_TIMEDWAIT_RESULT res = spawn_popen_timedwait(instance, CGROUP_NAME_GRACE_MS, &exit_code);
+        if (res == SPAWN_TIMEDWAIT_EXITED) {
+            switch (exit_code) {
+                case 0:
+                    cg->pending_renames = 0;
+                    break;
+
+                case 3:
+                    cg->pending_renames = 0;
+                    cg->processed = 1;
+                    break;
+
+                default:
+                    // Exit 2 may carry a fallback while requesting a retry; exit
+                    // 1 carries no usable record. Keep the normal retry ladder,
+                    // then apply any fallback or continue with the raw chart id.
+                    break;
+            }
+        } else {
+            // still running after writing, or wait error: reclaim, drop the
+            // output, and stop retrying (same reasoning as the timeout path).
+            spawn_popen_kill(instance, 0);
             cg->pending_renames = 0;
-            break;
-
-        case 3:
-            cg->pending_renames = 0;
-            cg->processed = 1;
-            break;
-
-        default:
-            break;
+            new_name = NULL;
+        }
     }
 
     if (cg->pending_renames || cg->processed)
         return;
+    // On a clean exit (0 or the final retry of exit 2) apply whatever name the
+    // helper printed; the kill/timeout paths above already cleared new_name.
     if (!new_name || !*new_name || *new_name == '\n')
         return;
     if (!(new_name = trim(new_name)))
@@ -789,7 +802,7 @@ static inline void discovery_update_filenames_all_cgroups() {
 static inline void discovery_cleanup_all_cgroups() {
     struct cgroup *cg = discovered_cgroup_root, *last = NULL;
 
-    for(; cg ;) {
+    while(cg) {
         if(!cg->available) {
             // enable the first duplicate cgroup
             {
@@ -871,7 +884,7 @@ static inline void discovery_find_all_cgroups_v2() {
 
 static int is_digits_only(const char *s) {
     do {
-        if (!isdigit(*s++)) {
+        if (!isdigit((uint8_t)*s++)) {
             return 0;
         }
     } while (*s);
@@ -881,7 +894,7 @@ static int is_digits_only(const char *s) {
 
 static int is_cgroup_k8s_container(const char *id) {
     // examples:
-    // https://github.com/netdata/netdata/blob/0fc101679dcd12f1cb8acdd07bb4c85d8e553e53/collectors/cgroups.plugin/cgroup-name.sh#L121-L147
+    // See src/collectors/cgroups.plugin/cgroup-name/FLOW.md for the cgroup-name Kubernetes path rules.
     const char *p = id;
     const char *pp = NULL;
     int i = 0;
@@ -964,13 +977,7 @@ static inline void discovery_process_first_time_seen_cgroup(struct cgroup *cg) {
 
     char comm[TASK_COMM_LEN + 1];
 
-    if (cg->container_orchestrator == CGROUPS_ORCHESTRATOR_UNSET) {
-        if (strstr(cg->id, "kubepods")) {
-            cg->container_orchestrator = CGROUPS_ORCHESTRATOR_K8S;
-        } else {
-            cg->container_orchestrator = CGROUPS_ORCHESTRATOR_UNKNOWN;
-        }
-    }
+    discovery_classify_orchestrator(cg);
 
     if (is_inside_k8s && !k8s_get_container_first_proc_comm(cg->id, comm)) {
         // container initialization may take some time when CPU % is high
@@ -1170,6 +1177,7 @@ static inline void discovery_find_all_cgroups() {
     netdata_log_debug(D_CGROUP, "searching for cgroups");
 
     worker_is_busy(WORKER_DISCOVERY_INIT);
+    discovery_orchestrator_begin_cycle();
     discovery_mark_as_unavailable_all_cgroups();
 
     worker_is_busy(WORKER_DISCOVERY_FIND);
@@ -1196,11 +1204,60 @@ static inline void discovery_find_all_cgroups() {
     worker_is_busy(WORKER_DISCOVERY_COPY);
     discovery_copy_discovered_cgroups_to_reader();
 
+    __atomic_add_fetch(&cgroup_discovery_generation, 1, __ATOMIC_RELEASE);
+
     netdata_mutex_unlock(&cgroup_root_mutex);
 
-    // cgroup metadata is now served on-demand via netipc (cgroup-netipc.c)
+    // Build and publish the immutable snapshot the netipc handlers serve. This
+    // runs after the splice unlock and off cgroup_root_mutex: discovery is the
+    // sole writer of the fields it reads and will not splice again this cycle.
+    cgroup_snapshot_rebuild_and_publish();
 
     netdata_log_debug(D_CGROUP, "done searching for cgroups");
+}
+
+static void discovery_run_all_cgroups(bool opportunistic)
+{
+    if (opportunistic)
+        __atomic_add_fetch(&cgroup_discovery_scans_opportunistic, 1, __ATOMIC_RELAXED);
+    else
+        __atomic_add_fetch(&cgroup_discovery_scans_natural, 1, __ATOMIC_RELAXED);
+
+    discovery_find_all_cgroups();
+}
+
+void cgroup_discovery_update_charts(int update_every)
+{
+    if (unlikely(!cgroup_discovery_scans_st)) {
+        cgroup_discovery_scans_st = rrdset_create_localhost(
+            "netdata",
+            "collector_cgroups_discovery_scans",
+            NULL,
+            "discovery",
+            "netdata.collector.cgroups.discovery.scans",
+            "cgroups Discovery Scans",
+            "scans/s",
+            PLUGIN_CGROUPS_NAME,
+            PLUGIN_CGROUPS_MODULE_CGROUPS_NAME,
+            NETDATA_CHART_PRIO_CGROUPS_CONTAINERS + 3002,
+            update_every,
+            RRDSET_TYPE_LINE);
+
+        cgroup_discovery_scans_natural_rd = rrddim_add(
+            cgroup_discovery_scans_st, "discovery_scans_natural", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+        cgroup_discovery_scans_opportunistic_rd = rrddim_add(
+            cgroup_discovery_scans_st, "discovery_scans_opportunistic", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+    }
+
+    rrddim_set_by_pointer(
+        cgroup_discovery_scans_st,
+        cgroup_discovery_scans_natural_rd,
+        (collected_number)__atomic_load_n(&cgroup_discovery_scans_natural, __ATOMIC_RELAXED));
+    rrddim_set_by_pointer(
+        cgroup_discovery_scans_st,
+        cgroup_discovery_scans_opportunistic_rd,
+        (collected_number)__atomic_load_n(&cgroup_discovery_scans_opportunistic, __ATOMIC_RELAXED));
+    rrdset_done(cgroup_discovery_scans_st);
 }
 
 void cgroup_discovery_worker(void *ptr)
@@ -1228,23 +1285,47 @@ void cgroup_discovery_worker(void *ptr)
 
     service_register(NULL, NULL, NULL);
 
+    cgroup_snapshot_store_init();
+
     cgroup_netipc_init();
+    cgroup_netipc_lookup_init();
+
+    bool just_did_bounded_rescan = false;
 
     while (service_running(SERVICE_COLLECTORS)) {
         worker_is_idle();
 
         netdata_mutex_lock(&discovery_thread.mutex);
-        netdata_cond_wait(&discovery_thread.cond_var, &discovery_thread.mutex);
+        bool pending_lookup_signal = __atomic_load_n(&discovery_signal_pending, __ATOMIC_ACQUIRE);
+        if (just_did_bounded_rescan) {
+            netdata_cond_wait(&discovery_thread.cond_var, &discovery_thread.mutex);
+            just_did_bounded_rescan = false;
+        }
+        else if (!pending_lookup_signal)
+            netdata_cond_wait(&discovery_thread.cond_var, &discovery_thread.mutex);
         netdata_mutex_unlock(&discovery_thread.mutex);
 
         if (unlikely(!service_running(SERVICE_COLLECTORS)))
             break;
 
-        discovery_find_all_cgroups();
+        bool opportunistic = __atomic_exchange_n(&discovery_signal_pending, false, __ATOMIC_ACQUIRE);
+        discovery_run_all_cgroups(opportunistic);
+
+        if (unlikely(!service_running(SERVICE_COLLECTORS)))
+            break;
+
+        if (__atomic_load_n(&discovery_signal_pending, __ATOMIC_ACQUIRE)) {
+            opportunistic = __atomic_exchange_n(&discovery_signal_pending, false, __ATOMIC_ACQUIRE);
+            discovery_run_all_cgroups(opportunistic);
+            just_did_bounded_rescan = true;
+        }
     }
 
-    // Stop the netipc server first so its worker threads cannot iterate cgroup_root while we free it.
+    // Stop both netipc servers first so their worker threads cannot read the
+    // snapshot store; then tear the store down.
+    cgroup_netipc_lookup_cleanup();
     cgroup_netipc_cleanup();
+    cgroup_snapshot_store_shutdown();
     discovery_walkdir_open_errors_cleanup();
 
     // free all cgroups

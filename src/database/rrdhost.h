@@ -252,8 +252,40 @@ struct rrdhost {
                     uint32_t charts;                // the number of charts currently being replicated from a child
                     NETDATA_DOUBLE percent;         // the % of replication completion
                 } replication;
+
+                // single-writer (the receiver thread), relaxed-atomic; read lock-free by the
+                // pulse traversal. Cumulative over the host's lifetime, never reset.
+                // Keep these 8-byte aligned: 32-bit GCC may inline relaxed 64-bit access.
+                uint64_t bytes_in __attribute__((aligned(8)));  // raw socket bytes received from this child
+                uint64_t bytes_out __attribute__((aligned(8))); // raw socket bytes sent to this child
+
+                // realtime second the current inbound (receiver) state was entered; reset by
+                // pulse_host_status() on every inbound state change, read by the pulse traversal
+                // to chart the age in the current state.
+                time_t state_changed_s;
+
+                // "running latched": set true once the node first reaches RCV_RUNNING after a
+                // (re)connect. While set and the node is currently running, per-chart replication
+                // ripples (a new container/service/process group briefly replicating) do NOT flip
+                // the host status back to replicating. Reset on disconnect (RCV_OFFLINE) and when a
+                // replicating transition arrives while the node is NOT currently running (i.e. the
+                // initial catch-up of a fresh connection). Note: this masks ANY replication once
+                // running until the next disconnect, not only small ripples. Maintained by
+                // pulse_host_status() (relaxed atomic).
+                bool running_latched;
+
+                // last host-label version applied to this host's per-child charts; the pulse
+                // traversal (single thread) re-applies labels + hops only when it changes, i.e. on
+                // reconnect / mid-stream label push.
+                uint32_t labels_applied_version;
             } status;
         } rcv;
+
+        // resolved combined PULSE_HOST_STATUS (basic|receiver|sender|ephemerality), maintained by
+        // pulse_host_status() lock-free (CAS) and read by the pulse traversal, which computes the
+        // streaming_inbound (basic|receiver bits) and streaming_outbound (sender bits) aggregates.
+        // Replaces the former global PHOST Judy + spinlock.
+        uint32_t pulse_state;
 
         // --- configuration ---
 
@@ -298,7 +330,9 @@ struct rrdhost {
 
     // ------------------------------------------------------------------------
     // ML handle
+    RW_SPINLOCK ml_host_rwlock;
     rrd_ml_host_t *ml_host;
+    bool ml_running;                                      // atomic
 
     // ------------------------------------------------------------------------
     // Support for host-level labels
@@ -342,6 +376,7 @@ struct rrdhost {
     ND_UUID node_id;                                // Cloud node_id
 
     struct {
+        SPINLOCK spinlock;
         ND_UUID claim_id_of_origin;
         ND_UUID claim_id_of_parent;
     } aclk;
@@ -372,6 +407,8 @@ extern RRDHOST *localhost;
 #define rrdhost_os(host) string2str((host)->os)
 // Timezone fields are mutable at runtime (DST refresh); use rrdhost_tz_get() for thread-safe access.
 // Do NOT access host->timezone or host->abbrev_timezone directly outside of rrdhost_update_lock.
+// Host identity fields are mutable at runtime; use rrdhost_identity_acquire()
+// when their STRING references must survive concurrent host metadata updates.
 #define rrdhost_program_name(host) string2str((host)->program_name)
 #define rrdhost_program_version(host) string2str((host)->program_version)
 
@@ -492,6 +529,15 @@ void set_host_properties(
     const char *prog_name, const char *prog_version);
 
 bool rrdhost_update_timezone(RRDHOST *host, const char *timezone, const char *abbrev_timezone, int32_t utc_offset);
+
+typedef struct {
+    STRING *hostname;
+    STRING *prog_name;
+    STRING *prog_version;
+} RRDHOST_IDENTITY;
+
+RRDHOST_IDENTITY rrdhost_identity_acquire(RRDHOST *host);
+void rrdhost_identity_release(RRDHOST_IDENTITY *identity);
 
 // Thread-safe timezone snapshot from an RRDHOST.
 // The returned struct owns strdup'd copies; release with rrdhost_tz_free().

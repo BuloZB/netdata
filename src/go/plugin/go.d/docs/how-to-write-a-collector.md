@@ -81,7 +81,7 @@ Framework/API references:
 - `src/go/plugin/framework/chartengine/README.md`
 - `src/go/plugin/framework/functions/README.md`
 - `src/go/tools/functions-validation/README.md`
-- `.agents/sow/specs/go-v2-host-scope.md`
+- `.agents/skills/project-writing-go-modules-framework-v2/go-v2-host-scope.md`
 - `.agents/skills/integrations-lifecycle/consistency.md`
 
 ## File Layout
@@ -160,6 +160,16 @@ Public lifecycle and framework-contract methods MUST stay in `collector.go`:
 - `Cleanup(context.Context)`
 - `MetricStore() metrix.CollectorStore`
 - `ChartTemplateYAML() string`
+
+Collectors that need a long-running side-effect loop MAY additionally implement
+`collectorapi.CollectorV2Runner` with `Run(context.Context) error`. Use this
+only when work must start with the running job lifecycle but must not wait for
+the next globally aligned `Collect()` tick, such as an agent-wide Function state
+refresh. The runtime starts `Run()` only after the job starts, never during
+autodetection or DynCfg `test`, cancels it on stop, and waits for it before
+`Cleanup()`. The implementation MUST return promptly after `ctx.Done()` and
+SHOULD make in-flight I/O cancellation-aware where the underlying library allows
+it.
 
 `Init()` validates config, prepares matchers/clients, and initializes persistent
 state. Explicit setup details SHOULD live in helper methods, preferably in
@@ -275,7 +285,7 @@ Rules:
 - Keep the default host scope empty unless the metric truly belongs to the
   agent/job host.
 
-Use `.agents/sow/specs/go-v2-host-scope.md` for the framework contract.
+Use `.agents/skills/project-writing-go-modules-framework-v2/go-v2-host-scope.md` for the framework contract.
 
 ## Functions
 
@@ -304,9 +314,9 @@ deps so the boundary is compile-enforced.
 
 ## Topology
 
-New topology producers MUST use `src/go/pkg/topology/v1`, not legacy topology
-payloads. New producers MUST NOT import the non-v1 `src/go/pkg/topology`
-payload model.
+New topology producers MUST use `src/go/pkg/topology/v1`. The non-v1 root
+`src/go/pkg/topology` payload model has been retired and MUST NOT be
+reintroduced for topology payloads.
 
 Rules:
 
@@ -414,6 +424,8 @@ exactly what was run.
 
 - New collector using `Collect() map[string]int64`.
 - Full live collection from `Check()`.
+- Starting operational background polling from `Check()` or `Init()`; use the
+  optional V2 runner hook when polling must be tied to the running job lifecycle.
 - Public config knobs for internal implementation details.
 - Custom selector or retry framework when existing package/framework behavior is
   enough.

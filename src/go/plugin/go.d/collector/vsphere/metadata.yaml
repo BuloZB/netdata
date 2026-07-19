@@ -503,44 +503,60 @@ modules:
               default: ""
               options: []
           returns:
-            description: Cached vSphere inventory topology payload. Actors represent discovered inventory objects and links represent parent-child, host-runs-VM, or host/VM-connects-network relationships.
+            description: Cached vSphere inventory topology payload using the netdata.topology.v1 schema. Actors represent discovered inventory objects, links represent inventory ownership, VM-to-host runtime placement, and host/VM network attachment relationships, and overlays expose refreshable datastore utilization metrics.
             columns:
               - name: schema_version
                 type: string
                 unit: ""
                 description: Topology payload schema version.
-              - name: source
-                type: string
+              - name: producer
+                type: object
                 unit: ""
-                description: Topology source identifier.
-              - name: layer
-                type: string
-                unit: ""
-                description: Topology layer identifier.
-              - name: agent_id
-                type: string
-                unit: ""
-                description: Netdata Agent identifier for the node serving the function.
+                description: Producer metadata identifying the vSphere topology source, selected collector job, plugin, and local node when available.
               - name: collected_at
                 type: datetime
                 unit: ""
                 description: Time when the cached topology response was built.
               - name: view
-                type: string
+                type: object
                 unit: ""
-                description: Topology view identifier.
+                description: Topology view metadata.
+              - name: dictionaries
+                type: object
+                unit: ""
+                description: Compact-table dictionaries used by actors, links, evidence, and detail tables.
+              - name: types
+                type: object
+                unit: ""
+                description: Actor, link, evidence, table, and presentation type registry.
+              - name: presentation
+                type: object
+                unit: ""
+                description: Graph-level presentation metadata.
               - name: actors
-                type: array
+                type: object
                 unit: ""
-                description: vSphere inventory actors, including datacenters, clusters, ESXi hosts, VMs, datastores, optional networks, datastore clusters, and resource pools.
+                description: Compact actor table for vSphere inventory objects, including datacenters, clusters, ESXi hosts, VMs, datastores, optional networks, datastore clusters, and resource pools.
               - name: links
-                type: array
+                type: object
                 unit: ""
-                description: Topology links between vSphere inventory actors.
+                description: Compact link table for relationships between vSphere inventory actors.
+              - name: evidence
+                type: object
+                unit: ""
+                description: Relationship evidence tables backing the rendered links.
+              - name: tables
+                type: object
+                unit: ""
+                description: Actor detail and label tables used by topology modals.
+              - name: overlays
+                type: object
+                unit: ""
+                description: Telemetry overlay refs for refreshable metrics, including datastore used-space utilization selected by collector job and vSphere managed object ID.
               - name: stats
                 type: object
                 unit: ""
-                description: Counts of discovered inventory objects, actors, and links included in the response.
+                description: Counts of discovered inventory objects, actors, links, and overlay refs included in the response.
           performance: |
             Uses cached collector state only:<br/>• No additional vCenter or ESXi API requests are triggered by the function<br/>• Response size grows with discovered inventory object count<br/>• `collect_network_topology` adds Network discovery during normal collector discovery cycles when enabled
           security: |

@@ -73,7 +73,7 @@ The debugfs filesystem must be mounted on your host for plugin to collect data. 
 | Option | Description | Default | Required |
 |:-----|:------------|:--------|:---------:|
 | update every | Data collection frequency. | 1 | no |
-| command options | Additinal parameters for collector |  | no |
+| command options | Additional parameters for collector |  | no |
 
 
 </details>
@@ -138,5 +138,3 @@ Metrics:
 | mem.fragmentation_index_dma | order0, order1, order2, order3, order4, order5, order6, order7, order8, order9, order10 | index |
 | mem.fragmentation_index_dma32 | order0, order1, order2, order3, order4, order5, order6, order7, order8, order9, order10 | index |
 | mem.fragmentation_index_normal | order0, order1, order2, order3, order4, order5, order6, order7, order8, order9, order10 | index |
-
-

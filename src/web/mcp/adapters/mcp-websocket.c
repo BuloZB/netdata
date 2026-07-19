@@ -18,6 +18,16 @@ MCP_CLIENT *mcp_websocket_get_context(struct websocket_server_client *wsc) {
     return (MCP_CLIENT *)wsc->user_data;
 }
 
+static void mcp_websocket_release_context(struct websocket_server_client *wsc) {
+    MCP_CLIENT *ctx = mcp_websocket_get_context(wsc);
+    if (!ctx)
+        return;
+
+    // Detach before freeing so repeated lifecycle callbacks never observe a stale pointer.
+    mcp_websocket_set_context(wsc, NULL);
+    mcp_free_client(ctx);
+}
+
 // Create a response context for a WebSocket client
 static MCP_CLIENT *mcp_websocket_create_context(struct websocket_server_client *wsc) {
     if (!wsc) return NULL;
@@ -64,14 +74,14 @@ void mcp_websocket_on_message(struct websocket_server_client *wsc, const char *m
     if (!wsc || !message || length == 0)
         return;
     
-    // Log the raw incoming message
-    netdata_log_debug(D_MCP, "RCV: %s", message);
-    
     // Only handle text messages
     if (opcode != WS_OPCODE_TEXT) {
         websocket_error(wsc, "Ignoring binary message - mcp supports only TEXT messages");
         return;
     }
+
+    // Log the raw incoming message
+    netdata_log_debug(D_MCP, "RCV: %s", message);
     
     // Silently ignore standalone "PING" messages (legacy MCP client behavior)
     if (length == 4 && strncmp(message, "PING", 4) == 0) {
@@ -101,12 +111,12 @@ void mcp_websocket_on_message(struct websocket_server_client *wsc, const char *m
     }
 
     if (json_object_is_type(request, json_type_array)) {
-        int len = (int)json_object_array_length(request);
+        size_t len = json_object_array_length(request);
         BUFFER **responses = NULL;
         size_t responses_used = 0;
         size_t responses_size = 0;
 
-        for (int i = 0; i < len; i++) {
+        for (size_t i = 0; i < len; i++) {
             struct json_object *req_item = json_object_array_get_idx(request, i);
             BUFFER *resp_item = mcp_jsonrpc_process_single_request(mcpc, req_item, NULL);
             if (resp_item) {
@@ -163,12 +173,7 @@ void mcp_websocket_on_close(struct websocket_server_client *wsc, WEBSOCKET_CLOSE
     
     websocket_debug(wsc, "MCP client closing (code: %d, reason: %s)", code, reason ? reason : "none");
     
-    // Clean up the MCP context
-    MCP_CLIENT *ctx = mcp_websocket_get_context(wsc);
-    if (ctx) {
-        mcp_free_client(ctx);
-        mcp_websocket_set_context(wsc, NULL);
-    }
+    mcp_websocket_release_context(wsc);
 }
 
 // WebSocket disconnect handler for MCP
@@ -177,12 +182,7 @@ void mcp_websocket_on_disconnect(struct websocket_server_client *wsc) {
     
     websocket_debug(wsc, "MCP client disconnected");
     
-    // Clean up the MCP context
-    MCP_CLIENT *ctx = mcp_websocket_get_context(wsc);
-    if (ctx) {
-        mcp_free_client(ctx);
-        mcp_websocket_set_context(wsc, NULL);
-    }
+    mcp_websocket_release_context(wsc);
 }
 
 // Register WebSocket callbacks for MCP

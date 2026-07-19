@@ -74,7 +74,7 @@ The debugfs filesystem must be mounted on your host for plugin to collect data. 
 | Option | Description | Default | Required |
 |:-----|:------------|:--------|:---------:|
 | update every | Data collection frequency. | 1 | no |
-| command options | Additinal parameters for collector |  | no |
+| command options | Additional parameters for collector |  | no |
 
 
 </details>
@@ -140,5 +140,3 @@ Metrics:
 | system.zswap_written_back_raw_bytes | written_back | bytes/s |
 | system.zswap_same_filled_raw_size | same_filled | bytes |
 | system.zswap_duplicate_entry | duplicate | entries/s |
-
-

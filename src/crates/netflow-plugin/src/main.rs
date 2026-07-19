@@ -10,6 +10,7 @@ mod flow;
 #[allow(dead_code)]
 mod flow_index;
 mod ingest;
+mod local_journal_host;
 mod memory_allocator;
 #[cfg(test)]
 mod memory_tests;
@@ -22,6 +23,7 @@ mod rollup;
 mod routing;
 #[cfg(test)]
 mod startup_memory_tests;
+mod test_cli;
 mod tiering;
 
 pub(crate) use api::NetflowFlowsHandler;
@@ -41,16 +43,40 @@ const MAX_RUNTIME_WORKER_THREADS: usize = 4;
 const MIN_RUNTIME_BLOCKING_THREADS: usize = 8;
 
 fn main() {
-    if let Err(err) = journal_core::install_sigbus_handler() {
+    if let Err(err) = journal_sdk_core::install_sigbus_handler() {
         eprintln!("failed to install SIGBUS handler: {}", err);
         std::process::exit(1);
+    }
+
+    match test_cli::TestCommand::parse_from_env_args() {
+        Ok(Some(command)) => {
+            let worker_threads = runtime_worker_threads();
+            let max_blocking_threads = runtime_blocking_threads(worker_threads);
+            let runtime = match build_tokio_runtime(worker_threads, max_blocking_threads) {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    eprintln!("failed to build tokio runtime: {}", err);
+                    std::process::exit(1);
+                }
+            };
+            if let Err(err) = runtime.block_on(test_cli::run(command)) {
+                eprintln!("{err:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(2);
+        }
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     let glibc_arena_max = memory_allocator::limit_glibc_arenas_for_process();
 
     println!("TRUST_DURATIONS 1");
-    rt::init_tracing();
+    rt::init_tracing_with_identifier("netflow-plugin");
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     match glibc_arena_max {
@@ -79,12 +105,7 @@ fn main() {
         "configured netflow tokio runtime"
     );
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(worker_threads)
-        .max_blocking_threads(max_blocking_threads)
-        .build()
-    {
+    let runtime = match build_tokio_runtime(worker_threads, max_blocking_threads) {
         Ok(runtime) => runtime,
         Err(err) => {
             eprintln!("failed to build tokio runtime: {}", err);
@@ -167,12 +188,13 @@ async fn async_main() -> i32 {
         &config.enrichment.geoip.asn_database,
         &config.enrichment.geoip.geo_database,
     );
-    let _charts_task = charts::NetflowCharts::new(&mut runtime).spawn_sampler(
+    let _charts_task = charts::NetflowCharts::new(&mut runtime, &config.charts).spawn_sampler(
         Arc::clone(&metrics),
         Arc::clone(&open_tiers),
         Arc::clone(&tier_flow_indexes),
         Arc::clone(&facet_runtime),
         resident_mapping_paths,
+        config.charts.clone(),
         shutdown.clone(),
     );
 
@@ -368,6 +390,17 @@ fn runtime_worker_threads() -> usize {
 
 fn runtime_blocking_threads(worker_threads: usize) -> usize {
     MIN_RUNTIME_BLOCKING_THREADS.max(worker_threads)
+}
+
+fn build_tokio_runtime(
+    worker_threads: usize,
+    max_blocking_threads: usize,
+) -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(worker_threads)
+        .max_blocking_threads(max_blocking_threads)
+        .build()
 }
 
 #[cfg(test)]

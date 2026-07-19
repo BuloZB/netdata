@@ -74,6 +74,7 @@ pub(crate) struct TierFlowRef {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub(crate) struct OpenTierRow {
     pub(crate) timestamp_usec: u64,
     pub(crate) flow_ref: TierFlowRef,
@@ -89,6 +90,15 @@ pub(crate) struct OpenTierState {
 }
 
 impl OpenTierState {
+    pub(crate) fn clear_retain_capacity(&mut self) {
+        // Keep the high-water buffers visible to memory diagnostics while the
+        // sync tick refills the published snapshot in place.
+        self.generation = 0;
+        self.minute_1.clear();
+        self.minute_5.clear();
+        self.hour_1.clear();
+    }
+
     pub(crate) fn estimated_heap_bytes(&self) -> usize {
         self.minute_1.capacity() * size_of::<OpenTierRow>()
             + self.minute_5.capacity() * size_of::<OpenTierRow>()

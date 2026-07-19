@@ -28,7 +28,10 @@ static inline void stream_circular_buffer_stats_update_unsafe(STREAM_CIRCULAR_BU
     scb->stats.bytes_max_size = scb->cb->max_size;
     scb->stats.bytes_outstanding = cbuffer_next_unsafe(scb->cb, NULL);
     scb->stats.bytes_available = cbuffer_available_size_unsafe(scb->cb);
-    scb->stats.buffer_ratio = (double)(scb->cb->max_size -  scb->stats.bytes_available) * 100.0 / (double)scb->cb->max_size;
+    if(unlikely(!scb->cb->max_size))
+        scb->stats.buffer_ratio = 0.0;
+    else
+        scb->stats.buffer_ratio = (double)(scb->cb->max_size -  scb->stats.bytes_available) * 100.0 / (double)scb->cb->max_size;
 
     __atomic_store_n(&((scb)->atomic.buffer_ratio), (size_t)round(scb->stats.buffer_ratio), __ATOMIC_RELAXED);
 }
@@ -113,8 +116,13 @@ bool stream_circular_buffer_add_unsafe(
     scb->stats.bytes_uncompressed += bytes_uncompressed;
     scb->stats.bytes_sent_by_type[type] += bytes_actual;
 
-    if(unlikely(autoscale && cbuffer_available_size_unsafe(scb->cb) < bytes_actual))
-        stream_circular_buffer_set_max_size_unsafe(scb, scb->cb->max_size * 2, true);
+    if(unlikely(autoscale && cbuffer_available_size_unsafe(scb->cb) < bytes_actual)) {
+        size_t max_size = scb->cb->max_size;
+        max_size = (max_size > SIZE_MAX / 2) ? SIZE_MAX : max_size * 2;
+
+        if(max_size > scb->cb->max_size)
+            stream_circular_buffer_set_max_size_unsafe(scb, max_size, true);
+    }
 
     if(unlikely(cbuffer_add_unsafe(scb->cb, data, bytes_actual) != 0))
         return false;

@@ -5,23 +5,29 @@ package snmptopology
 import (
 	"strings"
 	"time"
+
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_topology/internal/topologymodel"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_topology/internal/topologyutil"
 )
 
 func newTopologyCache() *topologyCache {
 	return &topologyCache{
-		lldpLocPorts:    make(map[string]*lldpLocPort),
-		lldpRemotes:     make(map[string]*lldpRemote),
-		cdpRemotes:      make(map[string]*cdpRemote),
-		ifNamesByIndex:  make(map[string]string),
-		ifStatusByIndex: make(map[string]ifStatus),
-		ifIndexByIP:     make(map[string]string),
-		ifNetmaskByIP:   make(map[string]string),
-		bridgePortToIf:  make(map[string]string),
-		fdbEntries:      make(map[string]*fdbEntry),
-		fdbIDToVlanID:   make(map[string]string),
-		vlanIDToName:    make(map[string]string),
-		stpPorts:        make(map[string]*stpPortEntry),
-		arpEntries:      make(map[string]*arpEntry),
+		lldpLocPorts:       make(map[string]*lldpLocPort),
+		lldpRemotes:        make(map[string]*lldpRemote),
+		cdpRemotes:         make(map[string]*cdpRemote),
+		ifNamesByIndex:     make(map[string]string),
+		ifStatusByIndex:    make(map[string]ifStatus),
+		ifIndexByIP:        make(map[string]string),
+		ifNetmaskByIP:      make(map[string]string),
+		l3InterfacesByIP:   make(map[string]topologymodel.L3Interface),
+		bridgePortToIf:     make(map[string]string),
+		fdbEntries:         make(map[string]*fdbEntry),
+		fdbIDToVlanID:      make(map[string]string),
+		vlanIDToName:       make(map[string]string),
+		stpPorts:           make(map[string]*stpPortEntry),
+		arpEntries:         make(map[string]*arpEntry),
+		ospfNeighborsByKey: make(map[string]topologymodel.OSPFNeighbor),
+		bgpPeersByKey:      make(map[string]topologymodel.BGPPeer),
 	}
 }
 
@@ -42,6 +48,7 @@ func (c *topologyCache) replaceWith(src *topologyCache) {
 	c.ifStatusByIndex = src.ifStatusByIndex
 	c.ifIndexByIP = src.ifIndexByIP
 	c.ifNetmaskByIP = src.ifNetmaskByIP
+	c.l3InterfacesByIP = src.l3InterfacesByIP
 	c.bridgePortToIf = src.bridgePortToIf
 	c.fdbEntries = src.fdbEntries
 	c.fdbIDToVlanID = src.fdbIDToVlanID
@@ -53,6 +60,8 @@ func (c *topologyCache) replaceWith(src *topologyCache) {
 	c.stpDesignatedRoot = src.stpDesignatedRoot
 	c.stpPorts = src.stpPorts
 	c.arpEntries = src.arpEntries
+	c.ospfNeighborsByKey = src.ospfNeighborsByKey
+	c.bgpPeersByKey = src.bgpPeersByKey
 }
 
 func (c *topologyCache) hasFreshSnapshotAt(now time.Time) bool {
@@ -65,26 +74,64 @@ func (c *topologyCache) hasFreshSnapshotAt(now time.Time) bool {
 	return true
 }
 
-func (c *Collector) finalizeTopologyCache() {
-	cache := c.topologyCache
+func (c *topologyCache) hasRenderableObservationAt(now time.Time) bool {
+	if c == nil {
+		return false
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if !c.hasFreshSnapshotAt(now) {
+		return false
+	}
+
+	local := normalizeTopologyDevice(c.localDevice)
+	localManagementIP := topologyutil.NormalizeIPAddress(local.ManagementIP)
+	if localManagementIP == "" {
+		localManagementIP = pickManagementIP(local.ManagementAddresses)
+	}
+	baseBridgeAddress := c.resolveLocalBaseBridgeAddress(localManagementIP)
+	return strings.TrimSpace(ensureTopologyObservationDeviceID(local, baseBridgeAddress)) != ""
+}
+
+func (c *Collector) finalizeTopologyCache(cache *topologyCache) {
 	if cache == nil {
 		return
 	}
 
-	cache.mu.Lock()
-	cache.updateFDBDiagnostics()
-	droppedNoMAC := cache.fdbRowsDroppedNoMAC
-	unmappedPort := cache.fdbRowsUnmappedPort
-	agentID := cache.agentID
-	cache.lastUpdate = cache.updateTime
-	cache.mu.Unlock()
+	stats := cache.finalizeTopologyCache()
 
-	if droppedNoMAC > 0 {
-		c.Warningf("device '%s': dropped %d topology FDB row(s) with empty MAC", agentID, droppedNoMAC)
+	if stats.droppedNoMAC > 0 {
+		c.Warningf("device '%s': dropped %d topology FDB row(s) with empty MAC", stats.agentID, stats.droppedNoMAC)
 	}
-	if unmappedPort > 0 {
-		c.Warningf("device '%s': observed %d topology FDB row(s) with bridge ports missing ifIndex mapping", agentID, unmappedPort)
+	if stats.unmappedPort > 0 {
+		c.Warningf("device '%s': observed %d topology FDB row(s) with bridge ports missing ifIndex mapping", stats.agentID, stats.unmappedPort)
 	}
+}
+
+type topologyCacheFinalizeStats struct {
+	agentID      string
+	droppedNoMAC int
+	unmappedPort int
+}
+
+func (c *topologyCache) finalizeTopologyCache() topologyCacheFinalizeStats {
+	if c == nil {
+		return topologyCacheFinalizeStats{}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.updateFDBDiagnostics()
+	stats := topologyCacheFinalizeStats{
+		agentID:      c.agentID,
+		droppedNoMAC: c.fdbRowsDroppedNoMAC,
+		unmappedPort: c.fdbRowsUnmappedPort,
+	}
+	c.lastUpdate = c.updateTime
+	return stats
 }
 
 func (c *topologyCache) updateFDBDiagnostics() {
@@ -97,7 +144,7 @@ func (c *topologyCache) updateFDBDiagnostics() {
 		if bridgePort == "" || bridgePort == "0" {
 			continue
 		}
-		if parseIndex(c.bridgePortToIf[bridgePort]) == 0 {
+		if topologyutil.ParseIndex(c.bridgePortToIf[bridgePort]) == 0 {
 			c.fdbRowsUnmappedPort++
 		}
 	}

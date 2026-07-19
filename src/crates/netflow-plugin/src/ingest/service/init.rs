@@ -1,5 +1,6 @@
 use super::super::*;
 use super::{FacetLifecycleObserver, IngestService, MaterializedTierWriters};
+use crate::local_journal_host::load_local_journal_provider;
 
 impl IngestService {
     #[allow(dead_code)]
@@ -22,8 +23,12 @@ impl IngestService {
         tier_flow_indexes: Arc<RwLock<TierFlowIndexStore>>,
         facet_runtime: Arc<crate::facet_runtime::FacetRuntime>,
     ) -> Result<Self> {
-        let machine_id = load_machine_id().context("failed to load machine id")?;
-        let lifecycle_observer: Arc<dyn journal_log_writer::LogLifecycleObserver> =
+        let journal_host = Arc::new(
+            load_local_journal_provider(&cfg).context("failed to load local journal host")?,
+        );
+        let machine_id = journal_host.machine_id();
+        let boot_id = journal_host.boot_id();
+        let lifecycle_observer: Arc<dyn journal_sdk_log_writer::LogLifecycleObserver> =
             Arc::new(FacetLifecycleObserver {
                 runtime: Arc::clone(&facet_runtime),
             });
@@ -46,7 +51,16 @@ impl IngestService {
                 retention_policy =
                     retention_policy.with_duration_of_journal_files(duration_of_journal_files);
             }
+            // Fastest-storage profile for the netflow flow store: compact
+            // on-disk layout, no DATA compression, no FSS sealing (not enabled),
+            // and live publication disabled (0) — the plugin reads its own files
+            // by opening them, not via journalctl --follow, so the per-entry
+            // inotify/set_len publication is pure overhead here.
             Config::new(origin, rotation_policy, retention_policy)
+                .with_compact(true)
+                .with_compression(Compression::None)
+                .with_boot_id(boot_id)
+                .with_live_publish_every_entries(0)
         };
         let raw_journal =
             Self::build_raw_journal(&cfg, &build_journal_cfg, Arc::clone(&lifecycle_observer))?;
@@ -76,7 +90,10 @@ impl IngestService {
             decoder_state_dir,
             last_decoder_state_persist_usec: now_usec(),
             raw_journal,
-            tier_writers,
+            journal_host,
+            tier_writers: Some(tier_writers),
+            tier_handoff: Arc::new(super::super::tier_commit::TierHandoffShared::new()),
+            tier_worker_handles: Vec::new(),
             tier_accumulators,
             open_tiers,
             tier_flow_indexes,
@@ -98,7 +115,7 @@ impl IngestService {
     fn build_raw_journal(
         cfg: &PluginConfig,
         build_journal_cfg: &impl Fn(TierKind) -> Config,
-        lifecycle_observer: Arc<dyn journal_log_writer::LogLifecycleObserver>,
+        lifecycle_observer: Arc<dyn journal_sdk_log_writer::LogLifecycleObserver>,
     ) -> Result<Log> {
         let raw_dir = cfg.journal.raw_tier_dir();
         Log::new(&raw_dir, build_journal_cfg(TierKind::Raw))
@@ -114,7 +131,7 @@ impl IngestService {
     fn build_materialized_tier_writers(
         cfg: &PluginConfig,
         build_journal_cfg: &impl Fn(TierKind) -> Config,
-        lifecycle_observer: Arc<dyn journal_log_writer::LogLifecycleObserver>,
+        lifecycle_observer: Arc<dyn journal_sdk_log_writer::LogLifecycleObserver>,
     ) -> Result<MaterializedTierWriters> {
         let minute_1_dir = cfg.journal.minute_1_tier_dir();
         let minute_5_dir = cfg.journal.minute_5_tier_dir();

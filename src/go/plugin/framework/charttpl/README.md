@@ -146,8 +146,8 @@ groups:
         title: Request Duration Buckets
         context: request_duration_buckets
         units: observations/s
-        type: stacked
-        algorithm: incremental        # histogram buckets are counters
+        type: heatmap                 # histogram bucket charts are forced to heatmap
+        algorithm: incremental        # histogram range buckets are counter-like totals
         instances:
           by_labels: [host]
         dimensions:
@@ -207,7 +207,7 @@ groups:
             # service_status="ready" → dim "ready", service_status="degraded" → dim "degraded", etc.
 ```
 
-**What this template produces** — if the collector reports metrics for 2 hosts (`host="web-1"`, `host="web-2"`), the engine creates **2 instances of every chart** (one per host). The histogram bucket chart gets one dimension per `le` boundary, the summary chart gets one per quantile, and the stateset chart gets one per state — all named automatically by the engine.
+**What this template produces** — if the collector reports metrics for 2 hosts (`host="web-1"`, `host="web-2"`), the engine creates **2 instances of every chart** (one per host). The histogram bucket chart is a heatmap with one non-overlapping range dimension per `le` boundary, the summary chart gets one per quantile, and the stateset chart gets one per state — all named automatically by the engine.
 
 ## Template Structure
 
@@ -267,6 +267,18 @@ For example:
 | Group `context_namespace`     | _(empty)_           |
 | Chart `context`               | `queries`           |
 | **Resulting context**         | **`mysql.queries`** |
+
+**Autogen charts** — the **top-level** `context_namespace` also prefixes the contexts of charts
+created by `engine.autogen` (metrics not matched by any template dimension), joined with the same
+`.`. Group-level `context_namespace` does not apply to autogen, since unmatched series belong to
+no group. For example, with top-level `context_namespace: nagios`, an unmatched metric
+`check_load` autogenerates the context `nagios.check_load`.
+
+The autogen context is `context_namespace` joined with the **full metric name**, and a metric's name
+includes any `SnapshotMeter("<prefix>")` prefix (`<prefix>.<instrument>`). So a non-empty meter prefix
+**stacks after** `context_namespace` — e.g. `context_namespace: app` with `SnapshotMeter("app")` and
+instrument `foo` yields `app.app.foo`. When you set `context_namespace`, write metrics with
+`SnapshotMeter("")` so the namespace has a single source; do not also encode it in the meter prefix.
 
 ### 3. engine
 
@@ -502,12 +514,16 @@ charts:
 | `context`         | string        | **yes**  |                        | Chart context leaf. Combined with context namespaces.                        |
 | `units`           | string        | **yes**  |                        | Chart units (e.g., `queries/s`, `bytes`, `percentage`).                      |
 | `algorithm`       | string        | no       | inferred from metrics  | `absolute` or `incremental`. If omitted, inferred from metric suffixes.      |
-| `type`            | string        | no       | `line`                 | `line`, `area`, `stacked`, or `heatmap`.                                     |
+| `type`            | string        | no       | `line`                 | `line`, `area`, `stacked`, or `heatmap`. Histogram bucket charts are forced to `heatmap`. |
 | `priority`        | int           | no       | `70000`                | Chart ordering priority in the dashboard (`0` = use engine default `70000`). |
 | `label_promotion` | array[string] | no       | from `chart_defaults`  | Labels to promote as chart labels (for filtering/grouping in UI). Entries must be non-empty label keys. |
 | `instances`       | object        | no       | from `chart_defaults`  | Instance identity policy (see [instances](#instances)).                      |
 | `lifecycle`       | object        | no       |                        | Instance/dimension cap and expiry (see [lifecycle](#lifecycle)).             |
 | `dimensions`      | array         | **yes**  |                        | At least one dimension required (see [dimensions](#6-dimensions)).           |
+
+Chart and dimension identity labels are immutable routing inputs: changing one creates a new chart or dimension
+ID. Promoted labels are non-identity metadata. When their effective intersection changes, chartengine updates the
+existing chart with a complete replacement label set; it does not recreate the chart or its dimensions.
 
 > [!TIP]
 > When `algorithm` is omitted, the engine infers it from metric name suffixes. You only need to set it explicitly when the suffix doesn't match the intended behavior (e.g., a gauge metric named `*_total`).
@@ -516,6 +532,11 @@ charts:
 |-------------------------------------------|--------------------|
 | `*_total`, `*_count`, `*_sum`, `*_bucket` | `incremental`      |
 | Everything else                           | `absolute`         |
+
+Histogram `_bucket` dimensions receive non-overlapping range bucket totals from
+`metrix.ReadFlatten()`. The `le` label remains the bucket upper bound, but the
+value is no longer cumulative with earlier buckets. Histogram bucket dimensions
+are named by the bare `le` value and ordered numerically, with `+Inf` last.
 
 > [!WARNING]
 > If a chart's dimensions mix counter-like metrics (e.g., `requests_total`) with gauge-like metrics (e.g., `temperature`) and `algorithm` is omitted, the engine fails with a compile error: _"algorithm inference is ambiguous for mixed metric kinds; set algorithm explicitly"_. Set `algorithm` on the chart to resolve this.
@@ -646,7 +667,7 @@ dimensions:
 | `options.multiplier` | int    | no       | `1`     | Multiply the raw value by this factor.                           |
 | `options.divisor`    | int    | no       | `1`     | Divide the raw value by this factor.                             |
 | `options.hidden`     | bool   | no       | `false` | Hide this dimension in the chart (still collected).              |
-| `options.float`      | bool   | no       | `false` | Use floating-point precision for this dimension.                 |
+| `options.float`      | bool   | no       | `false` | Force floating-point precision. A dimension also inherits the metric's float flag from the collector, so this is redundant (and harmless) when the metric is already marked float. |
 
 > [!IMPORTANT]
 > There are three ways to name a dimension — pick **exactly one**:
@@ -713,7 +734,7 @@ dimensions:
       divisor: 1000
 ```
 
-**Float precision** — for ratios or small decimal values:
+**Float precision** — for ratios or small decimal values. A dimension also inherits the metric's float flag from the collector (collectors mark float-valued metrics), so `options.float` is redundant (harmless) for those and only needed to force float on a metric the collector did not mark float:
 
 ```yaml
 dimensions:
@@ -1039,3 +1060,45 @@ All rules below produce semantic validation errors unless noted:
 | Group family hierarchy + `chart.family` | Composed into `/`-separated chart family.                                                |
 | `options.multiplier = 0`                | Treated as `1`.                                                                          |
 | `options.divisor = 0`                   | Treated as `1`.                                                                          |
+
+## Programmatic API
+
+> [!NOTE]
+> Most collectors ship a static `charts.yaml` and never touch the Go API. This section is for collectors that **build a chart template at runtime** — for example from discovery results or selected profiles — and return it from `CollectorV2.ChartTemplateYAML()`.
+
+The package exposes a small Go surface for decoding, cloning, and re-emitting templates:
+
+| Function                                 | Purpose                                                                            |
+|------------------------------------------|------------------------------------------------------------------------------------|
+| `DecodeYAML([]byte) (*Spec, error)`      | Strict parse, apply decode-time defaults, then validate. The canonical read path.  |
+| `Group.Clone() Group`                    | Typed deep copy of a group and everything nested under it.                          |
+| `Spec.MarshalTemplate() (string, error)` | Validate (only) and serialize a runtime-built template to YAML.                    |
+
+### Building a template at runtime
+
+`CollectorV2.ChartTemplateYAML()` returns a plain `string`, so build the template where the error can be handled — typically once during `Init` — and cache the result; `ChartTemplateYAML()` then returns the cached string. Assemble a `Spec` from `charttpl` types and serialize it with `MarshalTemplate`:
+
+```go
+func buildChartTemplate(groups []charttpl.Group) (string, error) {
+    spec := charttpl.Spec{
+        Version:          charttpl.VersionV1,
+        ContextNamespace: "myapp",
+        Groups:           groups, // assembled from discovery / profiles
+    }
+    return spec.MarshalTemplate()
+}
+```
+
+`MarshalTemplate` runs `Spec.Validate()` and marshals with `gopkg.in/yaml.v2` — the same library `DecodeYAML` parses with — so a runtime template emits and re-decodes through one consistent YAML implementation. It deliberately does **not** apply decode-time defaults: a field you leave unset stays unset in the emitted YAML, and the chart engine applies the defaults when it re-decodes the template. Treat the returned string as opaque — it is only ever re-decoded, never compared byte-for-byte.
+
+### Cloning a shared template before mutating it
+
+Collectors that derive groups from a **shared catalog** (profiles loaded once and reused across jobs) must not mutate those groups in place — a per-job edit would corrupt the catalog for every other job. `Group.Clone()` returns an isolated deep copy, including nested groups, charts, dimensions, and their option pointers; mutate the clone freely:
+
+```go
+g := profile.Template.Clone()
+g.Metrics = perJobMetrics // safe: the shared catalog copy is untouched
+spec.Groups = append(spec.Groups, g)
+```
+
+`Clone()` is needed only when you mutate a group you do not own. A collector that decodes a fresh `Spec` per job (its own `DecodeYAML` result) already owns it and can mutate it directly.

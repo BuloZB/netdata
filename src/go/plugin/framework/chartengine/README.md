@@ -83,11 +83,11 @@ plan := attempt.Plan()
 defer attempt.Abort()
 
 err = chartemit.ApplyPlan(api, plan, chartemit.EmitEnv{
-TypeID:      "plugin.job",
-UpdateEvery: 1,
-Plugin:      "example",
-Module:      "example",
-JobName:     "example",
+	TypeID:      "plugin.job",
+	UpdateEvery: 1,
+	Plugin:      "example",
+	Module:      "example",
+	JobName:     "example",
 })
 // handle err
 err = attempt.Commit()
@@ -124,13 +124,13 @@ If inferred dimensions are present without flattened reader metadata, `PreparePl
 
 ## Action Semantics
 
-| Action                  | Meaning                                                                |
-|-------------------------|------------------------------------------------------------------------|
-| `CreateChartAction`     | Materialize chart instance (with chart metadata and labels)            |
-| `CreateDimensionAction` | Materialize dimension for a chart                                      |
-| `UpdateChartAction`     | Emit chart values for current cycle; unseen dims become `IsEmpty=true` |
-| `RemoveDimensionAction` | Obsolete one dimension                                                 |
-| `RemoveChartAction`     | Obsolete one chart                                                     |
+| Action                  | Meaning                                                                                                                              |
+|-------------------------|--------------------------------------------------------------------------------------------------------------------------------------|
+| `CreateChartAction`     | Materialize chart instance (with chart metadata and labels)                                                                          |
+| `CreateDimensionAction` | Materialize dimension for a chart                                                                                                    |
+| `UpdateChartAction`     | Emit chart values for current cycle; unseen dims, and dims whose value is non-finite (NaN/Inf), become `IsEmpty=true` (gap, never 0) |
+| `RemoveDimensionAction` | Obsolete one dimension                                                                                                               |
+| `RemoveChartAction`     | Obsolete one chart                                                                                                                   |
 
 `chartemit` normalizes emitted action order by phase:
 
@@ -168,10 +168,19 @@ Default lifecycle policy when template omits lifecycle:
 | Topic                 | Behavior                                                                                                                                       |
 |-----------------------|------------------------------------------------------------------------------------------------------------------------------------------------|
 | Trigger               | Unmatched series only when autogen is enabled                                                                                                  |
+| Context namespace     | Autogen context = top-level `context_namespace` + the full metric name (which includes any `SnapshotMeter` prefix); empty namespace leaves the bare name. A non-empty meter prefix stacks after `context_namespace`, so pair `context_namespace` with `SnapshotMeter("")` to avoid a doubled prefix |
 | Structured families   | Autogen has dedicated source builders for flattened `Histogram`, `Summary`, `StateSet`, and `MeasureSet` families                              |
 | Metric metadata usage | Uses `metrix.MetricMeta` hints for title/family/unit where allowed                                                                             |
 | Type ID budget        | Enforced via `AutogenPolicy.MaxTypeIDLen` + effective emit type-id prefix (`WithEmitTypeIDBudgetPrefix(...)`)                                  |
 | Lifecycle             | Autogen applies `ExpireAfterSuccessCycles` to **both** chart and dimension expiry (unlike template lifecycle where they default independently) |
+
+Histogram bucket charts use non-overlapping range bucket totals from
+`metrix.ReadFlatten()` and are emitted as `heatmap` charts in both autogen and
+template-driven paths. The `le` label remains the upper-bound identity for the
+bucket dimension. Autogen and template-inferred bucket dimensions are named by
+the bare `le` value (for example `0.005`, `0.025`, `+Inf`). Bucket dimensions
+are ordered by numeric upper bound with `+Inf` last, not by lexical dimension
+name.
 
 `MeasureSet` autogen specifics:
 
@@ -190,7 +199,7 @@ These label keys are treated specially by chartengine when consuming flattened s
 
 | Key / Pattern   | Meaning                                                                                                                |
 |-----------------|------------------------------------------------------------------------------------------------------------------------|
-| `le`            | Histogram bucket bound label                                                                                           |
+| `le`            | Histogram range bucket upper-bound label                                                                               |
 | `quantile`      | Summary quantile label                                                                                                 |
 | `measure_field` | `MeasureSet` field identity label                                                                                      |
 | `<metric-name>` | `StateSet` special case: the flattened state name is carried under a synthetic label whose key is the base metric name |

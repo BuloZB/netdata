@@ -274,11 +274,12 @@ async fn profile_live_startup_memory() -> anyhow::Result<StartupMemoryReport> {
 fn profile_config(base_dir: &Path) -> plugin_config::PluginConfig {
     let mut cfg = plugin_config::PluginConfig::default();
     cfg.journal.journal_dir = base_dir.to_string_lossy().to_string();
-    cfg.listener.listen = "127.0.0.1:0".to_string();
+    cfg.listener.listen = vec!["127.0.0.1:0".to_string()];
     cfg.listener.sync_every_entries = 1024;
     cfg.listener.sync_interval = std::time::Duration::from_secs(1);
-    // Per-tier defaults (10GB / 7d) already applied by JournalConfig::default;
-    // this call leaves them at the defaults, matching the original test intent.
+    // Per-tier defaults (10GB, no age cap) are already applied by
+    // JournalConfig::default; leave them unchanged to match the original
+    // test intent.
     cfg
 }
 
@@ -411,12 +412,13 @@ impl ProfilePluginRuntime {
             &cfg.enrichment.geoip.geo_database,
         );
         let charts_shutdown = CancellationToken::new();
-        let charts_task = charts::NetflowCharts::new(&mut runtime).spawn_sampler(
+        let charts_task = charts::NetflowCharts::new(&mut runtime, &cfg.charts).spawn_sampler(
             metrics,
             open_tiers,
             tier_flow_indexes,
             facet_runtime,
             resident_mapping_paths,
+            cfg.charts.clone(),
             charts_shutdown.clone(),
         );
 

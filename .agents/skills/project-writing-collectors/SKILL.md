@@ -243,7 +243,7 @@ Both clients (consume) and servers (offer) exist in all three languages. Real ex
 
 Set `Vnode` in job config when the collector has one remote target. For Go V2
 collectors that emit multiple remote nodes from one job, use
-`metrix.HostScope`; see `.agents/sow/specs/go-v2-host-scope.md` and
+`metrix.HostScope`; see `.agents/skills/project-writing-go-modules-framework-v2/go-v2-host-scope.md` and
 `src/go/plugin/go.d/docs/how-to-write-a-collector.md`. Past pain: an older
 refactor had to retroactively split job-name validation per vnode/domain because
 earlier collectors had not accounted for it.
@@ -280,15 +280,15 @@ This is the most operator-controllable shaping mechanism — the dashboard is wh
 
 ### 3.4 OTEL mappings — per-metric YAML routing
 
-Netdata's OTEL plugin (`src/crates/netdata-otel/otel-plugin/`) accepts any OTLP gRPC metric. Mapping is **generic by default** — all resource attributes, scope attributes, and data point attributes become chart labels — but the operator controls routing via per-metric YAML files at `/etc/netdata/otel.d/v1/metrics/*.yaml`. Key knobs:
+Netdata's OTEL plugin (`src/crates/otel-plugin/`) accepts any OTLP gRPC metric. Mapping is **generic by default** — all resource attributes, scope attributes, and data point attributes become chart labels — but the operator controls routing via per-metric YAML files at `/etc/netdata/otel.d/v1/metrics/*.yaml`. Key knobs:
 
 - `instrumentation_scope.name` / `version` — regex match to scope an entry to a specific OTel instrumentation
 - `dimension_attribute_key` — which data point attribute becomes the dimension name (default: `"value"`); other attributes become chart labels
 - `interval_secs`, `grace_period_secs` — per-metric timing overrides
 
-Aggregation temporality drives the chart algorithm: Gauge → absolute, Sum delta → DeltaSum, Sum cumulative monotonic → CumulativeSum, Sum cumulative non-monotonic → treated as Gauge (`src/crates/netdata-otel/otel-plugin/src/chart.rs:84`).
+Aggregation temporality drives the chart algorithm: Gauge → absolute, Sum delta → DeltaSum, Sum cumulative monotonic → CumulativeSum, Sum cumulative non-monotonic → treated as Gauge (`src/crates/otel-ingestor/src/chart.rs`).
 
-The plugin does **not** recognize OTel semantic conventions specifically (`host.name`, `service.name`, `deployment.environment`) — they pass through as labels. Cardinality control is `metrics.max_new_charts_per_request` in `otel.yaml`. Stock examples: `src/crates/netdata-otel/otel-plugin/configs/otel.d/v1/metrics/`.
+The plugin does **not** recognize OTel semantic conventions specifically (`host.name`, `service.name`, `deployment.environment`) — they pass through as labels. Cardinality control is `metrics.max_new_charts_per_request` in `otel.yaml`. Stock examples: `src/crates/otel-ingestor/configs/otel.d/v1/metrics/`.
 
 ### 3.5 Prometheus — deterministic; shape upstream to shape dashboard
 
@@ -365,8 +365,7 @@ Reference section. Use it after the mental model and best practices have framed 
 | `go.d.plugin` | Go (no CGO) | All | `src/go/plugin/go.d/` | Application integrations |
 | `ibm.d.plugin` | Go + CGO | Linux, IBM i | `src/go/plugin/ibm.d/modules/` | IBM workloads (DB2, IBM i / AS-400, IBM MQ, WebSphere) |
 | `netflow-plugin` | Rust | Linux | `src/crates/netflow-plugin/` | NetFlow v5/v9, IPFIX, sFlow |
-| `netdata-otel` | Rust | Linux | `src/crates/netdata-otel/otel-plugin/` | OpenTelemetry ingestion |
-| `netdata-log-viewer` | Rust | Linux | `src/crates/netdata-log-viewer/` | OTEL signal viewer + journal Function backend |
+| `otel-plugin` | Rust | Linux | `src/crates/otel-plugin/` | OpenTelemetry metrics + logs ingestion (logs queryable via the `otel-logs` Function) |
 | `charts.d.plugin` / `python.d.plugin` | Bash / Python | All | `src/collectors/{charts,python}.d.plugin/` | **Legacy** — do not add new modules |
 
 Path conventions: internal C plugins → `src/collectors/<name>.plugin/`; Go orchestrators → `src/go/plugin/{go.d,ibm.d}/`; Rust plugins → `src/crates/<name>/`.
@@ -383,7 +382,7 @@ Path conventions: internal C plugins → `src/collectors/<name>.plugin/`; Go orc
 | New interactive Function | `src/go/plugin/framework/functions/README.md`, `src/plugins.d/FUNCTION_UI_SCHEMA.json`, `src/plugins.d/FUNCTION_UI_DEVELOPER_GUIDE.md` |
 | Topology work | `.agents/skills/project-create-topology/SKILL.md`, `src/go/pkg/topology/v1`, `src/plugins.d/FUNCTION_TOPOLOGY_SCHEMA.json` |
 | Auto-discovery for a new go.d module | rules under `src/go/plugin/go.d/config/go.d/sd/`; engine: `src/go/plugin/agent/discovery/` |
-| OTEL ingestion | `src/crates/netdata-otel/otel-plugin/` |
+| OTEL ingestion | `src/crates/otel-plugin/` (ingest logic in `src/crates/otel-ingestor/`) |
 | Log ingestion (parse → journal) | `src/collectors/log2journal/` and `log2journal.d/` rules |
 | New external plugin in any language | `src/plugins.d/README.md` (PLUGINSD protocol) |
 | New internal C plugin | `src/collectors/README.md`; mirror an adjacent collector |
@@ -450,7 +449,7 @@ The default. Streams as `BEGIN/SET/END` (PLUGINSD) or framework equivalents. Sha
 Two paths:
 
 - **Structured journaling.** `src/collectors/log2journal/` parses application/access logs (configurable YAML rules in `log2journal.d/`, e.g. `nginx-json.yaml`, `default.yaml`) and writes structured fields into the systemd journal. The `systemd-journal.plugin` then exposes the entries via a Function (the log explorer in the Netdata UI).
-- **OTEL log signals.** `src/crates/netdata-log-viewer/` ingests OTEL logs and exposes them as Functions in the dashboard.
+- **OTEL log signals.** `src/crates/otel-plugin/` ingests OTLP logs into a write-ahead log with indexed segments (`src/crates/otel-ingestor/`, `sfsq`), queryable via the `otel-logs` Function in the Logs tab.
 
 Platform-specific events: `windows-events.plugin` (Windows event log).
 
@@ -478,8 +477,9 @@ Topology is its own data type — directed/undirected graphs of nodes and links.
 - **Live socket topology** (`src/collectors/network-viewer.plugin/`) — local L3/L4 sockets and their inferred connections.
 - **Streaming graph** (`src/streaming/`) — Netdata parent/child topology.
 - **Topology library** at `src/go/pkg/topology/v1` — production Go payload
-  helpers for new topology producers. The non-v1 `src/go/pkg/topology/` payload
-  model is legacy and must not be used for new topology work.
+  helpers for new topology producers. The non-v1 root
+  `src/go/pkg/topology/` payload model has been retired and must not be
+  reintroduced for topology work.
 
 Topology is consumed via Functions (`topology:*` family), not via metrics. The cardinality of network edges is too high for time-series storage and the use case is interactive lookup.
 
@@ -571,7 +571,7 @@ Internal C plugins under `src/collectors/`. Reuse shared metric definitions from
 | ibm.d framework | starting `ibm.d` work | `src/go/plugin/ibm.d/AGENTS.md`, `src/go/plugin/ibm.d/framework/README.md` |
 | Rust plugin SDK | new Rust plugin | `src/crates/netdata-plugin/` (`rt/`, `protocol/`, `bridge/`, `charts-derive/`, `schema/`, `types/`, `error/`) |
 | Rust NetFlow plugin | NetFlow / sFlow / IPFIX work | `src/crates/netflow-plugin/` |
-| OTEL ingestion mappings | per-metric YAML routing | `src/crates/netdata-otel/otel-plugin/` (configs under `configs/otel.d/v1/metrics/`) |
+| OTEL ingestion mappings | per-metric YAML routing | `src/crates/otel-ingestor/` (configs under `configs/otel.d/v1/metrics/`) |
 | SNMP profile format | adding/extending an SNMP profile | `src/go/plugin/go.d/collector/snmp/profile-format.md` |
 | SNMP stock profiles | starting from a known device | `src/go/plugin/go.d/config/go.d/snmp.profiles/default/` |
 | statsd synthetic_charts | operator-curated dashboards | `src/collectors/statsd.plugin/README.md` (lines 397-639) |

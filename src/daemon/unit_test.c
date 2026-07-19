@@ -2,6 +2,10 @@
 
 #include "common.h"
 #include "web/api/formatters/rrd2json.h"
+#include "database/contexts/rrdcontext-internal.h"
+#ifdef OS_WINDOWS
+#include "win_system-info.h"
+#endif
 
 #if defined(OS_LINUX)
 #include "collectors/proc.plugin/plugin_proc.h"
@@ -527,6 +531,64 @@ int unit_test_buffer() {
 
     fprintf(stderr, "buffer_sprintf() works as expected.\n");
     buffer_free(wb);
+    return 0;
+}
+
+static int check_jsonwrap_v2_partial_data_trimming_case(RRDR_OPTIONS options, const char *expected) {
+    RRDR r = {
+        .partial_data_trimming = {
+            .max_update_every = 10,
+            .expected_after = 100,
+            .trimmed_after = 101,
+        },
+    };
+
+    BUFFER *wb = buffer_create(0, NULL);
+    buffer_json_initialize(wb, "\"", "\"", 0, true, BUFFER_JSON_OPTIONS_MINIFY);
+    rrdr_json_wrapper_partial_data_trimming_v2(wb, &r, options);
+    buffer_json_finalize(wb);
+
+    const char *actual = buffer_tostring(wb);
+    if(strcmp(actual, expected) != 0) {
+        fprintf(stderr, "rrdr_json_wrapper_partial_data_trimming_v2() generated '%s', expected '%s'\n",
+                actual, expected);
+        buffer_free(wb);
+        return 1;
+    }
+
+    buffer_free(wb);
+    return 0;
+}
+
+static int test_jsonwrap_v2_partial_data_trimming_raw_metadata(void) {
+    const char *expected =
+        "{\"partial_data_trimming\":{\"max_update_every\":10,\"expected_after\":100,\"trimmed_after\":101}}";
+
+    if(check_jsonwrap_v2_partial_data_trimming_case(0, "{}"))
+        return 1;
+
+    if(check_jsonwrap_v2_partial_data_trimming_case(RRDR_OPTION_DEBUG, expected))
+        return 1;
+
+    if(check_jsonwrap_v2_partial_data_trimming_case(RRDR_OPTION_RETURN_RAW, expected))
+        return 1;
+
+    if(check_jsonwrap_v2_partial_data_trimming_case(RRDR_OPTION_DEBUG | RRDR_OPTION_RETURN_RAW, expected))
+        return 1;
+
+    QUERY_TARGET qt = { 0 };
+    qt.window.options = RRDR_OPTION_RETURN_RAW;
+    if(!query_target_aggregatable(&qt)) {
+        fprintf(stderr, "RRDR_OPTION_RETURN_RAW must keep query_target_aggregatable() true\n");
+        return 1;
+    }
+
+    qt.window.options = 0;
+    if(query_target_aggregatable(&qt)) {
+        fprintf(stderr, "query_target_aggregatable() unexpectedly true without RRDR_OPTION_RETURN_RAW\n");
+        return 1;
+    }
+
     return 0;
 }
 
@@ -1522,6 +1584,97 @@ static int test_incremental_sum_lookup_respects_update_every(void) {
     return rc;
 }
 
+static int test_rrdmetric_algorithm_follows_rrddim(void) {
+    fprintf(stderr, "%s() running...\n", __FUNCTION__);
+
+    RRD_DB_MODE old_default_rrd_memory_mode = default_rrd_memory_mode;
+    default_rrd_memory_mode = RRD_DB_MODE_ALLOC;
+
+    RRDSET *st = rrdset_create_localhost(
+        "netdata", "unittest-algo-track", "unittest-algo-track", "netdata", NULL,
+        "Unit Testing", "x", "unittest", NULL, 1,
+        nd_profile.update_every, RRDSET_TYPE_LINE);
+    RRDDIM *rd = rrddim_add(st, "d", NULL, 1, 1, RRD_ALGORITHM_INCREMENTAL);
+
+    int rc = 0;
+    RRDMETRIC *rm = rrdmetric_acquired_value(rd->rrdcontexts.rrdmetric);
+    if(!rm || rrdmetric_algorithm_atomic_load(rm) != RRD_ALGORITHM_INCREMENTAL) {
+        fprintf(stderr, "%s: after rrddim_add INCREMENTAL, rm->algorithm = %d (want %d)\n",
+                __FUNCTION__, rm ? (int)rrdmetric_algorithm_atomic_load(rm) : -1,
+                (int)RRD_ALGORITHM_INCREMENTAL);
+        rc = 1;
+    }
+
+    rrddim_set_algorithm(st, rd, RRD_ALGORITHM_ABSOLUTE);
+    rm = rrdmetric_acquired_value(rd->rrdcontexts.rrdmetric);
+    if(!rm || rrdmetric_algorithm_atomic_load(rm) != RRD_ALGORITHM_ABSOLUTE) {
+        fprintf(stderr, "%s: after rrddim_set_algorithm ABSOLUTE, rm->algorithm = %d (want %d)\n",
+                __FUNCTION__, rm ? (int)rrdmetric_algorithm_atomic_load(rm) : -1,
+                (int)RRD_ALGORITHM_ABSOLUTE);
+        rc = 1;
+    }
+
+    default_rrd_memory_mode = old_default_rrd_memory_mode;
+    return rc;
+}
+
+static int test_rrdset_rejects_invalid_update_every(void) {
+    fprintf(stderr, "%s() running...\n", __FUNCTION__);
+
+    RRD_DB_MODE old_default_rrd_memory_mode = default_rrd_memory_mode;
+    time_t old_update_every = nd_profile.update_every;
+    const time_t original_update_every = 5;
+
+    default_rrd_memory_mode = RRD_DB_MODE_ALLOC;
+    nd_profile.update_every = original_update_every;
+
+    RRDSET *st = rrdset_create_localhost(
+        "netdata", "unittest-update-every-guard", "unittest-update-every-guard", "netdata", NULL,
+        "Unit Testing", "x", "unittest", NULL, 1,
+        original_update_every, RRDSET_TYPE_LINE);
+
+    int rc = 0;
+    time_t previous = rrdset_set_update_every_s(st, 0);
+    if(previous != original_update_every || st->update_every != original_update_every) {
+        fprintf(stderr, "%s: zero update every changed chart from %ld to %d\n",
+                __FUNCTION__, (long)previous, st->update_every);
+        rc = 1;
+    }
+
+    previous = rrdset_set_update_every_s(st, -1);
+    if(previous != original_update_every || st->update_every != original_update_every) {
+        fprintf(stderr, "%s: negative update every changed chart from %ld to %d\n",
+                __FUNCTION__, (long)previous, st->update_every);
+        rc = 1;
+    }
+
+    if(sizeof(time_t) > sizeof(int32_t)) {
+        time_t too_large_update_every = (time_t)INT32_MAX;
+        too_large_update_every++;
+        previous = rrdset_set_update_every_s(st, too_large_update_every);
+        if(previous != original_update_every || st->update_every != original_update_every) {
+            fprintf(stderr, "%s: out-of-range update every changed chart from %ld to %d\n",
+                    __FUNCTION__, (long)previous, st->update_every);
+            rc = 1;
+        }
+    }
+
+    const time_t valid_update_every = 7;
+    previous = rrdset_set_update_every_s(st, valid_update_every);
+    if(previous != original_update_every || st->update_every != valid_update_every) {
+        fprintf(stderr, "%s: valid update every did not change chart from %ld to %ld; current %d\n",
+                __FUNCTION__, (long)previous, (long)valid_update_every, st->update_every);
+        rc = 1;
+    }
+
+    if(st->update_every != original_update_every)
+        rrdset_set_update_every_s(st, original_update_every);
+
+    default_rrd_memory_mode = old_default_rrd_memory_mode;
+    nd_profile.update_every = old_update_every;
+    return rc;
+}
+
 int run_all_mockup_tests(void)
 {
     fprintf(stderr, "%s() running...\n", __FUNCTION__ );
@@ -1529,6 +1682,9 @@ int run_all_mockup_tests(void)
         return 1;
 
     if(check_number_printing())
+        return 1;
+
+    if(test_jsonwrap_v2_partial_data_trimming_raw_metadata())
         return 1;
 
     if(check_rrdcalc_comparisons())
@@ -1539,6 +1695,12 @@ int run_all_mockup_tests(void)
         return 1;
 #endif
     if(test_incremental_sum_lookup_respects_update_every())
+        return 1;
+
+    if(test_rrdmetric_algorithm_follows_rrddim())
+        return 1;
+
+    if(test_rrdset_rejects_invalid_update_every())
         return 1;
 
     if(!test_variable_renames())
@@ -1754,3 +1916,169 @@ int test_sqlite(void) {
     (void) sqlite3_close_v2(db_mt);
     return 0;
 }
+
+#ifdef OS_WINDOWS
+int unit_test_windows_virt_normalize(void) {
+    static const struct {
+        const char *raw;
+        const char *expected;
+    } cases[] = {
+        {"VMware Virtual Platform",            "vmware"},
+        {"VMware7,1",                          "vmware"},
+        {"VirtualBox",                         "oracle"},
+        {"innotek GmbH VirtualBox",            "oracle"},
+        {"Oracle Corporation VirtualBox",      "oracle"},
+        {"Parallels Software International",   "parallels"},
+        {"QEMU",                               "qemu"},
+        {"QEMU Standard PC (i440FX + PIIX, 1995)", "qemu"},
+        {"KVM",                                "kvm"},
+        {"Standard PC (i440FX + PIIX, 1995)",  "unknown"},
+        {"HVM domU",                           "xen"},
+        {"Amazon EC2",                         "amazon"},
+        {"amazon ec2",                         "amazon"},
+        {"DigitalOcean Droplet",               "digitalocean"},
+        {"Microsoft Hv",                       "microsoft"},
+        {"Virtual Machine",                    "microsoft"},
+        {"Hyper-V",                            "microsoft"},
+        {"Microsoft Corporation",              "unknown"},
+        {"Surface Laptop 5",                   "unknown"},
+        {"HP ProLiant DL380 Gen10",            "unknown"},
+        {"Linode",                             "unknown"},
+        {"OpenStack",                          "unknown"},
+        {"",                                   "none"},
+        {NULL,                                 "none"},
+    };
+
+    int failures = 0;
+    for(size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *got = netdata_windows_normalize_virt_string(cases[i].raw);
+        if(strcmp(got, cases[i].expected) != 0) {
+            fprintf(stderr,
+                    "unit_test_windows_virt_normalize: case '%s' expected '%s' got '%s'\n",
+                    cases[i].raw ? cases[i].raw : "(NULL)",
+                    cases[i].expected,
+                    got);
+            failures++;
+        }
+    }
+
+    if(failures) {
+        fprintf(stderr, "unit_test_windows_virt_normalize: %d failure(s)\n", failures);
+        return 1;
+    }
+
+    fprintf(stderr, "unit_test_windows_virt_normalize: OK (%zu cases)\n",
+            sizeof(cases) / sizeof(cases[0]));
+    return 0;
+}
+
+int unit_test_windows_virt_resolution(void) {
+    static const struct {
+        const char *wmi;
+        const char *smbios;
+        const char *registry;
+        const char *expected;
+    } cases[] = {
+        {"vmware", "unknown", "oracle", "vmware"},
+        {NULL, "unknown", "vmware", "vmware"},
+        {NULL, "unknown", "oracle", "oracle"},
+        {NULL, "unknown", NULL, "unknown"},
+        {NULL, "kvm", "vmware", "kvm"},
+        {NULL, NULL, "parallels", "parallels"},
+        {NULL, NULL, NULL, "none"},
+    };
+
+    int failures = 0;
+    for(size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *got = netdata_windows_resolve_virt_detection(
+            cases[i].wmi, cases[i].smbios, cases[i].registry);
+        if(strcmp(got, cases[i].expected) != 0) {
+            fprintf(stderr,
+                    "unit_test_windows_virt_resolution: case %zu expected '%s' got '%s'\n",
+                    i,
+                    cases[i].expected,
+                    got);
+            failures++;
+        }
+    }
+
+    if(failures) {
+        fprintf(stderr, "unit_test_windows_virt_resolution: %d failure(s)\n", failures);
+        return 1;
+    }
+
+    fprintf(stderr, "unit_test_windows_virt_resolution: OK (%zu cases)\n",
+            sizeof(cases) / sizeof(cases[0]));
+    return 0;
+}
+
+int unit_test_windows_container(void) {
+    int failures = 0;
+
+    // Kubernetes env-var probe. NULL expected means "not detected via env, fall back to WMI".
+    static const struct {
+        const char *host;
+        const char *port;
+        const char *expected;
+    } env_cases[] = {
+        {"10.0.0.1", "443",  NETDATA_WIN_CONTAINER_KUBERNETES},
+        {"10.0.0.1", "6443", NETDATA_WIN_CONTAINER_KUBERNETES},
+        {"10.0.0.1", "",     NULL},
+        {"",         "443",  NULL},
+        {"",         "",     NULL},
+        {NULL,       "443",  NULL},
+        {"10.0.0.1", NULL,   NULL},
+        {NULL,       NULL,   NULL},
+    };
+
+    for(size_t i = 0; i < sizeof(env_cases) / sizeof(env_cases[0]); i++) {
+        const char *got = netdata_windows_container_from_env(env_cases[i].host, env_cases[i].port);
+        bool ok = (got == NULL && env_cases[i].expected == NULL) ||
+                  (got != NULL && env_cases[i].expected != NULL && strcmp(got, env_cases[i].expected) == 0);
+        if(!ok) {
+            fprintf(stderr,
+                    "unit_test_windows_container: env case %zu (host='%s' port='%s') expected '%s' got '%s'\n",
+                    i,
+                    env_cases[i].host ? env_cases[i].host : "(NULL)",
+                    env_cases[i].port ? env_cases[i].port : "(NULL)",
+                    env_cases[i].expected ? env_cases[i].expected : "(NULL)",
+                    got ? got : "(NULL)");
+            failures++;
+        }
+    }
+
+    // Container classification -> detection-method mapping.
+    static const struct {
+        const char *container;
+        const char *expected;
+    } map_cases[] = {
+        {NETDATA_WIN_CONTAINER_KUBERNETES, NETDATA_WIN_CONTAINER_KUBERNETES_DETECT},
+        {NETDATA_WIN_CONTAINER_WINDOWS,    NETDATA_WIN_CONTAINER_WINDOWS_DETECT},
+        {NETDATA_WIN_CONTAINER_NONE,       NETDATA_WIN_CONTAINER_NONE},
+        {"unexpected-value",               NETDATA_WIN_CONTAINER_NONE},
+        {NULL,                             NETDATA_WIN_CONTAINER_NONE},
+    };
+
+    for(size_t i = 0; i < sizeof(map_cases) / sizeof(map_cases[0]); i++) {
+        const char *got = netdata_windows_container_detection_method(map_cases[i].container);
+        if(strcmp(got, map_cases[i].expected) != 0) {
+            fprintf(stderr,
+                    "unit_test_windows_container: map case '%s' expected '%s' got '%s'\n",
+                    map_cases[i].container ? map_cases[i].container : "(NULL)",
+                    map_cases[i].expected,
+                    got);
+            failures++;
+        }
+    }
+
+    if(failures) {
+        fprintf(stderr, "unit_test_windows_container: %d failure(s)\n", failures);
+        return 1;
+    }
+
+    fprintf(stderr, "unit_test_windows_container: OK (%zu env + %zu map cases)\n",
+            sizeof(env_cases) / sizeof(env_cases[0]),
+            sizeof(map_cases) / sizeof(map_cases[0]));
+    return 0;
+}
+#endif

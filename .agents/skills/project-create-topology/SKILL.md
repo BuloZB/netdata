@@ -22,8 +22,8 @@ Read these before designing or changing topology payloads:
 | `src/plugins.d/FUNCTION_TOPOLOGY_SCHEMA.json` | JSON Schema for production topology payloads |
 | `src/plugins.d/FUNCTION_TOPOLOGY_DEVELOPER_GUIDE.md` | Human-readable topology schema contract and producer guidance |
 | `src/plugins.d/FUNCTION_TOPOLOGY_IMPLEMENTATION_SCOPE.md` | Backend/frontend/aggregator migration scope |
-| `.agents/sow/specs/topology-function-schema.md` | Durable project spec for topology semantics |
-| `.agents/sow/specs/topology-modes-correlation-aggregation.md` | Mode, correlation, aggregation, and actor modal identification contract |
+| `.agents/skills/project-create-topology/topology-function-schema.md` | Durable project spec for topology semantics |
+| `.agents/skills/project-create-topology/topology-modes-correlation-aggregation.md` | Mode, correlation, aggregation, and actor modal identification contract |
 | `src/go/pkg/topology/v1` | Go production topology payload builders and compact-table helpers |
 | `.agents/skills/project-writing-collectors/SKILL.md` | Collector quality, Function, validation, and cardinality rules |
 
@@ -41,8 +41,9 @@ developer-facing and must stay in this project skill, not under
 ## Core Rules
 
 - Production payloads carry canonical topology facts for the aggregator and UI.
-- Go producers MUST use `src/go/pkg/topology/v1`. The non-v1
-  `src/go/pkg/topology` payload model is legacy for new producers.
+- Go producers MUST use `src/go/pkg/topology/v1`. The non-v1 root
+  `src/go/pkg/topology` payload model has been retired and MUST NOT be
+  reintroduced for production topology payloads.
 - Test-only projection code may reconstruct compatibility payload shapes to
   prove parity.
 - Never add compatibility reconstruction fields, old-schema adapter names, or
@@ -65,6 +66,27 @@ developer-facing and must stay in this project skill, not under
    - Declare `identity`, `merge_identity`, and `parent_identity` in actor types.
    - Prepare aggregation scopes such as node, process name, PID, container,
      Kubernetes workload, SNMP device/interface, or vSphere object.
+  - For network-connections, the product contract is explicit actor-level
+     grouping: `group_by:process_name` emits grouped `process` actors,
+     `group_by:pid` emits per-PID `process` actors with scalar per-PID details, and
+     `group_by:container` emits `container` actors grouped by canonical
+     `container_name`. In container grouping, producer-declared actor types may
+     be more specific than `container` (`docker_container`, `systemd_service`,
+     `user`, `vm`, etc.) as long as they share the `container` aggregation
+     scope. `user.slice/user-UID.slice` paths are grouped by resolved username,
+     or `user${UID}` when username resolution is unavailable; leaf scopes remain
+     cgroup/detail evidence, not graph actor identities. Grouped views must not
+     pretend variable per-PID fields are scalar actor identity; instead, expose
+     them through merged/set-valued actor labels or declared `set` aggregation
+     metadata so actor modals and Cloud aggregation preserve the contributing
+     process/container facts.
+   - Keep topology display classification rule-based and local to a shared
+     module. Do not scatter orchestrator/path special cases through topology
+     emitters. Metric cgroup selection rules and topology actor-kind/icon/name
+     rules are related but separate contracts.
+   - Network-connections advertises `v: 3`; verify selector behavior with the
+     actual POST payload shape (`selections.group_by`) and keep legacy
+     function-string aliases only as compatibility paths.
 
 3. Pick graph links.
    - Graph links are renderable relationship groups.
@@ -78,7 +100,8 @@ developer-facing and must stay in this project skill, not under
 4. Pick evidence rows.
    - Evidence is the lossless relationship proof.
    - For sockets, preserve the exact matching tuple.
-   - For SNMP/L2, preserve LLDP/CDP/FDB/ARP/STP facts according to role.
+   - For SNMP, preserve LLDP/CDP/FDB/ARP/STP facts according to role and keep
+     logical L3 adjacency in distinct L3 link/evidence types.
    - For streaming, keep relationship facts separate from actor-owned path data.
    - For vSphere, preserve inventory/relationship facts using stable object IDs.
 
@@ -92,15 +115,39 @@ developer-facing and must stay in this project skill, not under
    - Use a compact actor-owned `actor_labels` table for modal labels:
      `actor`, `key`, `value`, optional `source`, optional `kind`, and optional
      `value_index`.
+   - For network-connections, expose contributing process and cgroup facts as
+     actor-owned `processes` and `cgroups` tables. Do not rely on the generic
+     Labels tab for structured PID/cgroup inspection when the producer has typed
+     rows.
    - Expose complete host/node labels when available.
    - Expose useful non-node actor labels and metadata, while keeping identity,
      correlation, grouping, sorting, filtering, and aggregation facts as typed
      canonical columns.
+   - When labels feed user-facing grouping, derive the grouping fields into
+     typed columns and apply any free-form label whitelist only at the Function
+     output boundary. Do not rely on `actor_labels` for grouping keys.
 
 6. Define telemetry overlays.
    - Use overlay templates once per payload or type.
    - Links and actors carry compact refs and parameters only.
    - Do not put full metric query payloads on every row.
+   - Build Go producer refs with `topologyv1.NewActorOverlayRefsBuilder` or
+     `topologyv1.NewLinkOverlayRefsBuilder` instead of hand-assembling compact
+     tables.
+   - Overlay refs use a `template` column, exactly one convention owner column
+     (`actor` with type `actor_ref` or `link` with type `link_ref`), and one
+     column for each selector param required by the referenced template. Do not
+     add any other `actor_ref` or `link_ref` columns to overlay refs. Every row
+     must have a non-null owner value.
+   - The `template` column and required selector-param columns must be `string`
+     or `string_ref`; required selector-param row values must resolve to
+     non-empty strings.
+   - Do not use `template`, `actor`, or `link` as selector params; those names
+     are reserved refs-table convention columns.
+   - For `netdata.metrics`, `node_id` means node scope, `collect_job` maps to
+     chart label `_collect_job`, and other selector params map to same-named
+     chart labels. In go.d producers, pass `job.Name()` for `collect_job`; do
+     not use `job.FullName()`.
 
 7. Define correlation semantics when actors can be resolved across payloads.
    - Declare whether the topology needs loose-side resolution, actor
@@ -174,6 +221,9 @@ developer-facing and must stay in this project skill, not under
      later product decision explicitly re-enables force-strength tuning.
    - Use only closed icon tokens. Do not emit raw SVG or depend on frontend
      capability-string icon inference; add a schema/UI icon token first.
+     Runtime/container-family tokens include `docker`, `kubernetes`, `lxc`,
+     `nspawn`, `podman`, `systemd`, `user`, and the existing `container` and
+     `vm` tokens.
    - Missing v1 `size.scale`, `layout.repulsion`, and `search` use neutral
      defaults. Do not expect the UI to preserve legacy self/device/SNMP/
      endpoint heuristics for v1.
@@ -346,9 +396,9 @@ For `topology:streaming` actor modals:
   so Cloud aggregation can preserve multiple retaining parents and a future
   explicitly named `Retained by` section can be added without changing facts.
 
-## SNMP/L2 Modal Rules
+## SNMP Topology Modal Rules
 
-For SNMP/L2 managed device actor modals:
+For SNMP managed device actor modals:
 
 - Treat the device as a collection of ports. The primary section is `Ports`
   over `actor_ports`.
@@ -369,11 +419,46 @@ For SNMP/L2 managed device actor modals:
   confidence, inference, attachment mode, or timestamps.
 - `actor_port_links` may carry compact side-specific refs and scalar facts, but
   must not duplicate raw LLDP/CDP/FDB/ARP/STP evidence JSON.
+- Keep logical L3 adjacency out of `actor_port_links`. `l3_subnet` is not a
+  physical or L2 port-neighbor relationship.
+- Expose logical L3 adjacency through typed `l3_subnet` relationship evidence
+  and an evidence-backed device modal section such as `L3 Adjacencies`.
+- `l3_subnet` links represent shared-subnet logical L3 adjacency between
+  resolved managed SNMP device actors. They must use explicit L3 link/evidence
+  types and must not be presented as discovery, physical, or L2 links.
+- Protocol-specific L3 adjacency, such as `ospf_adjacency`, is control-plane
+  logical adjacency. It must not be presented as discovery, physical, L2, or
+  port-neighbor evidence.
+- Preserve protocol-neighbor diagnostics that do not become graph links in
+  actor-owned detail tables, such as `actor_ospf_neighbors` and
+  `actor_bgp_peers`. Non-full, non-established, or unresolved protocol
+  neighbors should remain visible there without creating loose router/IP
+  actors.
+- `bgp_adjacency` links represent established BGP control-plane adjacency
+  between resolved managed SNMP device actors. They must use explicit BGP
+  link/evidence types, carry `semantic_role: control`, and must not be
+  presented as discovery, physical, L2, or port-neighbor links.
+- Deduplicate BGP adjacency by managed actor pair plus routing instance. Keep
+  BGP identifiers, ASNs, and endpoint IPs as evidence/display fields, but do not
+  make them the primary graph identity because vendor profiles expose those
+  fields asymmetrically. Parallel sessions between the same managed actor pair
+  in the same routing instance should remain actor-owned peer detail rows under
+  one compact graph relationship unless a future producer contract explicitly
+  adds a more detailed BGP graph mode.
 - Keep generic graph-link `Links` sections only for endpoint, segment, or
   custom actors that do not own port inventory.
 - Build link endpoint port labels only from real port fields: `port_name`,
   `if_name`, `if_descr`, or source `port_id`. Never use actor labels such as
   `display_name` or `sys_name` as port-name fallbacks.
+- For SNMP topology changes, update and run the scenario-golden suite in
+  `src/go/plugin/go.d/collector/snmp_topology`. The suite starts from synthetic
+  SNMP-shaped `ddsnmp` inputs, runs the real cache, registry, and Function
+  rendering path, validates the final `topology.v1` payload, and checks semantic
+  product expectations.
+- Store the bulky SNMP topology full-payload JSON oracle in the external
+  `netdata/testdata` fixture repository under `snmp/topology-scenarios/`.
+  Local regeneration may point the test at that checkout with
+  `NETDATA_SNMP_TOPOLOGY_SCENARIO_GOLDEN_DIR`.
 
 ## Validation Checklist
 
@@ -395,10 +480,18 @@ For SNMP/L2 managed device actor modals:
 - Treat `actor_labels` as sensitive topology Function data. Preserve the source
   Function's access-control assumptions when forwarding, aggregating, testing,
   or documenting labels.
+- For sparse grouping columns, validate that consumers preserve actor identity
+  for null or empty grouping keys instead of merging every null row into one
+  bucket.
 - Modal sections are recipes over existing facts and do not duplicate
   high-cardinality evidence rows.
 - Raw JSON columns are hidden/debug-only unless a schema-declared projection
   renders a scalar value.
+- Overlay templates and refs validate global template references, required
+  selector-param columns, selector-param string types and values, reserved
+  selector-param names, exactly one convention actor/link owner column, no extra
+  actor/link ref owner columns, non-null owner row values, provider/merge enum
+  membership, and link-type `overlay_templates` references.
 - Payload size is measured on realistic or captured data.
 - Raw sensitive captures remain under `.local/`.
 

@@ -6,7 +6,7 @@
 
 static inline PARSER_RC pluginsd_set(char **words, size_t num_words, PARSER *parser) {
     int idx = 1;
-    ssize_t slot = pluginsd_parse_rrd_slot(words, num_words);
+    ssize_t slot = pluginsd_parse_rrd_slot(words, num_words, PLUGINSD_DIMENSION_SLOT_MAX);
     if(slot >= 0) idx++;
 
     char *dimension = get_word(words, num_words, idx++);
@@ -39,7 +39,7 @@ static inline PARSER_RC pluginsd_set(char **words, size_t num_words, PARSER *par
 
 static inline PARSER_RC pluginsd_begin(char **words, size_t num_words, PARSER *parser) {
     int idx = 1;
-    ssize_t slot = pluginsd_parse_rrd_slot(words, num_words);
+    ssize_t slot = pluginsd_parse_rrd_slot(words, num_words, PLUGINSD_CHART_SLOT_MAX);
     if(slot >= 0) idx++;
 
     char *id = get_word(words, num_words, idx++);
@@ -287,7 +287,6 @@ static inline PARSER_RC pluginsd_host_define_end(char **words __maybe_unused, si
 
 static inline PARSER_RC pluginsd_host(char **words, size_t num_words, PARSER *parser)
 {
-    static time_t last_host_stale_check = 0;
     char *guid = get_word(words, num_words, 1);
 
     if(!guid || !*guid || strcmp(guid, "localhost") == 0) {
@@ -295,7 +294,7 @@ static inline PARSER_RC pluginsd_host(char **words, size_t num_words, PARSER *pa
         // Check if we need to switch any nodes to stale
         uint32_t min_check_interval = UINT_MAX;
         time_t now = now_realtime_sec();
-        if (last_host_stale_check < now) {
+        if (parser->user.vnodes.last_host_stale_check < now) {
             Word_t Index = 0;
             bool first_then_next = true;
             uint32_t *Pvalue;
@@ -308,7 +307,7 @@ static inline PARSER_RC pluginsd_host(char **words, size_t num_words, PARSER *pa
                 min_check_interval = MIN(min_check_interval, stale_after_seconds);
                 if (rrdhost_option_check(virtual_host, RRDHOST_OPTION_VIRTUAL_HOST)) {
                     time_t last_seen = (*Pvalue + VNODE_BASE_EPOCH);
-                    uint32_t seen_seconds_ago = (uint32_t) (now - last_seen);
+                    uint32_t seen_seconds_ago = (now > last_seen) ? (uint32_t)(now - last_seen) : 0;
 
                     if (seen_seconds_ago >= stale_after_seconds) {
                         rrdhost_option_clear(virtual_host, RRDHOST_OPTION_VIRTUAL_HOST);
@@ -322,7 +321,7 @@ static inline PARSER_RC pluginsd_host(char **words, size_t num_words, PARSER *pa
             if (min_check_interval == UINT_MAX)
                 min_check_interval = 60;
 
-            last_host_stale_check = now_realtime_sec() + min_check_interval;
+            parser->user.vnodes.last_host_stale_check = now_realtime_sec() + min_check_interval;
         }
         return PARSER_RC_OK;
     }
@@ -356,7 +355,7 @@ static inline PARSER_RC pluginsd_chart(char **words, size_t num_words, PARSER *p
     if(!host) return PLUGINSD_DISABLE_PLUGIN(parser, NULL, NULL);
 
     int idx = 1;
-    ssize_t slot = pluginsd_parse_rrd_slot(words, num_words);
+    ssize_t slot = pluginsd_parse_rrd_slot(words, num_words, PLUGINSD_CHART_SLOT_MAX);
     if(slot >= 0) idx++;
 
     char *type = get_word(words, num_words, idx++);
@@ -473,7 +472,7 @@ static inline PARSER_RC pluginsd_chart(char **words, size_t num_words, PARSER *p
 
 static inline PARSER_RC pluginsd_dimension(char **words, size_t num_words, PARSER *parser) {
     int idx = 1;
-    ssize_t slot = pluginsd_parse_rrd_slot(words, num_words);
+    ssize_t slot = pluginsd_parse_rrd_slot(words, num_words, PLUGINSD_DIMENSION_SLOT_MAX);
     if(slot >= 0) idx++;
 
     char *id = get_word(words, num_words, idx++);
@@ -804,7 +803,7 @@ static ALWAYS_INLINE PARSER_RC pluginsd_begin_v2(char **words, size_t num_words,
     timing_init();
 
     int idx = 1;
-    ssize_t slot = pluginsd_parse_rrd_slot(words, num_words);
+    ssize_t slot = pluginsd_parse_rrd_slot(words, num_words, PLUGINSD_CHART_SLOT_MAX);
     if(slot >= 0) idx++;
 
     char *id = get_word(words, num_words, idx++);
@@ -841,6 +840,7 @@ static ALWAYS_INLINE PARSER_RC pluginsd_begin_v2(char **words, size_t num_words,
     // parse the parameters
 
     time_t update_every = (time_t) str2ull_encoded(update_every_str);
+    time_t parsed_update_every = update_every;
     time_t end_time = (time_t) str2ull_encoded(end_time_str);
 
     time_t wall_clock_time;
@@ -849,8 +849,10 @@ static ALWAYS_INLINE PARSER_RC pluginsd_begin_v2(char **words, size_t num_words,
     else
         wall_clock_time = (time_t) str2ull_encoded(wall_clock_time_str);
 
-    if (unlikely(update_every != st->update_every))
+    if (unlikely(update_every != st->update_every)) {
         rrdset_set_update_every_s(st, update_every);
+        update_every = st->update_every;
+    }
 
     timing_step(TIMING_STEP_BEGIN2_PARSE);
 
@@ -898,7 +900,7 @@ static ALWAYS_INLINE PARSER_RC pluginsd_begin_v2(char **words, size_t num_words,
         buffer_fast_strcat(wb, rrdset_id(st), string_strlen(st->id));
         buffer_fast_strcat(wb, "' ", 2);
 
-        if(can_copy)
+        if(can_copy && update_every == parsed_update_every)
             buffer_strcat(wb, update_every_str);
         else
             buffer_print_uint64_encoded(wb, integer_encoding, update_every);
@@ -949,7 +951,7 @@ static ALWAYS_INLINE PARSER_RC pluginsd_set_v2(char **words, size_t num_words, P
     timing_init();
 
     int idx = 1;
-    ssize_t slot = pluginsd_parse_rrd_slot(words, num_words);
+    ssize_t slot = pluginsd_parse_rrd_slot(words, num_words, PLUGINSD_DIMENSION_SLOT_MAX);
     if(slot >= 0) idx++;
 
     char *dimension = get_word(words, num_words, idx++);
@@ -1239,6 +1241,7 @@ static PARSER_RC pluginsd_json(char **words __maybe_unused, size_t num_words __m
     if(!host) return PLUGINSD_DISABLE_PLUGIN(parser, NULL, NULL);
 
     char *keyword = get_word(words, num_words, 1);
+    if(!keyword) keyword = "";
 
     parser->defer.response = buffer_create(0, NULL);
     parser->defer.end_keyword = PLUGINSD_KEYWORD_JSON_END;
@@ -1455,6 +1458,8 @@ ALWAYS_INLINE PARSER_RC parser_execute(PARSER *parser, const PARSER_KEYWORD *key
             return pluginsd_clabel_commit(words, num_words, parser);
         case PLUGINSD_KEYWORD_ID_FUNCTION:
             return pluginsd_function(words, num_words, parser);
+        case PLUGINSD_KEYWORD_ID_FUNCTION_DEL:
+            return pluginsd_function_del(words, num_words, parser);
         case PLUGINSD_KEYWORD_ID_FUNCTION_RESULT_BEGIN:
             return pluginsd_function_result_begin(words, num_words, parser);
         case PLUGINSD_KEYWORD_ID_FUNCTION_PROGRESS:
@@ -1513,7 +1518,72 @@ void parser_init_repertoire(PARSER *parser, PARSER_REPERTOIRE repertoire) {
     }
 }
 
+static int pluginsd_parser_unittest_slot_bounds(size_t max_slot) {
+    // The boundary cases below build "max_slot - 1", so a zero cap would underflow.
+    // All real callers pass nonzero compile-time caps; guard against misuse anyway.
+    if(max_slot < 1) {
+        netdata_log_error("PLUGINSD: slot bounds unittest requires max_slot >= 1, got %zu", max_slot);
+        return 1;
+    }
+
+    // Note on initialization: every element below is given an explicit
+    // initializer, so C zero-fills the remainder of each slot_word array. The
+    // trailing three entries start empty and are filled from max_slot at runtime.
+    struct slot_test_case {
+        char slot_word[64];
+        ssize_t expected;
+    } cases[] = {
+        { "", -1 },                                          // no SLOT word -> -1 (caller must not advance idx)
+        { PLUGINSD_KEYWORD_SLOT ":0", 0 },                   // explicit zero -> uncached
+        { PLUGINSD_KEYWORD_SLOT ":1", 1 },                   // smallest cached slot
+        { PLUGINSD_KEYWORD_SLOT ":-1", 0 },                  // negative parses as unsigned 0 -> uncached
+        { PLUGINSD_KEYWORD_SLOT ":abc", 0 },                 // malformed decimal -> 0 -> uncached
+        { PLUGINSD_KEYWORD_SLOT ":0xZZ", 0 },                // malformed hex -> 0 -> uncached
+        { PLUGINSD_KEYWORD_SLOT ":0x0AAAAAAAAAAAAAAB", 0 },  // over cap; cast stays positive, would wrap allocation
+        { PLUGINSD_KEYWORD_SLOT ":0xFFFFFFFFFFFFFFFF", 0 },  // u64 max -> over cap -> uncached
+        { PLUGINSD_KEYWORD_SLOT ":0x40000000", 0 },          // over both caps -> uncached (the reported OOM value)
+        { "", 0 },                                           // filled below: max_slot - 1 (accepted)
+        { "", 0 },                                           // filled below: max_slot     (accepted, boundary)
+        { "", 0 },                                           // filled below: max_slot + 1 (rejected, boundary)
+    };
+
+    const size_t n = _countof(cases);
+
+    snprintfz(cases[n - 3].slot_word, sizeof(cases[n - 3].slot_word),
+              PLUGINSD_KEYWORD_SLOT ":%zu", max_slot - 1);
+    cases[n - 3].expected = (ssize_t)(max_slot - 1);
+
+    snprintfz(cases[n - 2].slot_word, sizeof(cases[n - 2].slot_word),
+              PLUGINSD_KEYWORD_SLOT ":%zu", max_slot);
+    cases[n - 2].expected = (ssize_t)max_slot;
+
+    snprintfz(cases[n - 1].slot_word, sizeof(cases[n - 1].slot_word),
+              PLUGINSD_KEYWORD_SLOT ":%zu", max_slot + 1);
+    cases[n - 1].expected = 0;
+
+    for(size_t i = 0; i < _countof(cases); i++) {
+        char command[] = "DIMENSION";
+        char *words[] = { command, cases[i].slot_word[0] ? cases[i].slot_word : NULL };
+        size_t num_words = words[1] ? 2 : 1;
+
+        ssize_t slot = pluginsd_parse_rrd_slot(words, num_words, max_slot);
+        if(slot != cases[i].expected) {
+            netdata_log_error("PLUGINSD: slot parser unittest failed for '%s': expected %zd, got %zd",
+                              words[1] ? words[1] : "(unset)", cases[i].expected, slot);
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 int pluginsd_parser_unittest(void) {
+    if(pluginsd_parser_unittest_slot_bounds(PLUGINSD_DIMENSION_SLOT_MAX))
+        return 1;
+
+    if(pluginsd_parser_unittest_slot_bounds(PLUGINSD_CHART_SLOT_MAX))
+        return 1;
+
     PARSER *p = parser_init(NULL, -1, -1, PARSER_INPUT_SPLIT, NULL);
     pluginsd_keywords_init(p, PARSER_INIT_PLUGINSD | PARSER_INIT_STREAMING);
 

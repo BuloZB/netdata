@@ -210,7 +210,7 @@ static void rrdcontext_to_json_v2_full_text_search(struct rrdcontext_to_json_v2_
     
     RRDINSTANCE *ri;
     dfe_start_read(rc->rrdinstances, ri) {
-        if(ctl->window.enabled && !query_matches_retention(ctl->window.after, ctl->window.before, ri->first_time_s, (ri->flags & RRD_FLAG_COLLECTED) ? ctl->now : ri->last_time_s, 0))
+        if(ctl->window.enabled && !query_matches_retention(ctl->window.after, ctl->window.before, ri->first_time_s, rrd_flag_is_collected(ri) ? ctl->now : ri->last_time_s, 0))
             continue;
 
         // Check instance name match only if instances option is enabled
@@ -227,7 +227,7 @@ static void rrdcontext_to_json_v2_full_text_search(struct rrdcontext_to_json_v2_
         if(ctl->options & CONTEXTS_OPTION_DIMENSIONS) {
             RRDMETRIC *rm;
             dfe_start_read(ri->rrdmetrics, rm) {
-                if(ctl->window.enabled && !query_matches_retention(ctl->window.after, ctl->window.before, rm->first_time_s, (rm->flags & RRD_FLAG_COLLECTED) ? ctl->now : rm->last_time_s, 0))
+                if(ctl->window.enabled && !query_matches_retention(ctl->window.after, ctl->window.before, rm->first_time_s, rrd_flag_is_collected(rm) ? ctl->now : rm->last_time_s, 0))
                     continue;
 
                 if(unlikely(full_text_search_string(&ctl->q.fts, q, rm->id)) ||
@@ -267,7 +267,7 @@ static ssize_t rrdcontext_to_json_v2_add_context(void *data, RRDCONTEXT_ACQUIRED
 
     RRDCONTEXT *rc = rrdcontext_acquired_value(rca);
 
-    if(ctl->window.enabled && !query_matches_retention(ctl->window.after, ctl->window.before, rc->first_time_s, (rc->flags & RRD_FLAG_COLLECTED) ? ctl->now : rc->last_time_s, 0))
+    if(ctl->window.enabled && !query_matches_retention(ctl->window.after, ctl->window.before, rc->first_time_s, rrd_flag_is_collected(rc) ? ctl->now : rc->last_time_s, 0))
         return 0; // continue to next context
 
     struct fts_search_results search_results = {0};
@@ -294,7 +294,7 @@ static ssize_t rrdcontext_to_json_v2_add_context(void *data, RRDCONTEXT_ACQUIRED
             .priority = rc->priority,
             .first_time_s = rc->first_time_s,
             .last_time_s = rc->last_time_s,
-            .flags = rc->flags,
+            .flags = rrd_flags_get(rc),
             .nodes = 1,
             .instances = dictionary_entries(rc->rrdinstances),
             .instances_dict = NULL,
@@ -491,7 +491,11 @@ static void rrdcontext_to_json_v2_rrdhost(BUFFER *wb, RRDHOST *host, struct rrdc
             buffer_json_member_add_string(wb, "v", rrdhost_program_version(host));
 
             host_labels2json(host, wb, "labels");
-            rrdhost_system_info_to_json_v2(wb, host->system_info);
+            spinlock_lock(&host->rrdhost_update_lock);
+            struct rrdhost_system_info *system_info = rrdhost_system_info_dup(host->system_info);
+            spinlock_unlock(&host->rrdhost_update_lock);
+            rrdhost_system_info_to_json_v2(wb, system_info);
+            rrdhost_system_info_free(system_info);
 
             // created      - the node is created but never connected to cloud
             // unreachable  - not currently connected
@@ -972,7 +976,7 @@ static void contexts_react_callback(const DICTIONARY_ITEM *item __maybe_unused, 
     // Collect instances, dimensions, and labels if requested
     RRDINSTANCE *ri;
     dfe_start_read(rc->rrdinstances, ri) {
-        if(ctl->window.enabled && !query_matches_retention(ctl->window.after, ctl->window.before, ri->first_time_s, (ri->flags & RRD_FLAG_COLLECTED) ? ctl->now : ri->last_time_s, (time_t)ri->update_every_s))
+        if(ctl->window.enabled && !query_matches_retention(ctl->window.after, ctl->window.before, ri->first_time_s, rrd_flag_is_collected(ri) ? ctl->now : ri->last_time_s, (time_t)ri->update_every_s))
             continue;
 
         // Add instance name to instances dictionary
@@ -984,7 +988,7 @@ static void contexts_react_callback(const DICTIONARY_ITEM *item __maybe_unused, 
         if(t->dimensions_dict) {
             RRDMETRIC *rm;
             dfe_start_read(ri->rrdmetrics, rm) {
-                if(ctl->window.enabled && !query_matches_retention(ctl->window.after, ctl->window.before, rm->first_time_s, (rm->flags & RRD_FLAG_COLLECTED) ? ctl->now : rm->last_time_s, (time_t)ri->update_every_s))
+                if(ctl->window.enabled && !query_matches_retention(ctl->window.after, ctl->window.before, rm->first_time_s, rrd_flag_is_collected(rm) ? ctl->now : rm->last_time_s, (time_t)ri->update_every_s))
                     continue;
 
                 dictionary_set(t->dimensions_dict, string2str(rm->name), NULL, 0);

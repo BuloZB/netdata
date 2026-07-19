@@ -3,6 +3,11 @@
 package collector
 
 import (
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp/ddsnmp"
+	snmptopology "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_topology"
+	snmptraps "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_traps"
+
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/activemq"
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/adaptecraid"
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/ap"
@@ -18,6 +23,7 @@ import (
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/ceph"
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/chrony"
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/clickhouse"
+	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/cloudwatch"
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/cockroachdb"
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/consul"
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/coredns"
@@ -108,8 +114,6 @@ import (
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/scaleio"
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/sensors"
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/smartctl"
-	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp"
-	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_topology"
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/spigotmc"
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/sql"
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/squid"
@@ -139,3 +143,14 @@ import (
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/zfspool"
 	_ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/zookeeper"
 )
+
+func init() {
+	// These collectors share SNMP state; wire them together here instead of
+	// exposing package-global registries from the individual collector packages.
+	deviceStore := ddsnmp.NewDeviceStore()
+	trapEnrichment := snmptopology.NewTrapEnrichmentHandle()
+
+	snmp.Register(deviceStore)
+	snmptopology.Register(deviceStore, trapEnrichment)
+	snmptraps.Register(deviceStore, trapEnrichment)
+}

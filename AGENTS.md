@@ -30,21 +30,322 @@ CRITICAL RULES:
 
 ## Mandatory Development Principles
 
-These principles are mandatory for every task in this repository:
+These principles are mandatory for every task. Code is cheap to add and
+expensive to live with, so a larger diff that removes debt beats a smaller one
+that preserves it.
+
+**Core (read first; the bullets under each principle are the authority for forks
+and edge cases):**
+
+- Deliver the **clean end state** of the approved scope, not the smallest diff —
+  including removing what the change makes redundant; refactor low-risk mess in
+  code you touch.
+- **Record that target in the SOW first** (what you remove; any coupled item you
+  exclude, with its reason). When you replace a path or contract, record a
+  reference search proving the list is complete.
+- **You are not the scope authority.** Coupled cleanup is in scope: do the
+  low-risk part and disclose it; never silently drop it or relabel it
+  "independent."
+- Falling short of the recorded target — or any user-owned **fork** (competing
+  designs, a public-contract or destructive change, unclear scope) — triggers a
+  **Mandatory pause**: stop, state the trade-off, get explicit approval.
+- **Plan before non-trivial work:** establish the user-approved end state plus
+  acceptance criteria, then ordered steps; re-evaluate against the target at each
+  step, before any PR, and before completion.
+- **Default on doubt:** if unsure whether something is in scope, trivial, or a
+  user-owned fork, treat it as in-scope / non-trivial / user-owned and ask.
 
 1. **Clean end state over less churn.**
-   You MUST always aim for the clean end state, not the smallest diff. While
-   designing and implementing, actively search for the structure that should
-   exist after the work is complete. You MUST periodically re-evaluate
-   already-written changes against that target; do not keep a compromise only
-   because it already exists in the branch.
+   - Binding rule (read first): you MUST recommend and deliver the clean end
+     state — the structure the codebase SHOULD have once the approved scope is
+     fully delivered, including removing the code, config, docs, and tests the
+     change makes redundant — not the smallest diff. You MUST NOT relabel the
+     smallest working diff as "the clean end state."
+   - Record the target: before generating options, record that clean end state in
+     the SOW. The recorded target is the clean end state of this SOW's approved
+     scope; for staged work, each stage's SOW records that stage's target and the
+     stages together MUST reach the full target. Any option that does not match
+     the recorded target is a non-clean state and triggers the Mandatory pause.
+   - Open design decision: when the clean end state is itself an open design
+     decision that is the user's to make, do not invent a fixed target; record a
+     provisional target plus the open design question and resolve it with the
+     user first.
+   - Approved scope: "the approved scope" is the union of (a) the issue or user
+     request, (b) the SOW Purpose and Acceptance Criteria, and (c) the
+     migration/contract surface they imply. If it is unclear whether work is in
+     scope, treat it as in-scope and raise it with the user; never silently
+     exclude it.
+   - You are not the scope authority:
+     - A "coupled item" is code, config, docs, or tests the current change makes
+       redundant or leaves inconsistent (for example a replaced path, its
+       callers, or its tests).
+     - You MUST NOT reclassify in-scope or coupled work as "independent" or "out
+       of scope" to avoid doing it, and you MUST NOT silently drop coupled work.
+     - When you only suspect something is coupled and including it is low-risk and
+       confined to what you are changing, include it and disclose it rather than
+       stopping to ask.
+     - Pause for the user only when including it would expand the blast radius,
+       change a user-visible contract, or the boundary is itself a genuine scope
+       fork.
+     - This overrides any reading of "Scope discipline" that would defer coupled
+       cleanup.
+   - Disclose exclusions: in the recorded target you MUST list (i) what you will
+     remove as redundant, and (ii) any coupled item you are treating as NOT part
+     of this clean end state, each with its reason and the scope source it rests
+     on. Excluding an in-scope or coupled item without recording it there is
+     silent scope-narrowing and is prohibited, so a reviewer or the next agent can
+     check your exclusions against those sources.
+   - Touch-the-mess-you-touch: when your change modifies code that already
+     contains adjacent duplication, dead code, or a clear pre-existing defect, you
+     SHOULD clean that adjacent mess as part of this work rather than build on top
+     of it, provided the cleanup is low-risk and confined to the code you are
+     already modifying. Cleanup that would reach into unrelated code is
+     independent work (Scope discipline) — track it, do not silently bundle it. If you
+     choose NOT to clean adjacent mess you touched, record why under the
+     disclosure list (ii).
+   - Reference search (when replacing a path or altering a contract):
+     - You MUST run and record in the SOW a reference search for remaining
+       references to the replaced path or contract.
+     - Search construction sites and prefixes too, not only literal final names —
+       identifiers here are often built dynamically (for example via
+       `fmt.Sprintf`).
+     - Every surviving reference MUST appear in (i) or (ii) with its scope source,
+       or the target is incomplete; an item you did not search for counts as
+       silent scope-narrowing.
+     - A repository-wide search cannot prove safety for consumers outside this
+       repo (Netdata Cloud, exporters, streaming, ML, the docs pipeline); treat
+       renaming a shipped public contract as a user-owned breaking decision (an
+       Allowed-exceptions pause), not something the search clears.
+   - Allowed exceptions (pause conditions, not auto-routes): recommend a
+     non-clean route ONLY for one of:
+     - (a) technically impossible — impossible to implement correctly at all, NOT
+       impossible within a preferred diff size;
+     - (b) a concrete, evidenced safety risk — a named hazard such as data loss
+       or a security/production-stability regression, NOT "a larger diff is
+       riskier";
+     - (c) confirmed by the user as outside the approved scope; or
+     - (d) accepted by the user, through the Mandatory pause, as an in-scope
+       partial to ship now.
 
-2. **Scope discipline at every step.**
-   At each milestone, you MUST check whether the work has drifted outside the
-   approved scope. If the new work is valid but independent, you MUST defer it
-   to a later step or pause and submit the independent work first, then rebase
-   the current branch after it merges. Complex features MUST be delivered in
-   coherent steps where each step builds on the previous one.
+     For (a)/(b) you MUST cite specific evidence (file/line, failure class, or
+     test) and route through the Mandatory pause — you do not self-certify
+     "unsafe." For (d) track the remainder per "Followup Discipline" with why
+     deferral is acceptable and when it lands; repeatedly shipping partials is
+     debt accumulation, not delivery. Risk reduction, review convenience, smaller
+     diff, and issue staging are NEVER valid and MUST NOT be relabeled "unsafe"
+     or "independent."
+   - Mandatory pause: if the delivered state will fall short of its recorded
+     target for any reason other than approved staged delivery, you MUST present
+     the evidence, STOP, and obtain explicit user approval (see Approval bar)
+     before proceeding, before requesting non-draft review, and before marking
+     the work complete.
+   - Approval bar (used by every gate): approval means the user explicitly
+     accepts a trade-off, goal, or plan that you stated in your own words (what
+     stays redundant or partial, and why). A bare "ok" or "sounds good" to a
+     one-sided pitch is not approval.
+   - Re-evaluation: at the completion of each planned step, before opening or
+     updating a PR, and before marking a SOW completed (the Re-evaluation
+     checkpoints), you MUST re-evaluate already-written changes against the
+     recorded target; you SHOULD also re-evaluate whenever you pause to report
+     progress. Do not keep a compromise only because it already exists in the
+     branch.
+   - Staged delivery: allowed ONLY when every stage is an in-scope decomposition
+     of one approved clean end state and the stages together reach it. The user
+     approval recorded for the staged plan covers the intermediate states, so an
+     approved stage does not re-trigger the Mandatory pause; every later stage
+     MUST be tracked per "Followup Discipline" (implemented here, rejected with
+     evidence, or a linked GitHub issue) before an earlier stage merges. A
+     self-certified "a later stage will finish it" with no tracked item is not
+     acceptable.
+   - Re-ground staged designs: a design recorded during planning or an earlier
+     stage MAY have drifted from the code a previous stage produced (a removed
+     structure, an obsoleted mechanism). Before implementing a later stage you
+     MUST re-verify its recorded design against the current code and record the
+     correction in the SOW; never implement against stale assumptions.
+   - Deferral check: before recommending deferral, check the issue, SOW,
+     acceptance criteria, and affected migration scope. Silence or ambiguity MUST
+     NOT be read as permission to defer; if those sources do not clearly place
+     the work outside the approved clean end state, treat it as in-scope and
+     either complete it or pause for a user decision.
+   - Trivial-work exemption: trivial work (per "When A SOW Is Required") has no
+     SOW and is exempt from the record-the-target, disclosure, and
+     reference-search bullets above; the clean-end-state preference still applies.
+     When unsure, treat the work as non-trivial.
+
+2. **Plan before non-trivial work.**
+   - Plan first: non-trivial work (see "When A SOW Is Required") MUST start with
+     a plan recorded in the SOW before any implementation-file change and before
+     any implementation-equivalent action — migrations, deletions, pushes,
+     non-draft PRs, or external-state mutations via tools. Trivial work is exempt;
+     when unsure, treat the work as non-trivial.
+   - Human-owned goal: the desired end state — the goal, or coherent goal set, the
+     work must reach — MUST be created with or approved by the user. You MUST NOT
+     finalize the goal unilaterally (same user-owned target as Clean end state).
+   - End state first: you MUST establish the desired end state — including its
+     acceptance criteria — before planning the steps; the goal drives the work,
+     not a first diff. If you cannot yet state the end state, keep investigating
+     until you can; do not start work against an unknown target. When the end
+     state is itself a user-owned design decision, record a provisional target
+     plus the open question and resolve it with the user first (Clean end state).
+     Then plan the steps to move from the current state toward that end state.
+   - Decompose into steps: split the work into ordered steps, each with its own
+     clean end state and acceptance criteria, each building on the previous one
+     toward the desired end state. A single coherent step is a valid decomposition
+     when the work is atomic; do not invent artificial sub-steps.
+   - Resolve huge or vague work: if the deliverable is large or vague, keep
+     refining the plan until every step has a clean end state and acceptance
+     criteria. Do not start implementation while steps are still unclear.
+   - Reachability: the plan MUST either reach the desired end state through its
+     steps, or produce evidence that it is not achievable; an unachievable goal
+     is a pause condition for a user decision, not a silent partial result.
+   - Human approval gate: when a goal-approval round is required (see "Approval is
+     for goal-decisions" below), the whole plan — the desired end state and the
+     step breakdown — MUST be explicitly approved by the user before
+     implementation. The assistant proposes and investigates; the user approves.
+     State the goal and step breakdown being accepted, and get confirmation that
+     meets the Approval bar (Clean end state). If the user rejects or edits the
+     plan, revise and re-seek approval; the SOW stays in `planning` until an
+     explicit approval is recorded, then reaches `Status: ready`. This gate is the
+     canonical statement of the approval requirement that the Pre-Implementation
+     Gate and Required First Checks reference.
+   - Approval is for goal-decisions, not work categories:
+     - The goal-approval round fires ONLY when the end state is a genuine
+       user-owned fork — competing designs, a public-contract change, a
+       destructive or irreversible step, or unclear scope.
+     - Other non-trivial work whose end state is already fixed by the triggering
+       request, an existing project skill, or an established repository pattern
+       (for example a clear bug fix, a metadata/docs edit with no contract change,
+       or a collector's skeleton and wiring fixed by its authoring skill — though
+       its Function surface, vnode/host-scope design, and new public config
+       options remain user-owned forks) still needs a recorded plan and the
+       Pre-Implementation Gate, but the triggering request IS the recorded goal
+       approval — no separate round, which also satisfies the resume re-check and
+       the progress rule.
+     - When it is unclear whether a real fork exists, treat it as user-owned and
+       seek approval.
+   - Approval persists; re-check on resume: before continuing an `in-progress` or
+     `paused` SOW you did not personally take through this gate — including
+     takeover or handoff — you MUST confirm the SOW records explicit approval of
+     the current goal and plan. If it does not, or the plan changed materially
+     since approval, treat the SOW as `planning` and re-obtain approval before
+     further implementation.
+
+3. **Scope discipline at every step.**
+   - Drift check: at each Re-evaluation checkpoint (Clean end state), you MUST
+     also check whether the work has drifted outside the approved scope, not only
+     whether the diff still matches the recorded target.
+   - Independence test: new work is "genuinely independent" only if ALL hold —
+     (a) the approved clean end state is still complete and correct without it,
+     (b) it is not a coupled item or a remaining reference recorded under Clean
+     end state, and (c) it has its own separable acceptance criteria. If any test
+     fails, or you are unsure, treat the work as coupled, not independent, and
+     handle it under Clean end state (do the low-risk part and disclose it; pause
+     only for a genuine fork) — you are not the scope authority.
+   - Disposition of independent work:
+     - Do NOT silently bundle it.
+     - Submit it as a separate PR first and rebase the current branch after it
+       merges, or track it as a GitHub issue per "Followup Discipline."
+     - Do NOT fold it into this SOW's steps — Clean-end-state staged-delivery
+       stages must be a decomposition of one clean end state.
+   - Governed elsewhere: coupled cleanup is in scope (Clean end state), and
+     non-trivial work is delivered in coherent incremental steps (Plan before
+     non-trivial work); this principle does not restate them.
+
+**Flow diagrams (human reading aid, non-normative):** the bullets above are
+authoritative; the diagrams below summarize the flow for human readers and MUST
+be kept in sync when the principles change.
+
+<details>
+<summary>Show per-principle flow diagrams</summary>
+
+How the three principles connect (lifecycle order):
+
+```mermaid
+flowchart LR
+    A("1. Clean end state<br/>defines the target (what 'done' means)")
+    B("2. Plan before non-trivial work<br/>establish the target + steps; user approves real forks")
+    C("3. Scope discipline<br/>stay on the target while executing each step")
+    A --> B --> C
+    C -->|re-evaluate vs target| A
+```
+
+1. Clean end state over less churn:
+
+```mermaid
+flowchart TD
+    A("Approved scope = issue + SOW Purpose/Acceptance + implied surface")
+    B("Define the clean end state, incl. removing what the change makes redundant")
+    C("Record target in SOW: exclusions list + reference search if a path/contract is replaced")
+    D{"Matches recorded target?"}
+    E("Deliver the clean end state")
+    F{"Allowed exception?"}
+    Fx("Only: a) impossible, b) evidenced safety risk, c) out of scope, d) user-accepted partial")
+    G("NOT allowed: risk reduction, smaller diff, or staging")
+    H("Mandatory pause: present evidence, STOP")
+    I{"Explicit approval?"}
+    Ix("Approval bar: a bare 'ok' is not approval")
+    J("Proceed; track remainder per Followup Discipline")
+    K("Re-evaluate vs target: each step, before a PR, before complete")
+    A --> B --> C --> D
+    D -->|yes| E
+    D -->|no| F
+    F -->|no| G --> B
+    F -->|yes| H --> I
+    I -->|no| B
+    I -->|yes| J
+    F -.- Fx
+    I -.- Ix
+    E --> K
+    J --> K
+```
+
+2. Plan before non-trivial work:
+
+```mermaid
+flowchart TD
+    A("Task")
+    B{"Trivial?"}
+    C("Exempt: just do it (clean-end-state preference still applies)")
+    D("Establish the desired end state + acceptance criteria FIRST; keep investigating until you can")
+    E("Decompose into ordered steps, each with its own clean end state + criteria; move current toward desired")
+    F{"End state a user-owned fork?"}
+    Fk("Fork = competing designs, public-contract/destructive change, or unclear scope")
+    G("Fixed by request/skill/pattern: the request IS the approval (recorded plan + gate, no separate round)")
+    H("Goal-approval round: explicit user approval of the whole plan (Approval bar)")
+    I("Status: ready, implement")
+    J("Pause for a user decision (not a silent partial)")
+    A --> B
+    B -->|yes| C
+    B -->|no| D
+    D --> E --> F
+    F -->|no| G
+    F -->|yes| H
+    F -.- Fk
+    G --> I
+    H --> I
+    D -->|goal unreachable| J
+```
+
+3. Scope discipline at every step:
+
+```mermaid
+flowchart TD
+    A("At each Re-evaluation checkpoint")
+    B{"Drifted outside approved scope?"}
+    C("Continue")
+    D{"Genuinely independent?"}
+    Dx("Independent only if ALL: end state complete without it; not a coupled item/reference; separable acceptance criteria")
+    E("Treat as COUPLED: handle under Clean end state (do the low-risk part + disclose); pause only for a genuine fork")
+    F("Do NOT bundle silently: separate PR + rebase, or track as a GitHub issue; never fold into this SOW's steps")
+    A --> B
+    B -->|no| C
+    B -->|new work| D
+    D -->|no or unsure| E
+    D -->|yes| F
+    D -.- Dx
+```
+
+</details>
 
 USER COMMUNICATION:
 
@@ -65,7 +366,27 @@ Project SOW status: initialized
 
 This project uses a local Statement of Work system.
 
-The SOW system is self-contained in this repository. Normal SOW work must not depend on `~/.agents`, `~/.AGENTS.md`, global skills, global templates, or global scripts. Use this `AGENTS.md`, project-local SOW files, project-local specs, project-local skills, and the active SOW.
+SOWs and specs are **local-only working memory, never committed**:
+
+- SOW working files live under `.agents/sow/q/**` (the queue tree) and MUST NOT
+  be committed to any branch.
+- Specs live under `.agents/sow/specs/**` and are likewise local-only and
+  gitignored. They may be re-introduced to git later, reorganized, as a
+  deliberate decision; until then treat them as local memory.
+- Only the SOW framework files are committed and shared via git:
+  `.agents/sow/SOW.template.md`, `.agents/sow/audit.sh`,
+  `.agents/sow/scan-sensitive.sh`, `.agents/sow/worktree-link.sh`.
+- `.gitignore` enforces this: `/.agents/sow/q` and `/.agents/sow/specs` are
+  ignored; the framework files are tracked normally.
+- Durable knowledge that must survive a SOW belongs in project skills, docs,
+  code, and tests (and, once reorganized, specs) — not in the SOW body.
+- Worktree sharing: SOW working memory is per-developer, not per-worktree. Run
+  `.agents/sow/worktree-link.sh` after creating a git worktree (or after
+  updating an old checkout to this model) to create the queues and symlink
+  `.agents/sow/q`, `.agents/sow/specs`, `.local`, and `.env` to the origin
+  checkout. See "### SOW Locations And Naming".
+
+The SOW system is self-contained in this repository. Normal SOW work must not depend on `~/.agents`, `~/.AGENTS.md`, global skills, global templates, or global scripts. Use this `AGENTS.md`, the local SOW, project-local specs, and project-local skills.
 
 ### Roles
 
@@ -76,16 +397,27 @@ The SOW system is self-contained in this repository. Normal SOW work must not de
 
 Before non-trivial work:
 
-1. Read pending/current SOWs for overlap, contradictions, and existing decisions.
-2. Read relevant specs under `.agents/sow/specs/`.
+1. Read the active SOWs under `.agents/sow/q/` (the local-only queue tree) if any exist. SOWs are local working memory; discover other in-flight work through open PRs and issues, not through `master`.
+2. Read relevant specs under `.agents/sow/specs/` (local-only memory).
 3. Inspect `.agents/skills/*/SKILL.md` if any exist, and load every runtime project skill whose trigger matches the work.
 4. Inspect legacy runtime skills listed below when the user request matches their frontmatter trigger.
 5. Inspect code, docs, tests, and existing project instructions as ground truth.
-6. Ask the user only for irreducible product/design/risk decisions.
+6. Ask the user only for irreducible product/design/risk decisions. For non-trivial work, the goal and plan are user-owned decisions gated by the "Plan before non-trivial work" Human approval gate.
 
 ### Git Worktrees
 
 Assistants must not create git worktrees on their own. Create a git worktree only when the user explicitly asks for it or approves it.
+
+After a git worktree is created — or after an old checkout is updated to the
+local-only SOW model — run `.agents/sow/worktree-link.sh`. It builds the SOW
+queues and symlinks `.agents/sow/q`, `.agents/sow/specs`, `.local`, and `.env`
+to the origin checkout, so SOW working memory is shared per-developer rather than
+re-created per worktree. (Exception: a worktree that already has its own real
+`.env` keeps it and is not relinked, so per-worktree secrets are never
+overwritten.) The script is idempotent, never loses data on a name collision,
+re-points a symlink whose origin moved, and refuses to run in a worktree whose
+origin checkout is not yet on this model (it prints how to update the origin
+first).
 
 ### Sensitive Data In Durable Artifacts
 
@@ -102,6 +434,37 @@ Write only sanitized evidence:
 
 If sensitive data is required to continue, stop and ask the user for a secure handling path. If sensitive data is found in a durable artifact, sanitize it before any commit. If sensitive data was already committed, tell the user and do not rewrite history without explicit approval.
 
+### Durable AI-Facing Artifact Formatting
+
+AI-facing durable artifacts include `AGENTS.md`, SOW specs, runtime project
+skills, public/operator skills, SOW templates, instruction bridge files, and
+other docs primarily written so future AI agents can execute repository rules
+correctly.
+
+When writing or updating these artifacts:
+
+- Structure for retrieval and scanning. Use headings, short sections, labeled
+  bullets, and numbered procedures so both humans and AI agents can find the
+  exact rule quickly.
+- Avoid dense multi-rule paragraphs. If a paragraph contains multiple
+  requirements, exceptions, or decision branches, split it into bullets or a
+  table.
+- Use tables only for matrices or comparisons where the cells stay short. Use
+  bullets for rules, workflows, checklists, and exception handling.
+- Put RFC-style requirement words (`MUST`, `MUST NOT`, `SHOULD`, `MAY`) close
+  to the action they govern. Do not hide mandatory behavior in explanatory
+  prose.
+- Prefer labeled bullets for operational guardrails, such as `Target`,
+  `Exception handling`, `Validation`, or `Failure mode`.
+- Keep one durable idea per bullet. If a bullet needs multiple sentences, the
+  first sentence states the rule and later sentences provide evidence,
+  rationale, or examples.
+- For a guardrail with several distinct requirements, use a labeled parent
+  bullet with an indented sub-list — one requirement per sub-bullet — rather than
+  a multi-requirement paragraph; keep a single rule-plus-rationale as one bullet.
+- Preserve precision over brevity. Formatting is for readability, not for
+  weakening contracts or removing necessary evidence.
+
 ### Open-Source Reference Evidence
 
 When SOW evidence comes from other open-source repositories, cite the upstream repository and checked commit instead of the workstation absolute path.
@@ -117,9 +480,9 @@ Resolve `owner/repo` from the repository remote, record the checked commit, and 
 
 ### Pre-Implementation Gate
 
-Implementation must not begin until the active SOW contains a concrete `## Pre-Implementation Gate` section. Before moving a SOW from `pending/open` to `current/in-progress`, or before continuing implementation in an existing current SOW that lacks this section, fill the gate.
+Implementation must not begin until the local SOW contains a concrete `## Pre-Implementation Gate` section with `Status: ready` or `Status: in-progress`. Before changing implementation files, or before continuing implementation in an existing SOW that lacks this section, fill the gate. Reaching `Status: ready` additionally requires the "Plan before non-trivial work" Human approval gate (explicit user approval of the goal and plan).
 
-The gate must record the problem/root-cause model, evidence reviewed, affected contracts and surfaces, existing patterns to reuse, risk and blast radius, sensitive data handling plan, implementation plan, validation plan, artifact impact plan, and open decisions. The sensitive data plan must cover SOWs, specs, documentation, project skills, agent instructions, and code comments. Generic placeholders such as `TBD`, `N/A`, or "to be checked later" are invalid unless the SOW explains why the item truly does not apply. If the gate exposes an unknown that cannot be resolved by investigation, stop and ask the user before implementation.
+The gate must record the problem/root-cause model, evidence reviewed, affected contracts and surfaces, the clean-end-state target (its removed-redundant and excluded-coupled items, and the reference search where a path or contract is replaced), existing patterns to reuse, risk and blast radius, sensitive data handling plan, implementation plan, validation plan, artifact impact plan, and open decisions. The sensitive data plan must cover SOWs, specs, documentation, project skills, agent instructions, and code comments. Generic placeholders such as `TBD`, `N/A`, or "to be checked later" are invalid unless the SOW explains why the item truly does not apply. If the gate exposes an unknown that cannot be resolved by investigation, stop and ask the user before implementation.
 
 ### When A SOW Is Required
 
@@ -145,49 +508,128 @@ Trivial work does not need a SOW:
 - typo fixes;
 - formatting-only changes;
 - mechanical rename with no behavior change;
-- simple search/replace with low risk.
+- simple search/replace with low risk (still grep for the old token to confirm no call sites are missed).
 
 When unsure, treat the work as non-trivial.
 
-### SOW Locations
+### SOW Locations And Naming
 
-- Pending: `.agents/sow/pending/`
-- Current: `.agents/sow/current/`
-- Done: `.agents/sow/done/`
-- Specs: `.agents/sow/specs/`
-- Template for new SOWs: `.agents/sow/SOW.template.md`
-- Local audit: `.agents/sow/audit.sh`
+- SOW queues (local-only): `.agents/sow/q/` with sub-queues `pending/`,
+  `current/`, `active/`, `done/`. Move a SOW file between these as its state
+  changes; the whole `q/` tree is gitignored.
+- Specs (local-only): `.agents/sow/specs/`
+- Template for new SOWs (committed): `.agents/sow/SOW.template.md`
+- Local audit (committed): `.agents/sow/audit.sh`
+- Worktree/queue setup (committed): `.agents/sow/worktree-link.sh`
+
+SOW working files and specs are never committed. `.gitignore` ignores
+`/.agents/sow/q` and `/.agents/sow/specs`; only the framework files above are
+tracked. The queue directories are created locally by
+`.agents/sow/worktree-link.sh`, not by committed `.gitkeep` markers, so there is
+no committed SOW layout to preserve.
+
+Worktree model: SOW working memory is shared per-developer, not per-worktree.
+In a linked worktree, `.agents/sow/worktree-link.sh` symlinks `.agents/sow/q`,
+`.agents/sow/specs`, `.local`, and `.env` to the origin checkout, and migrates
+any pre-existing top-level queue dirs into `q/` without data loss.
 
 Create new SOW files from `.agents/sow/SOW.template.md`. The template is project-local and may be customized for this repository.
 
-Empty SOW directories must contain `.gitkeep` or `.keep` so the committed repository preserves the full SOW layout after clone/checkout.
+### Local SOW Parking
+
+Users may keep private paused, abandoned, or not-yet-public SOW drafts under
+`<repo-root>/.local/sow/`. This directory is gitignored and outside the project
+SOW lifecycle.
+
+Use `<repo-root>/.local/sow/` when the user wants to preserve work locally
+without creating a public or team-visible GitHub issue yet.
+
+Local parked SOWs are private memory only:
+
+- they are not durable project memory;
+- they are not visible to other contributors;
+- they are not acceptable as the only tracking for work that must coordinate a
+  team, block a merge, or survive across machines.
+
+Deferred work has two valid tracking paths:
+
+- public or team-visible follow-up: GitHub issue;
+- private or local follow-up: `<repo-root>/.local/sow/`.
+
+Active implementation work still MUST use the `.agents/sow/q/` queues. SOW
+working files are never committed (the `q/` tree is gitignored), so there is no
+commit-for-handoff and no remove-before-merge step.
+
+Destructive local deletion guard:
+
+- Assistants MUST NOT use `rm`, `apply_patch` delete hunks, editor delete
+  operations, or any equivalent filesystem operation to remove a SOW working
+  file from the local checkout unless the user explicitly asks to discard the
+  local SOW.
+- SOW working files are local-only and gitignored, so there is no tracked SOW to
+  untrack and no merge guard to clear.
+- Moving a SOW between `.agents/sow/q/` sub-queues (for example `current/` →
+  `done/`) is normal lifecycle, not deletion.
 
 Filename:
 
 ```text
-SOW-NNNN-YYYYMMDD-{slug}.md
+SOW-YYYYMMDD-{slug}.md
 ```
 
-Status and directory must agree:
+Use the creation date plus a descriptive slug. There is no sequential `NNNN`
+counter because it cannot be allocated safely across parallel branches.
 
-- `open` lives in `pending/`
-- `in-progress` lives in `current/`
-- `paused` lives in `current/`
-- `completed` lives in `done/`
-- `closed` lives in `done/`
+SOW state lives in the file's `Status:` field:
 
-### SOW Completion And Commit
+- `planning` - analysis or decisions are incomplete; implementation is blocked.
+- `ready` - the Pre-Implementation Gate is complete and, where the goal-approval round ("Plan before non-trivial work") applies, the user has approved the goal and plan; implementation can start.
+- `in-progress` - implementation is underway.
+- `paused` - work is intentionally stopped but may resume on the branch.
+- `completed` - work is validated and durable memory has been transferred. The
+  SOW file is local-only and never committed; it MAY be moved to
+  `.agents/sow/q/done/` as local history or deleted locally at the user's
+  request. Never delete it without the user asking.
 
-The successful terminal SOW status is `completed`. `done` is a directory name, not a status value. Never write `Status: done` or `Status: complete`.
+### SOW Completion And Merge
 
-When a SOW's work is ready to close:
+The successful terminal SOW status is `completed`.
 
-1. Finish implementation, docs, specs, skills, validation, and follow-up mapping.
-2. Update the SOW to `Status: completed`.
-3. Move the SOW file to `.agents/sow/done/`.
-4. Commit the work, artifact updates, SOW status change, and SOW move together as one commit, unless the user explicitly requested a different commit split.
+When a SOW's work is ready to merge:
 
-Do not create a separate commit just to mark or move the SOW. Do not claim a SOW is completed while the implementation and the SOW lifecycle change live in separate uncommitted or separately committed states.
+1. Finish implementation, docs, skills, validation, and follow-up mapping.
+2. Transfer all durable knowledge into project skills, docs, code, and tests
+   (and specs once specs are re-introduced to git). After this step, the SOW
+   body MUST hold nothing durable that is not captured elsewhere.
+3. Update the SOW to `Status: completed`.
+
+SOW working files are never committed (they live under the gitignored
+`.agents/sow/q/`), so there is no "remove SOW from git before merge" step and no
+CI merge guard to clear. A completed SOW MAY stay in `.agents/sow/q/done/` as
+local history or be deleted locally at the user's discretion — never delete a
+local SOW working file without the user's request (see the deletion guard above).
+
+### Enforcement
+
+The SOW system is enforced by local audit tooling and CI:
+
+- `.agents/sow/audit.sh` is the local consistency audit for SOW rules, the
+  local-only queue/spec layout, framework files, and sensitive-data scanning.
+- `.agents/sow/scan-sensitive.sh` is the shared sensitive-data scanner used by
+  local audit and CI.
+- `.agents/sow/worktree-link.sh` builds the local queues and links a worktree's
+  SOW working memory to its origin checkout.
+- `.github/workflows/sow.yml` rejects pull requests that commit SOW working
+  files or specs — anything under `.agents/sow/q/**`, `.agents/sow/specs/**`, or
+  a stray `.agents/sow/{active,pending,current,done}/SOW-*.md`. These paths are
+  local-only and gitignored; a hit means the file was force-added and MUST be
+  removed before merge.
+- The same workflow scans changed instruction, skill, and framework files for
+  raw sensitive data.
+
+These checks are guards, not substitutes for the SOW Validation Gate. The
+assistant still owns transferring durable knowledge out of the SOW before
+merge.
 
 ### One SOW At A Time
 
@@ -195,10 +637,11 @@ Never execute multiple SOWs as one batch.
 
 If work overlaps:
 
-- merge or consolidate before implementation; or
+- coordinate through the relevant open PRs and issues;
+- merge or consolidate branches before implementation; or
 - split into separate SOWs and complete one before starting the next.
 
-Progress reports are not stop points. Once a SOW is in progress, continue until it is delivered, failed with evidence, blocked on a real user decision/approval, or superseded by newer user instructions.
+Progress reports are not stop points (re-evaluating against the target per the Clean-end-state rule is not itself a stop point). Once a SOW is in progress and its goal/plan approval is recorded ("Plan before non-trivial work"), continue until it is delivered, failed with evidence, blocked on a real user decision/approval, or superseded by newer user instructions.
 
 ### User Decisions
 
@@ -208,7 +651,7 @@ When user decisions are needed:
 2. Provide numbered options.
 3. Explain pros, cons, implications, and risks.
 4. Recommend one option with reasoning.
-5. Record the user's decision in the SOW before implementation.
+5. Record the user's decision in the SOW before implementation. For the goal/plan approval round, the bar is the "Plan before non-trivial work" Human approval gate.
 
 ### Followup Discipline
 
@@ -218,7 +661,7 @@ Before a SOW can close, every valid deferred item must be:
 
 - implemented in the current SOW; or
 - explicitly rejected as not worth doing, with evidence; or
-- represented by a real pending/current SOW file.
+- represented by a GitHub issue linked from the current SOW or PR.
 
 Pre-close, search the SOW for:
 
@@ -230,36 +673,41 @@ Map every remaining item to implemented, rejected, or tracked.
 
 ### Regressions
 
-A regression is discovered after a SOW was considered completed or closed, later testing or use finds broken behavior, and the original SOW's claimed outcome is no longer true.
+A regression is broken behavior discovered after a SOW's work merged, where the
+original claimed outcome is no longer true.
 
-When behavior that a completed SOW claimed working stops working:
+Because completed SOWs are not retained on `master`, a regression is handled as
+new work:
 
-1. Find the original SOW in `done/`.
-2. Move it back to `current/`.
-3. Mark it `in-progress` with a regression note in `## Status`.
-4. Append a new dated `## Regression - YYYY-MM-DD` section at the end of the file, after the original outcome, lessons, and follow-up content.
-5. In that appended section, record what broke, evidence, why previous validation missed it, the repair plan, validation, and updates needed to specs, skills, docs, audits, or follow-up SOWs.
-6. Fix and validate there.
+1. Open a new local SOW under `.agents/sow/q/active/`.
+2. In `## Requirements`, link the prior work: `Regresses: PR #NNNNN` and cite
+   any known commit, spec, issue, or test evidence.
+3. Run the normal Pre-Implementation Gate and Validation for the new SOW.
+4. Update the relevant spec, skill, doc, code, or test so durable memory reflects
+   current reality.
 
-Never prepend regression content above the original SOW narrative. The original requirements, analysis, plan, validation, outcome, lessons, and follow-up must remain readable first.
-Do not create a new SOW for a true regression.
+Do not attempt to resurrect or mutate a prior SOW.
 
 ### Validation Gate
 
 A SOW cannot be completed until Validation records:
 
 - acceptance criteria evidence;
+- clean-end-state evidence: the delivered state matches the clean end state recorded in the SOW, including its recorded list of removed-redundant and excluded coupled items (and, where a path or contract was replaced, the recorded reference search), or an explicit user approval for a non-clean state is recorded and linked;
+- deferred clean-end-state remainder: any clean-end-state work deferred under an approved partial (exception (d)) or otherwise tracked rather than done is listed with why deferral was acceptable and when (or under what condition) it lands;
 - tests or equivalent validation;
 - real-use evidence when a runnable path exists;
 - reviewer findings and how they were handled;
 - same-failure search results;
 - artifact maintenance gate for `AGENTS.md`, runtime project skills, specs, end-user/operator docs, end-user/operator skills, and SOW lifecycle;
-- SOW status/directory consistency;
+- local-only SOW layout respected: no SOW working file or spec was committed
+  (they stay under the gitignored `.agents/sow/q/` and `.agents/sow/specs/`);
 - spec update or specific reason no spec update was needed;
 - project skill update or specific reason no skill update was needed;
 - end-user/operator docs update or evidence-backed reason none were affected;
 - end-user/operator skill update or evidence-backed reason none were affected by docs/spec changes;
 - lessons extracted or specific reason there were none;
+- workflow-friction triage: each recorded `Workflow Friction & Rule Gaps` note resolved to a rule update (`AGENTS.md`, project skill, spec, or SOW template), an evidence-backed rejection, or a tracked follow-up (or an explicit "none arose");
 - follow-up mapping.
 
 Generic "N/A" is invalid.
@@ -273,7 +721,7 @@ Every SOW close must explicitly record whether each durable artifact class was u
 - Specs - `.agents/sow/specs/` for WHAT the project does.
 - End-user/operator docs - README, docs site, runbooks, published guides, help text, or other human-facing documentation.
 - End-user/operator skills - output/reference skills copied or consumed outside normal repo work.
-- SOW lifecycle - split, merge, status, directory, deferred work, regression reopening, and follow-up mapping.
+- SOW lifecycle - local-only SOW under `.agents/sow/q/` (never committed), durable memory transfer, deferred work tracked as GitHub issues, and regressions handled as new linked SOWs.
 
 This is an assistant responsibility. If a SOW changes behavior, docs, specs, commands, schemas, defaults, workflows, examples, or operating procedure, the assistant must update every affected artifact in the same SOW, or record the evidence-backed reason an artifact is unaffected.
 
@@ -281,7 +729,20 @@ This is an assistant responsibility. If a SOW changes behavior, docs, specs, com
 
 Specs are memory of WHAT this project does.
 
-This repository is bootstrapped incrementally. The existing source tree and public documentation remain the primary ground truth. SOW specs under `.agents/sow/specs/` should capture durable project decisions, cross-cutting behavioral rules, and area-specific contracts as they are worked.
+Specs currently live under `.agents/sow/specs/` as **local-only** memory
+(gitignored, not committed). They are being reorganized and will be
+re-introduced to git later as a deliberate decision; until then they are
+per-developer local memory, shared across worktrees by
+`.agents/sow/worktree-link.sh`. Durable contracts that must be shared with the
+team right now belong in project skills, docs, code, and tests.
+
+This repository is bootstrapped incrementally. The existing source tree and public documentation remain the primary ground truth. Specs under `.agents/sow/specs/` capture durable project decisions, cross-cutting behavioral rules, and area-specific contracts as they are worked.
+
+`.agents/sow/specs/` stays flat until scale proves hierarchy is needed. Use
+`<domain>-<topic>.md` names, one durable contract or cross-cutting rule per file,
+and update `.agents/sow/specs/README.md` in the same change. Do not split specs
+by repository path; specs are organized by contract ownership, not source-file
+location.
 
 Update specs when shipped work changes:
 
@@ -352,6 +813,10 @@ Runtime input skills:
   Trigger: editing SNMP profile YAMLs, topology SNMP profiles, ddsnmp profile parsing, or SNMP profile-format documentation.
   Purpose: require MIB `MAX-ACCESS` checks and index-derived extraction for `not-accessible` INDEX objects.
 
+- `.agents/skills/project-snmp-trap-profiles-authoring/`
+  Trigger: editing SNMP trap profile YAMLs under `src/go/plugin/go.d/config/go.d/snmp.trap-profiles/`, the trap profile-format documentation, the `src/go/cmd/snmptrapprofilegen/` Go helper, or running a regeneration of the OOB trap profile pack.
+  Purpose: enforce the closed 8-category / 8-severity taxonomy, the file-scoped `varbinds:` table pattern, cardinality discipline on `labels:`, and stock/operator separation. Documents the regeneration recipe.
+
 - `.agents/skills/project-writing-collectors/`
   Trigger: authoring or modifying any Netdata data-collection plugin or module (Go go.d / ibm.d, Rust crates, internal C plugins, external plugins via PLUGINSD). Read before adding a new collector, modifying an existing one, working on NetFlow/sFlow/IPFIX, OTEL ingestion, topology, SNMP profiles, or interactive Functions.
   Status: live. Updates that close gaps or fix outdated pointers must ship in the same PR that exposed the issue.
@@ -400,7 +865,7 @@ Runtime input skills:
 
 - `.agents/skills/codacy-audit/`
   Trigger: Codacy Cloud workflow for this repository -- pre-push local analysis (`codacy-analysis-cli` via docker or local binary) and read-only PR-issue fetching via the v3 API.
-  Status: live. SKILL.md plus `scripts/_lib.sh` (token-safe wrappers + sentinel no-leak self-test), `scripts/analyze-local.sh`, `scripts/pr-issues.sh`, and a live `how-tos/INDEX.md` catalog. Read-only by design; write actions deferred to a future SOW.
+  Status: live. SKILL.md plus `scripts/_lib.sh` (token-safe wrappers + sentinel no-leak self-test), `scripts/analyze-local.sh`, `scripts/pr-issues.sh`, and a live `how-tos/INDEX.md` catalog. Read-only by design; write actions require a GitHub issue or branch-local SOW.
 
 Public skills (canonical under `docs/netdata-ai/skills/<name>/`; relative symlinks at `.agents/skills/<name>`):
 
@@ -413,6 +878,11 @@ Public skills (canonical under `docs/netdata-ai/skills/<name>/`; relative symlin
   Trigger: querying Netdata Agents directly on port 19999, including auto-mint of per-agent bearer tokens from a Cloud token.
   Symlink: `.agents/skills/query-netdata-agents` -> `../../docs/netdata-ai/skills/query-netdata-agents`.
   Status: live. SKILL.md plus `scripts/_lib.sh` helpers (`agents_resolve_bearer`, `agents_call_function`, `agents_netdata_prefix`).
+
+- `docs/netdata-ai/skills/query-snmp-traps/`
+  Trigger: querying SNMP trap logs through Netdata Cloud or directly from a Netdata Agent; use for trap journal entries, severities, categories, senders, deduplication summaries, `TRAP_*` fields, and `TRAP_JSON` varbind searches.
+  Symlink: `.agents/skills/query-snmp-traps` -> `../../docs/netdata-ai/skills/query-snmp-traps`.
+  Status: live. SKILL.md plus `how-tos/INDEX.md` and seeded operator how-tos.
 
 Output/reference skills:
 

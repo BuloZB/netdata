@@ -2,6 +2,7 @@
 
 #include "rrd.h"
 #include "rrdfunctions-internals.h"
+#include "streaming/protocol/commands.h"
 
 #define MAX_FUNCTION_LENGTH (PLUGINSD_LINE_MAX - 512) // we need some space for the rest of the line
 
@@ -19,6 +20,7 @@ static void rrd_functions_insert_callback(const DICTIONARY_ITEM *item __maybe_un
     rrd_collector_started();
     rdcf->collector = rrd_collector_acquire_current_thread();
     rdcf->rrdhost_state_id = object_state_id(&host->state_id);
+    rdcf->unregistered = false;
 
     if(!rdcf->priority)
         rdcf->priority = RRDFUNCTIONS_PRIORITY_DEFAULT;
@@ -49,6 +51,11 @@ static bool rrd_functions_conflict_callback(const DICTIONARY_ITEM *item __maybe_
     rrd_collector_started();
 
     bool changed = false;
+
+    if(__atomic_load_n(&rdcf->unregistered, __ATOMIC_ACQUIRE)) {
+        __atomic_store_n(&rdcf->unregistered, false, __ATOMIC_RELEASE);
+        changed = true;
+    }
 
     if(rdcf->collector != thread_rrd_collector) {
         nd_log(NDLS_DAEMON, NDLP_DEBUG,
@@ -194,7 +201,7 @@ static inline bool is_function_dyncfg(const char *name) {
         return false;
 
     char c = name[sizeof(PLUGINSD_FUNCTION_CONFIG) - 1];
-    if(c == 0 || isspace(c))
+    if(c == 0 || isspace((uint8_t)c))
         return true;
 
     return false;
@@ -227,8 +234,9 @@ void rrd_function_add(RRDHOST *host, RRDSET *st, const char *name, int timeout, 
     if(st && !st->functions_view)
         st->functions_view = dictionary_create_view(host->functions);
 
-    char key[strlen(name) + 1];
-    rrd_functions_sanitize(key, name, sizeof(key));
+    size_t key_size = rrd_functions_strlen_bounded(name, PLUGINSD_LINE_MAX) + 1;
+    CLEAN_CHAR_P *key = mallocz(key_size);
+    rrd_functions_sanitize(key, name, key_size);
 
     struct rrd_host_function tmp = {
         .collector = NULL,
@@ -253,27 +261,100 @@ void rrd_function_add(RRDHOST *host, RRDSET *st, const char *name, int timeout, 
     dictionary_acquired_item_release(host->functions, item);
 }
 
-void rrd_function_del(RRDHOST *host, RRDSET *st, const char *name) {
-    char key[strlen(name) + 1];
-    rrd_functions_sanitize(key, name, sizeof(key));
-    dictionary_del(host->functions, key);
+bool rrd_function_del(RRDHOST *host, RRDSET *st, const char *name, bool from_streaming, bool internal) {
+    if(unlikely(!name || !*name))
+        return false;
 
-    if(st)
+    size_t key_size = rrd_functions_strlen_bounded(name, PLUGINSD_LINE_MAX) + 1;
+    CLEAN_CHAR_P *key = mallocz(key_size);
+    rrd_functions_sanitize(key, name, key_size);
+
+    const DICTIONARY_ITEM *item = dictionary_get_and_acquire_item(host->functions, key);
+    if(!item)
+        return false;
+
+    struct rrd_host_function *rdcf = dictionary_acquired_item_value(item);
+
+    if(!from_streaming && !internal) {
+        if(!thread_rrd_collector || rdcf->collector != thread_rrd_collector) {
+            nd_log(NDLS_DAEMON, NDLP_WARNING,
+                   "FUNCTIONS: refusing to unregister function '%s' - "
+                   "collector mismatch (registered by %s, unregister requested by %s)",
+                   name,
+                   rdcf->collector ? "another collector" : "unknown",
+                   thread_rrd_collector ? "current collector" : "non-collector thread");
+            dictionary_acquired_item_release(host->functions, item);
+            return false;
+        }
+    }
+
+    // dyncfg config functions are intentionally never streamed to parents
+    // (stream_sender_send_global_rrdhost_functions skips RRD_FUNCTION_DYNCFG),
+    // so their removals must not be streamed either. Capture this before releasing.
+    bool is_dyncfg = (rdcf->options & RRD_FUNCTION_DYNCFG);
+
+    // The FUNCTION_DEL protocol command (from external plugins or streaming
+    // children) must never remove dyncfg config functions; those are owned and
+    // removed exclusively by the dyncfg subsystem (internal deletes).
+    if(!internal && is_dyncfg) {
+        nd_log(NDLS_DAEMON, NDLP_WARNING,
+               "FUNCTIONS: refusing to unregister dyncfg function '%s' via FUNCTION_DEL", name);
+        dictionary_acquired_item_release(host->functions, item);
+        return false;
+    }
+
+    // Mark the function unregistered before removing it from the dictionary.
+    // The flag makes the function unavailable to any thread that already holds
+    // an acquired reference during the delete window (it cannot be freed until
+    // that reference is released), and lets rrd_functions_find_by_name() report
+    // a specific "unregistered by the plugin" error in that window.
+    __atomic_store_n(&rdcf->unregistered, true, __ATOMIC_RELEASE);
+
+    if(st && st->functions_view)
         dictionary_del(st->functions_view, key);
-    else
+
+    // Delete from the index while still holding our acquired reference, then
+    // release: this unlinks the item before any concurrent re-registration could
+    // resurrect it through the conflict callback (a re-add now allocates a fresh
+    // item). The value is freed once the last reference - this one plus any
+    // in-flight execution - is released.
+    dictionary_del(host->functions, key);
+    dictionary_acquired_item_release(host->functions, item);
+
+    if(!st && !is_dyncfg)
+        stream_send_function_del(host, key);
+
+    if(!st)
         rrdhost_flag_set(host, RRDHOST_FLAG_GLOBAL_FUNCTIONS_UPDATED);
 
     dictionary_garbage_collect(host->functions);
+
+    return true;
+}
+
+bool rrd_function_is_available(struct rrd_host_function *rdcf, RRDHOST *host) {
+    if(__atomic_load_n(&rdcf->unregistered, __ATOMIC_ACQUIRE))
+        return false;
+
+    if(!rrd_collector_running(rdcf->collector))
+        return false;
+
+    if(host && rdcf->rrdhost_state_id != object_state_id(&host->state_id))
+        return false;
+
+    return true;
 }
 
 int rrd_functions_find_by_name(RRDHOST *host, BUFFER *wb, const char *name, size_t key_length, const DICTIONARY_ITEM **item) {
     char buffer[MAX_FUNCTION_LENGTH + 1];
     strncpyz(buffer, name, sizeof(buffer) - 1);
+    key_length = strnlen(buffer, sizeof(buffer));
     char *s = NULL;
 
     OBJECT_STATE_ID state_id = object_state_id(&host->state_id);
 
     bool found = false;
+    bool was_unregistered = false;
     *item = NULL;
     if(host->functions) {
         while (buffer[0]) {
@@ -281,7 +362,7 @@ int rrd_functions_find_by_name(RRDHOST *host, BUFFER *wb, const char *name, size
                 found = true;
 
                 struct rrd_host_function *rdcf = dictionary_acquired_item_value(*item);
-                if(rrd_collector_running(rdcf->collector) && rdcf->rrdhost_state_id == state_id) {
+                if(rrd_function_is_available(rdcf, host)) {
                     break;
                 }
                 else {
@@ -298,6 +379,7 @@ int rrd_functions_find_by_name(RRDHOST *host, BUFFER *wb, const char *name, size
                            rrdhost_ingestion_hops(host)
                            );
 
+                    was_unregistered = __atomic_load_n(&rdcf->unregistered, __ATOMIC_ACQUIRE);
                     dictionary_acquired_item_release(host->functions, *item);
                     *item = NULL;
                 }
@@ -319,10 +401,16 @@ int rrd_functions_find_by_name(RRDHOST *host, BUFFER *wb, const char *name, size
     buffer_flush(wb);
 
     if(!(*item)) {
-        if(found)
-            return rrd_call_function_error(wb,
-                                           "The plugin that registered this feature, is not currently running.",
-                                           HTTP_RESP_SERVICE_UNAVAILABLE);
+        if(found) {
+            if(was_unregistered)
+                return rrd_call_function_error(wb,
+                                               "This function has been unregistered by the plugin.",
+                                               HTTP_RESP_SERVICE_UNAVAILABLE);
+            else
+                return rrd_call_function_error(wb,
+                                               "The plugin that registered this feature, is not currently running.",
+                                               HTTP_RESP_SERVICE_UNAVAILABLE);
+        }
         else
             return rrd_call_function_error(wb,
                                            "This feature is not available on this host at this time.",
@@ -340,7 +428,7 @@ bool rrd_function_available(RRDHOST *host, const char *function) {
     const DICTIONARY_ITEM *item = dictionary_get_and_acquire_item(host->functions, function);
     if(item) {
         struct rrd_host_function *rdcf = dictionary_acquired_item_value(item);
-        if(rrd_collector_running(rdcf->collector) && rdcf->rrdhost_state_id == object_state_id(&host->state_id))
+        if(rrd_function_is_available(rdcf, host))
             ret = true;
 
         dictionary_acquired_item_release(host->functions, item);

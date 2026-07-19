@@ -534,11 +534,6 @@ void read_collector_values(int *disable_cgroups, int update_every, netdata_ebpf_
         ebpf_parse_service_name_section(&collector_config);
     }
 
-    enabled = inicfg_get_boolean(&collector_config, EBPF_PROGRAMS_SECTION, "cachestat", CONFIG_BOOLEAN_NO);
-    if (enabled) {
-        ebpf_enable_chart(EBPF_MODULE_CACHESTAT_IDX, *disable_cgroups);
-    }
-
     enabled = inicfg_get_boolean(&collector_config, EBPF_PROGRAMS_SECTION, "sync", CONFIG_BOOLEAN_YES);
     if (enabled) {
         ebpf_enable_chart(EBPF_MODULE_SYNC_IDX, *disable_cgroups);
@@ -656,7 +651,7 @@ static void ebpf_link_hostnames(const char *parse)
     char *clean = move;
     while (likely(move)) {
         // Find the first valid value
-        while (isspace(*move))
+        while (isspace((uint8_t)*move))
             move++;
 
         // No valid value found
@@ -1182,7 +1177,7 @@ void ebpf_parse_ips_unsafe(const char *ptr)
 
     while (likely(ptr)) {
         // Move forward until next valid character
-        while (isspace(*ptr))
+        while (isspace((uint8_t)*ptr))
             ptr++;
 
         // No valid value found
@@ -1522,7 +1517,7 @@ void ebpf_parse_ports(const char *ptr)
 
     while (likely(ptr)) {
         // Move forward until next valid character
-        while (isspace(*ptr))
+        while (isspace((uint8_t)*ptr))
             ptr++;
 
         // No valid value found
@@ -1541,10 +1536,10 @@ void ebpf_parse_ports(const char *ptr)
             ptr++;
         }
 
-        if (isdigit(*ptr)) { // Parse port
+        if (isdigit((uint8_t)*ptr)) { // Parse port
             ebpf_parse_port_list(
                 neg ? (void **)&network_viewer_opt.excluded_port : (void **)&network_viewer_opt.included_port, ptr);
-        } else if (isalpha(*ptr)) { // Parse service
+        } else if (isalpha((uint8_t)*ptr)) { // Parse service
             ebpf_parse_service_list(
                 neg ? (void **)&network_viewer_opt.excluded_port : (void **)&network_viewer_opt.included_port, ptr);
         } else if (*ptr == '*') { // All
@@ -1666,8 +1661,6 @@ void ebpf_print_help()
         " [-]-global            Disable charts per application and cgroup.\n"
         "\n"
         " [-]-all               Enable all chart groups (global, apps, and cgroup), unless -g is also given.\n"
-        "\n"
-        " [-]-cachestat         Enable charts related to process run time.\n"
         "\n"
         " [-]-dcstat            Enable charts related to directory cache.\n"
         "\n"

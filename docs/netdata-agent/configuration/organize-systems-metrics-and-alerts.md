@@ -63,27 +63,7 @@ Learn more in our [Spaces and Rooms documentation](/docs/netdata-cloud/organize-
 
 Virtual nodes let you split multi-component systems into distinct, monitorable units. For example, you can monitor each Windows server in your infrastructure as its own node, even when collecting metrics through a single Netdata Agent.
 
-To create a virtual node for your Windows server:
-
-1. Define the virtual node in `/etc/netdata/vnodes/vnodes.conf`:
-
-    ```yaml
-    - hostname: win_server1
-      guid: <value>
-    ```
-
-   :::tip
-   Generate a valid GUID using `uuidgen` on Linux or `[guid]::NewGuid()` in Windows PowerShell.
-   :::
-
-2. Add the vnode configuration to your data collection job in `go.d/windows.conf`:
-
-    ```yaml
-    jobs:
-      - name: win_server1
-        vnode: win_server1
-        url: http://203.0.113.10:9182/metrics
-    ```
+See [Virtual Nodes (vnodes)](/docs/learn/node-identities.md#virtual-nodes-vnodes) for the full reference: how to define a vnode via YAML or the dynamic configuration GUI, and how to attach it to a collector job.
 
 ## Host labels
 
@@ -102,11 +82,13 @@ Netdata automatically generates host labels when it starts, capturing:
 | Label Category | Information Captured                                |
 |----------------|-----------------------------------------------------|
 | System Info    | Kernel version, OS name and version                 |
-| Hardware       | CPU architecture, cores, frequency, RAM, disk space |
+| Hardware       | CPU architecture, cores, frequency, RAM, disk space, product ID, product name, product type |
 | Environment    | Container details, Kubernetes node status           |
 | Infrastructure | Virtualization layer, Parent-child streaming status |
 
 View your automatic labels at `http://HOST-IP:19999/api/v1/info`:
+
+Host-label values use Netdata's label sanitizer. For example, commas in hardware model identifiers are exposed as dots in host labels.
 
 ```json
 {
@@ -127,6 +109,25 @@ Add your own labels to categorize systems by any criteria you need.
     cd /etc/netdata   # Replace with your Netdata config directory
     sudo ./edit-config netdata.conf
     ```
+
+    :::note
+    On Windows, Netdata configuration lives at `C:\Program Files\Netdata\etc\netdata` (default install location) and there is no `sudo`. Open the bundled MSYS2 shell — for example `Win + R`, then `"C:\Program Files\Netdata\msys2.exe"` — and edit `netdata.conf`:
+
+    ```bash
+    cd /etc/netdata
+    ./edit-config netdata.conf
+    ```
+
+    `edit-config` opens the file in the `nano` editor. Add your `[host labels]` section and save it — the label naming rules, the `[host labels]` example, and the environment variable expansion in steps 2 and 3 work identically on Windows.
+
+    Reload labels without restarting the Agent, from an elevated PowerShell:
+
+    ```powershell
+    & "C:\Program Files\Netdata\usr\bin\netdatacli.exe" reload-labels
+    ```
+
+    Verify your labels at `http://HOST-IP:19999/api/v1/info`. See [editing configuration files on Windows](/packaging/windows/WINDOWS_INSTALLER.md#editing-configuration-files) for the full MSYS2 environment workflow.
+    :::
 
 2. Add a `[host labels]` section:
 

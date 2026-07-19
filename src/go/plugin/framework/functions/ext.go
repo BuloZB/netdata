@@ -2,9 +2,23 @@
 
 package functions
 
-import "strings"
+import (
+	"context"
+	"strings"
+)
 
 func (m *Manager) Register(name string, fn func(Function)) {
+	if fn == nil {
+		m.Warningf("not registering '%s': nil function", name)
+		return
+	}
+
+	m.RegisterWithContext(name, func(_ context.Context, f Function) {
+		fn(f)
+	})
+}
+
+func (m *Manager) RegisterWithContext(name string, fn Handler) {
 	if fn == nil {
 		m.Warningf("not registering '%s': nil function", name)
 		return
@@ -16,7 +30,7 @@ func (m *Manager) Register(name string, fn func(Function)) {
 	fs, ok := m.functionRegistry[name]
 	if !ok {
 		m.Debugf("registering function '%s' (direct)", name)
-		fs = &functionSet{prefixes: make(map[string]func(Function))}
+		fs = &functionSet{prefixes: make(map[string]Handler)}
 		m.functionRegistry[name] = fs
 	} else {
 		if fs.direct != nil {
@@ -44,6 +58,17 @@ func (m *Manager) RegisterPrefix(name, prefix string, fn func(Function)) {
 		m.Warningf("not registering '%s' with prefix '%s': nil function", name, prefix)
 		return
 	}
+
+	m.RegisterPrefixWithContext(name, prefix, func(_ context.Context, f Function) {
+		fn(f)
+	})
+}
+
+func (m *Manager) RegisterPrefixWithContext(name, prefix string, fn Handler) {
+	if fn == nil {
+		m.Warningf("not registering '%s' with prefix '%s': nil function", name, prefix)
+		return
+	}
 	if prefix == "" {
 		m.Warningf("not registering '%s': empty prefix", name)
 		return
@@ -54,7 +79,7 @@ func (m *Manager) RegisterPrefix(name, prefix string, fn func(Function)) {
 
 	fs := m.functionRegistry[name]
 	if fs == nil {
-		fs = &functionSet{prefixes: make(map[string]func(Function))}
+		fs = &functionSet{prefixes: make(map[string]Handler)}
 		m.functionRegistry[name] = fs
 	}
 
@@ -80,6 +105,32 @@ func (m *Manager) RegisterPrefix(name, prefix string, fn func(Function)) {
 	fs.prefixes[prefix] = fn
 }
 
+// RegisterPrefixLaneDeriver attaches a lane-key derivation callback to an
+// existing prefix registration. Registering for an unknown name/prefix is a
+// no-op with a warning; passing nil removes the deriver.
+func (m *Manager) RegisterPrefixLaneDeriver(name, prefix string, derive LaneKeyDeriver) {
+	m.mux.Lock()
+	defer m.mux.Unlock()
+
+	fs, ok := m.functionRegistry[name]
+	if !ok || fs.prefixes == nil {
+		m.Warningf("not attaching lane deriver to '%s' prefix '%s': not registered", name, prefix)
+		return
+	}
+	if _, exists := fs.prefixes[prefix]; !exists {
+		m.Warningf("not attaching lane deriver to '%s' prefix '%s': prefix not registered", name, prefix)
+		return
+	}
+	if derive == nil {
+		delete(fs.prefixDerivers, prefix)
+		return
+	}
+	if fs.prefixDerivers == nil {
+		fs.prefixDerivers = make(map[string]LaneKeyDeriver)
+	}
+	fs.prefixDerivers[prefix] = derive
+}
+
 func prefixesOverlap(a, b string) bool {
 	if a == "" || b == "" {
 		return false
@@ -100,6 +151,9 @@ func (m *Manager) UnregisterPrefix(name, prefix string) {
 	if _, exists := fs.prefixes[prefix]; exists {
 		m.Debugf("unregistering function '%s' with prefix '%s'", name, prefix)
 		delete(fs.prefixes, prefix)
+		// The deriver belongs to the registration: a later re-register of
+		// the same prefix must not inherit a stale deriver.
+		delete(fs.prefixDerivers, prefix)
 	}
 
 	if fs.direct == nil && len(fs.prefixes) == 0 {

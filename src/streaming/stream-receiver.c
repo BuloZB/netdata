@@ -143,16 +143,43 @@ static ssize_t read_stream(struct receiver_state *r, char* buffer, size_t size) 
 
 ALWAYS_INLINE
 static ssize_t receiver_read_uncompressed(struct receiver_state *r) {
-    internal_fatal(r->thread.uncompressed.read_buffer[r->thread.uncompressed.read_len] != '\0',
+    ssize_t read_len = r->thread.uncompressed.read_len;
+    if(unlikely(read_len < 0)) {
+        internal_fatal(true, "The line to read is too big! Already have %zd bytes in read_buffer.", read_len);
+        errno_clear();
+        return -2;
+    }
+
+    size_t read_offset = (size_t)read_len;
+    if(unlikely(read_offset >= sizeof(r->thread.uncompressed.read_buffer) - 1)) {
+        internal_fatal(true, "The line to read is too big! Already have %zd bytes in read_buffer.", read_len);
+        errno_clear();
+        return -2;
+    }
+
+    internal_fatal(r->thread.uncompressed.read_buffer[read_offset] != '\0',
                    "%s: read_buffer does not start with zero #2", __FUNCTION__ );
 
-    ssize_t bytes = read_stream(r, r->thread.uncompressed.read_buffer + r->thread.uncompressed.read_len, sizeof(r->thread.uncompressed.read_buffer) - r->thread.uncompressed.read_len - 1);
+    size_t available = sizeof(r->thread.uncompressed.read_buffer) - read_offset - 1;
+    char *dst = r->thread.uncompressed.read_buffer + read_offset;
+    ssize_t bytes = read_stream(r, dst, available);
     if(bytes > 0) {
+        size_t bytes_read = (size_t)bytes;
+        if(unlikely(bytes_read > available)) {
+            internal_fatal(true, "read_stream() returned %zd bytes with only %zu bytes available", bytes, available);
+            errno_clear();
+            return -2;
+        }
+
+        size_t new_read_len = read_offset + bytes_read;
         worker_set_metric(WORKER_RECEIVER_JOB_BYTES_READ, (NETDATA_DOUBLE)bytes);
         worker_set_metric(WORKER_RECEIVER_JOB_BYTES_UNCOMPRESSED, (NETDATA_DOUBLE)bytes);
 
-        r->thread.uncompressed.read_len += bytes;
-        r->thread.uncompressed.read_buffer[r->thread.uncompressed.read_len] = '\0';
+        r->thread.uncompressed.read_len = (ssize_t)new_read_len;
+        dst[bytes_read] = '\0';
+        r->thread.bytes_received += bytes;
+        if(likely(r->host))
+            single_writer_atomic_add(&r->host->stream.rcv.status.bytes_in, (uint64_t)bytes);
         pulse_stream_received_bytes(bytes);
     }
 
@@ -240,30 +267,56 @@ static decompressor_status_t receiver_get_decompressed(struct receiver_state *r)
     if (unlikely(!stream_decompressed_bytes_in_buffer(&r->thread.compressed.decompressor)))
         return DECOMPRESS_NEED_MORE_DATA;
 
-    size_t available = sizeof(r->thread.uncompressed.read_buffer) - r->thread.uncompressed.read_len - 1;
-    if (likely(available)) {
-        size_t len = stream_decompressor_get(
-            &r->thread.compressed.decompressor, r->thread.uncompressed.read_buffer + r->thread.uncompressed.read_len, available);
-        if (unlikely(!len)) {
-            internal_error(true, "decompressor returned zero length #1");
-            return DECOMPRESS_FAILED;
-        }
-
-        r->thread.uncompressed.read_len += (int)len;
-        r->thread.uncompressed.read_buffer[r->thread.uncompressed.read_len] = '\0';
-    }
-    else {
-        internal_fatal(true, "The line to read is too big! Already have %zd bytes in read_buffer.", r->thread.uncompressed.read_len);
+    ssize_t read_len = r->thread.uncompressed.read_len;
+    if(unlikely(read_len < 0)) {
+        internal_fatal(true, "The line to read is too big! Already have %zd bytes in read_buffer.", read_len);
         return DECOMPRESS_FAILED;
     }
+
+    size_t read_offset = (size_t)read_len;
+    if(unlikely(read_offset >= sizeof(r->thread.uncompressed.read_buffer) - 1)) {
+        internal_fatal(true, "The line to read is too big! Already have %zd bytes in read_buffer.", read_len);
+        return DECOMPRESS_FAILED;
+    }
+
+    size_t available = sizeof(r->thread.uncompressed.read_buffer) - read_offset - 1;
+    char *dst = r->thread.uncompressed.read_buffer + read_offset;
+    size_t len = stream_decompressor_get(
+        &r->thread.compressed.decompressor, dst, available);
+    if (unlikely(!len)) {
+        internal_error(true, "decompressor returned zero length #1");
+        return DECOMPRESS_FAILED;
+    }
+
+    if(unlikely(len > available)) {
+        internal_fatal(true, "decompressor returned %zu bytes with only %zu bytes available", len, available);
+        return DECOMPRESS_FAILED;
+    }
+
+    size_t new_read_len = read_offset + len;
+    r->thread.uncompressed.read_len = (ssize_t)new_read_len;
+    dst[len] = '\0';
 
     return DECOMPRESS_OK;
 }
 
 ALWAYS_INLINE_HOT_FLATTEN
 static ssize_t receiver_read_compressed(struct receiver_state *r) {
+    ssize_t read_len = r->thread.uncompressed.read_len;
+    if(unlikely(read_len < 0)) {
+        internal_fatal(true, "The line to read is too big! Already have %zd bytes in read_buffer.", read_len);
+        errno_clear();
+        return -2;
+    }
 
-    internal_fatal(r->thread.uncompressed.read_buffer[r->thread.uncompressed.read_len] != '\0',
+    size_t read_offset = (size_t)read_len;
+    if(unlikely(read_offset >= sizeof(r->thread.uncompressed.read_buffer) - 1)) {
+        internal_fatal(true, "The line to read is too big! Already have %zd bytes in read_buffer.", read_len);
+        errno_clear();
+        return -2;
+    }
+
+    internal_fatal(r->thread.uncompressed.read_buffer[read_offset] != '\0',
                    "%s: read_buffer does not start with zero #2", __FUNCTION__ );
 
     ssize_t bytes = read_stream(r, r->thread.compressed.buf + r->thread.compressed.used,
@@ -271,6 +324,9 @@ static ssize_t receiver_read_compressed(struct receiver_state *r) {
 
     if(bytes > 0) {
         r->thread.compressed.used += bytes;
+        r->thread.bytes_received += bytes;
+        if(likely(r->host))
+            single_writer_atomic_add(&r->host->stream.rcv.status.bytes_in, (uint64_t)bytes);
         worker_set_metric(WORKER_RECEIVER_JOB_BYTES_READ, (NETDATA_DOUBLE)bytes);
         pulse_stream_received_bytes(bytes);
     }
@@ -319,7 +375,7 @@ void stream_receiver_handle_op(struct stream_thread *sth, struct receiver_state 
         STREAM_CIRCULAR_BUFFER_STATS stats = *stream_circular_buffer_stats_unsafe(rpt->thread.send_to_child.scb);
         spinlock_unlock(&rpt->thread.send_to_child.spinlock);
         nd_log(NDLS_DAEMON, NDLP_ERR,
-               "STREAM RCV[%zu] '%s' [from [%s]:%s]: send buffer is full (buffer size %u, max %u, used %u, available %u). "
+               "STREAM RCV[%zu] '%s' [from [%s]:%s]: send buffer is full (buffer size %zu, max %zu, used %zu, available %zu). "
                "Restarting connection.",
                sth->id, rrdhost_hostname(rpt->host), rpt->remote_ip, rpt->remote_port,
                stats.bytes_size, stats.bytes_max_size, stats.bytes_outstanding, stats.bytes_available);
@@ -423,6 +479,11 @@ void stream_receiver_move_to_running_unsafe(struct stream_thread *sth, struct re
     rpt->thread.compressed.enabled = stream_decompression_initialize(rpt);
     buffered_reader_init(&rpt->thread.uncompressed);
 
+    // start fresh at admission: the no-traffic timeout must be measured from when we start
+    // reading (now), not from when the connection was accepted and queued.
+    rpt->thread.bytes_received = 0;
+    rpt->thread.last_traffic_ut = now_monotonic_usec();
+
     rpt->thread.line_buffer = buffer_create(sizeof(rpt->thread.uncompressed.read_buffer), NULL);
 
     // help preferred_sender_buffer() select the right buffer
@@ -500,8 +561,11 @@ static void stream_receiver_remove_internal(struct stream_thread *sth, struct re
 
     receiver_set_exit_reason(rpt, reason, false);
 
+    // rpt->host may be NULL here (e.g. removal on an early handshake failure,
+    // before the host is attached) -- this path null-checks it below at the
+    // iface/replication reads, so guard the log field too.
     ND_LOG_STACK lgs[] = {
-        ND_LOG_FIELD_STR(NDF_NIDL_NODE, rpt->host->hostname),
+        ND_LOG_FIELD_STR(NDF_NIDL_NODE, rpt->host ? rpt->host->hostname : NULL),
         ND_LOG_FIELD_TXT(NDF_SRC_IP, rpt->remote_ip),
         ND_LOG_FIELD_TXT(NDF_SRC_PORT, rpt->remote_port),
         ND_LOG_FIELD_CB(NDF_SRC_TRANSPORT, stream_receiver_log_transport, rpt),
@@ -516,16 +580,39 @@ static void stream_receiver_remove_internal(struct stream_thread *sth, struct re
     if(parser)
         count = parser->user.data_collections_count;
 
+    // gather diagnostics for a single, uniform disconnect line (same fields for every reason):
+    // bytes_in distinguishes "the child sent nothing" (network/silent) from "sent but unparsed";
+    // iface exposes the child's connection type (e.g. ppp0 cellular vs eth0) for log-side pivots.
+    size_t bytes_out = 0;
+    spinlock_lock(&rpt->thread.send_to_child.spinlock);
+    if(rpt->thread.send_to_child.scb)
+        bytes_out = stream_circular_buffer_stats_unsafe(rpt->thread.send_to_child.scb)->bytes_sent;
+    spinlock_unlock(&rpt->thread.send_to_child.spinlock);
+
+    char iface[64] = "";
+    if(rpt->host && rpt->host->rrdlabels)
+        rrdlabels_get_value_strcpyz(rpt->host->rrdlabels, iface, sizeof(iface), "_net_default_iface");
+
+    time_t connected_s = rpt->connected_since_s ? (now_realtime_sec() - rpt->connected_since_s) : 0;
+    long long idle_s = (long long)((now_monotonic_usec() - rpt->thread.last_traffic_ut) / USEC_PER_SEC);
+    double repl_pct = rpt->host ? rpt->host->stream.rcv.status.replication.percent : 0.0;
+
     errno_clear();
     nd_log(NDLS_DAEMON, NDLP_ERR,
-           "STREAM RCV[%zu] '%s' [from [%s]:%s]: "
-           "receiver disconnected (after %zu received messages): %s"
+           "STREAM RCV[%zu] '%s' [from [%s]:%s]: receiver disconnected: "
+           "reason=\"%s\" msgs=%zu bytes_in=%zu bytes_out=%zu connected=%llds idle=%llds repl=%.0f%% iface=%s"
            , sth->id
            , rpt->hostname ? rpt->hostname : "-"
            , rpt->remote_ip ? rpt->remote_ip : "-"
            , rpt->remote_port ? rpt->remote_port : "-"
+           , stream_handshake_error_to_string(reason)
            , count
-           , stream_handshake_error_to_string(reason));
+           , rpt->thread.bytes_received
+           , bytes_out
+           , (long long)connected_s
+           , idle_s
+           , repl_pct
+           , iface[0] ? iface : "-");
 
     internal_fatal(META_GET(&sth->run.meta, (Word_t)&rpt->thread.meta) == NULL,
                    "Receiver to be removed is not found in the list of receivers");
@@ -695,6 +782,8 @@ bool stream_receiver_send_data(struct stream_thread *sth, struct receiver_state 
             pulse_stream_sent_bytes(rc);
             rpt->thread.last_traffic_ut = now_ut;
             stream_circular_buffer_del_unsafe(scb, rc, now_ut);
+            if(likely(rpt->host))
+                single_writer_atomic_add(&rpt->host->stream.rcv.status.bytes_out, (uint64_t)rc);
             if (!stats->bytes_outstanding) {
                 rpt->thread.wanted = ND_POLL_READ;
                 if (!nd_poll_upd(sth->run.ndpl, rpt->sock.fd, rpt->thread.wanted))
@@ -773,6 +862,11 @@ bool stream_receiver_receive_data(struct stream_thread *sth, struct receiver_sta
     internal_fatal(sth->tid != gettid_cached(), "Function %s() should only be used by the dispatcher thread", __FUNCTION__ );
 
     PARSER *parser = __atomic_load_n(&rpt->thread.parser, __ATOMIC_RELAXED);
+    if(unlikely(!parser)) {
+        stream_receiver_remove(sth, rpt, STREAM_HANDSHAKE_RCV_DISCONNECT_PARSER_FAILED);
+        return false;
+    }
+
     ND_LOG_STACK lgs[] = {
         ND_LOG_FIELD_CB(NDF_REQUEST, line_splitter_reconstruct_line, &parser->line),
         ND_LOG_FIELD_CB(NDF_NIDL_NODE, parser_reconstruct_node, parser),
@@ -853,8 +947,15 @@ bool stream_receive_process_poll_events(struct stream_thread *sth, struct receiv
         return false;
     }
 
-    if (unlikely(events & (ND_POLL_ERROR | ND_POLL_HUP | ND_POLL_INVALID))) {
-        // we have errors on this socket
+    // ND_POLL_HUP together with ND_POLL_READ means the peer disconnected,
+    // but data it already delivered is still pending in the socket buffer.
+    // Removing the receiver here would discard that data, so keep reading:
+    // polling is level-triggered, both flags stay set while data remains,
+    // and when the buffer is drained recv() returns 0 and the read path
+    // removes the receiver with the same disconnect reason.
+    if (unlikely((events & (ND_POLL_ERROR | ND_POLL_INVALID)) ||
+                 ((events & ND_POLL_HUP) && !(events & ND_POLL_READ)))) {
+        // we have errors on this socket, or EOF with nothing left to read
 
         worker_is_busy(WORKER_STREAM_JOB_DISCONNECT_SOCKET_ERROR);
 
@@ -922,7 +1023,7 @@ void stream_receiver_check_all_nodes_from_poll(struct stream_thread *sth, usec_t
             stream_receiver_remove(sth, rpt, STREAM_HANDSHAKE_DISCONNECT_SOCKET_CLOSED_BY_REMOTE);
             continue;
         }
-        if (probe_rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        if (probe_rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
             // Socket error detected (keepalive timeout, etc.)
             // Save errno immediately as subsequent calls may modify it
             int saved_errno = errno;
@@ -946,7 +1047,7 @@ void stream_receiver_check_all_nodes_from_poll(struct stream_thread *sth, usec_t
             continue;
         }
         // probe_rc > 0: data available (normal)
-        // probe_rc < 0 with EAGAIN/EWOULDBLOCK: no data but connection alive
+        // probe_rc < 0 with EAGAIN/EWOULDBLOCK/EINTR: no data but connection alive
 
         spinlock_lock(&rpt->thread.send_to_child.spinlock);
         STREAM_CIRCULAR_BUFFER_STATS stats = *stream_circular_buffer_stats_unsafe(rpt->thread.send_to_child.scb);
@@ -1150,7 +1251,9 @@ RRDHOST_SET_RECEIVER_RESULT rrdhost_set_receiver(RRDHOST *host, struct receiver_
         rrdhost_flag_clear(host, RRDHOST_FLAG_ORPHAN);
         rrdhost_set_health_evloop_iteration(host);
 
-        host->stream.rcv.status.connections++;
+        // atomic: read lock-free by the pulse traversal (this write is under receiver_lock, but the
+        // read side has no lock; the connect path is rare so the atomic RMW cost is irrelevant)
+        __atomic_add_fetch(&host->stream.rcv.status.connections, 1, __ATOMIC_RELAXED);
         streaming_receiver_connected();
 
         host->receiver = rpt;
@@ -1164,7 +1267,7 @@ RRDHOST_SET_RECEIVER_RESULT rrdhost_set_receiver(RRDHOST *host, struct receiver_
 
         if (rpt->config.health.enabled != CONFIG_BOOLEAN_NO) {
             if (rpt->config.health.delay > 0) {
-                host->health.delay_up_to = now_realtime_sec() + rpt->config.health.delay;
+                host->health.delay_up_to = nd_time_t_add_saturating(now_realtime_sec(), rpt->config.health.delay);
                 nd_log(NDLS_DAEMON, NDLP_DEBUG,
                        "STREAM RCV '%s' [from [%s]:%s]: "
                        "Postponing health checks for %" PRId64 " seconds, because it was just connected.",

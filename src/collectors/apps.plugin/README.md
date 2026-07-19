@@ -140,6 +140,28 @@ interpreters: process1 process2 process3
 
 - For each process specified, all of its subprocesses will be automatically grouped, not just the matched process itself.
 
+### Automatic grouping on macOS
+
+On macOS, `launchd` spawns almost every process directly, and Apple ships hundreds of distinct helper processes (XPC services, app extensions, framework helpers, standalone daemons).
+To keep the number of groups meaningful, processes that do not match any group in `apps_groups.conf` are grouped automatically based on their executable path:
+
+| Executable                                                            | Group                                              |
+|-----------------------------------------------------------------------|----------------------------------------------------|
+| Application bundles (`*.app`, `*.appex`), Apple or third-party        | one group per application (`Finder`, `Xcode`, ...) |
+| Apple framework helpers (binaries inside `*.framework` bundles)       | `system-frameworks`                                |
+| Apple standalone daemons (`/usr/libexec`, `/usr/sbin`, `/bin`, ...)   | `system-daemons`                                   |
+| Driver extensions (`*.dext`)                                          | `driver-extensions`                                |
+| Third-party frameworks                                                | one group per framework                            |
+| Third-party plain binaries                                            | one group per process name                         |
+
+Since `apps_groups.conf` matches take precedence over automatic grouping, aggregated components can be re-exposed individually by naming them in the configuration.
+The stock configuration already re-exposes famous, long-stable macOS components (`windowserver`, `spotlight`, `media-analysis`, `coreaudio`, `fseventsd`, `icloud`, `nsurlsessiond`, `timemachine`, `videotoolbox`) — see the `MacOS system components of interest` section of `apps_groups.conf`.
+To re-expose any other component, add a line, e.g.:
+
+```text
+airdrop-sharing: sharingd
+```
+
 ### Matching processes
 
 `apps.plugin` uses different fields for process matching depending on the operating system:
@@ -256,6 +278,7 @@ You can use the Netdata `processes` function to verify that your `apps_groups.co
 2. **Review the output** to see:
     - Current running processes with their `comm`, `cmdline`, and (on Windows) `name` fields
     - The **Category** column shows which group from `apps_groups.conf` each process has been assigned to
+    - On Linux, cgroup/container/service enrichment columns show the cgroup status, container or service name, orchestrator, and Kubernetes/Docker/systemd details when available
     - Resource utilization for each process
 
 3. **Troubleshooting tips**:
@@ -320,6 +343,8 @@ The `--pss` option controls PSS sampling behavior:
 
 ### Integration with eBPF
 
+To monitor network bandwidth (upload and download) per application, enable the [`socket` program](/src/collectors/ebpf.plugin/README.md#ebpf-programs-configuration-options) (disabled by default) in `ebpf.d.conf`, then enable the `apps` option in `ebpf.d/network.conf` for the [eBPF Socket](/src/collectors/ebpf.plugin/integrations/ebpf_socket.md) collector. This adds a per-application **Bandwidth** chart alongside the other eBPF apps charts.
+
 If you don't see charts under the **eBPF syscall** or **eBPF net** sections, you should edit your
 [`ebpf.d.conf`](/src/collectors/ebpf.plugin/README.md#configure-the-ebpf-collector) file to ensure the eBPF program is enabled.
 
@@ -334,8 +359,8 @@ If this fails (i.e., `setcap` fails), `apps.plugin` is setuid to `root`.
 
 ## Security
 
-`apps.plugin` operates on a one-way communication model, sending metrics to Netdata without receiving instructions. This design minimizes potential security risks.
+`apps.plugin` sends metrics to Netdata and exposes a local APPS_LOOKUP netipc socket so other Netdata components can request bounded per-PID metadata. The socket is a Unix domain socket created with owner-only permissions (`0600`) for the plugin's effective user.
 
 Although `apps.plugin` can function without escalated privileges, it may not be able to collect all the necessary information. To ensure comprehensive data collection, it's recommended to grant the required privileges.
 
-The increased privileges are primarily used for building the process tree in memory, iterating over running processes, collecting metrics, and sending them to Netdata. This process does not involve any external communication or user interaction, further reducing security concerns.
+The increased privileges are primarily used for building the process tree in memory, iterating over running processes, collecting metrics, enriching local cgroup metadata, and sending data to Netdata. APPS_LOOKUP requests are local-only, size-bounded by the netipc payload limit, and limited to 8192 PIDs per request. On Linux, the `processes` Function exposes the same per-PID cgroup/container/service fields used by network connections, including cgroup status/path/name, container name, orchestrator, systemd unit kind, actor kind, and actor type.

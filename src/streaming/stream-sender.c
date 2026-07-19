@@ -141,6 +141,19 @@ static void stream_sender_on_connect_and_disconnect(struct sender_state *s) {
     stream_sender_unlock(s);
 }
 
+// Record the interface the stream actually egresses on as the host's _net_default_iface label, so
+// the parent sees the real uplink. The OS-specific lookup (getsockname + getifaddrs match) lives in
+// libnetdata/os/socket_egress_interface; here we only stamp the label. This is correct under policy
+// routing / multi-WAN, where the main routing table's default route can point at a different
+// interface than the stream uses. Runs once per (re)connect and rides out with the first host-labels
+// push in on_ready_to_dispatch(); on failover the connection breaks and reconnects over the new
+// interface, so it re-evaluates automatically.
+static void stream_sender_update_egress_iface_label(struct sender_state *s) {
+    char iface[OS_IFNAME_MAX];
+    if (os_socket_egress_interface(s->sock.fd, iface, sizeof(iface)) && iface[0])
+        rrdlabels_add(s->host->rrdlabels, "_net_default_iface", iface, RRDLABEL_SRC_AUTO);
+}
+
 void stream_sender_on_connect(struct sender_state *s) {
     nd_log(NDLS_DAEMON, NDLP_DEBUG,
            "STREAM SND [%s]: running on-connect hooks...",
@@ -151,6 +164,9 @@ void stream_sender_on_connect(struct sender_state *s) {
     stream_sender_on_connect_and_disconnect(s);
 
     s->thread.last_traffic_ut = now_monotonic_usec();
+
+    // record the real uplink interface before the first host-labels push
+    stream_sender_update_egress_iface_label(s);
 
     freez(s->thread.rbuf.b);
     s->thread.rbuf.size = PLUGINSD_LINE_MAX + 1;
@@ -267,7 +283,7 @@ void stream_sender_handle_op(struct stream_thread *sth, struct sender_state *s, 
         STREAM_CIRCULAR_BUFFER_STATS stats = *stream_circular_buffer_stats_unsafe(s->scb);
         stream_sender_unlock(s);
         nd_log(NDLS_DAEMON, NDLP_ERR,
-               "STREAM SND[%zu] '%s' [to %s]: send buffer is full (buffer size %u, max %u, used %u, available %u). "
+               "STREAM SND[%zu] '%s' [to %s]: send buffer is full (buffer size %zu, max %zu, used %zu, available %zu). "
                "Restarting connection.",
                sth->id, rrdhost_hostname(s->host), s->remote_ip,
                stats.bytes_size, stats.bytes_max_size, stats.bytes_outstanding, stats.bytes_available);
@@ -358,7 +374,7 @@ void stream_sender_move_queue_to_running_unsafe(struct stream_thread *sth) {
         s->thread.msg.meta = &s->thread.meta;
 
         __atomic_store_n(&s->host->stream.snd.status.tid, gettid_cached(), __ATOMIC_RELAXED);
-        s->host->stream.snd.status.connections++;
+        __atomic_add_fetch(&s->host->stream.snd.status.connections, 1, __ATOMIC_RELAXED);
         s->last_state_since_t = now_realtime_sec();
 
         s->replication.last_progress_ut = now_monotonic_usec();
@@ -777,25 +793,37 @@ bool stream_sender_send_data(struct stream_thread *sth, struct sender_state *s, 
 bool stream_sender_receive_data(struct stream_thread *sth, struct sender_state *s, usec_t now_ut, bool process_opcodes) {
     EVLOOP_STATUS status = EVLOOP_STATUS_CONTINUE;
     while(status == EVLOOP_STATUS_CONTINUE) {
-        ssize_t rc = nd_sock_revc_nowait(&s->sock, s->thread.rbuf.b + s->thread.rbuf.read_len, s->thread.rbuf.size - s->thread.rbuf.read_len - 1);
-        if (likely(rc > 0)) {
-            s->thread.rbuf.read_len += rc;
-
-            s->thread.last_traffic_ut = now_ut;
-            sth->snd.bytes_received += rc;
-            pulse_stream_received_bytes(rc);
-
-            worker_is_busy(WORKER_SENDER_JOB_EXECUTE);
-            stream_sender_execute_commands(s);
+        ssize_t read_len = s->thread.rbuf.read_len;
+        if(unlikely(!s->thread.rbuf.b || !s->thread.rbuf.size || read_len < 0 ||
+                    (size_t)read_len >= s->thread.rbuf.size - 1)) {
+            internal_fatal(true, "The line to read is too big! Already have %zd bytes in read_buffer.", read_len);
+            errno_clear();
+            status = EVLOOP_STATUS_SOCKET_ERROR;
         }
-        else if (rc == 0 || errno == ECONNRESET)
-            status = EVLOOP_STATUS_SOCKET_CLOSED;
+        else {
+            size_t available = s->thread.rbuf.size - (size_t)read_len - 1;
+            ssize_t rc = nd_sock_revc_nowait(&s->sock, s->thread.rbuf.b + read_len, available);
 
-        else if (rc < 0) {
-            if(errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR)
-                status = EVLOOP_STATUS_SOCKET_FULL;
-            else
-                status = EVLOOP_STATUS_SOCKET_ERROR;
+            if (likely(rc > 0)) {
+                s->thread.rbuf.read_len = read_len + rc;
+
+                s->thread.last_traffic_ut = now_ut;
+                sth->snd.bytes_received += rc;
+                pulse_stream_received_bytes(rc);
+
+                worker_is_busy(WORKER_SENDER_JOB_EXECUTE);
+                if(!stream_sender_execute_commands(s))
+                    status = EVLOOP_STATUS_SOCKET_ERROR;
+            }
+            else if (rc == 0 || errno == ECONNRESET)
+                status = EVLOOP_STATUS_SOCKET_CLOSED;
+
+            else if (rc < 0) {
+                if(errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR)
+                    status = EVLOOP_STATUS_SOCKET_FULL;
+                else
+                    status = EVLOOP_STATUS_SOCKET_ERROR;
+            }
         }
 
         if(status == EVLOOP_STATUS_SOCKET_ERROR || status == EVLOOP_STATUS_SOCKET_CLOSED) {

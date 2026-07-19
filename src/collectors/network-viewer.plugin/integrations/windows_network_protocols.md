@@ -88,18 +88,60 @@ There are no alerts configured by default for this integration.
 
 ## Live Data
 
-This collector exposes a real-time function for viewing Windows TCP and UDP stack statistics.
+This collector exposes real-time functions for viewing Windows network connections and TCP/UDP stack statistics.
 
+
+### Network Connections
+
+Shows active network connections on Windows with protocol details, states, addresses,
+ports, and process information.
+
+Each row represents one TCP connection or UDP endpoint and includes the socket direction
+(listen/inbound/outbound), protocol (tcp4/tcp6/udp4/udp6), TCP state, owning process
+(PID and name), username, server port name, local and remote addresses and ports,
+address space classification (loopback/private/public/multicast/zero), and server port number.
+
+Data is collected using the Windows IP Helper API (GetExtendedTcpTable,
+GetExtendedUdpTable) with process and user resolution via standard Windows APIs.
+
+
+| Aspect | Description |
+|:-------|:------------|
+| Name | `Perflibnetworkprotocols:network-connections` |
+| Require Cloud | no |
+| Performance |  |
+| Security |  |
+| Availability |  |
+
+#### Prerequisites
+
+No additional configuration is required.
+
+#### Parameters
+
+This function has no parameters.
+
+#### Returns
+
+
+
+| Column | Type | Unit | Visibility | Description |
+|:-------|:-----|:-----|:-----------|:------------|
 
 ### Network Protocols
 
 Shows Windows TCP and UDP stack counters grouped by transport protocol (TCP/UDP)
-and IP family (IPv4/IPv6).
+and IP family (IPv4/IPv6), and per-share SMB Server Shares traffic.
 
-Each row covers one transport+family combination (TCPv4, TCPv6, UDPv4, UDPv6) and includes
-traffic counters (received, sent, errors), TCP-specific connection counters
-(active opens, established, passive opens, resets, total segments, retransmitted segments),
-and the UDP-specific datagrams-with-no-port counter.
+Each row covers one transport+family combination (TCPv4, TCPv6, UDPv4, UDPv6) or one
+SMB share, and includes the transport's traffic counters (TCP/UDP: received, sent, errors;
+SMB: received bytes, sent bytes, active tree connections), the TCP-specific connection
+counters (active opens, established, passive opens, resets, total segments, retransmitted
+segments), the UDP-specific datagrams-with-no-port counter, and the SMB-specific
+active tree connections, received bytes, and sent bytes columns.
+
+Two stacked-bar charts are exposed: "Traffic" (TCP/UDP segments/datagrams, grouped by
+transport or IP family) and "SMB Traffic" (per-share bytes, grouped by share name).
 
 
 | Aspect | Description |
@@ -124,5 +166,3 @@ This function has no parameters.
 
 | Column | Type | Unit | Visibility | Description |
 |:-------|:-----|:-----|:-----------|:------------|
-
-

@@ -108,9 +108,9 @@ static inline uint32_t murmur32(uint32_t k) {
 static uint64_t murmur64(uint64_t k) __attribute__((const));
 static inline uint64_t murmur64(uint64_t k) {
     k ^= k >> 33;
-    k *= 0xff51afd7ed558ccdUL;
+    k *= 0xff51afd7ed558ccdULL;
     k ^= k >> 33;
-    k *= 0xc4ceb9fe1a85ec53UL;
+    k *= 0xc4ceb9fe1a85ec53ULL;
     k ^= k >> 33;
 
     return k;
@@ -432,15 +432,17 @@ static NETDATA_DOUBLE str2ndd_encoded(const char *src, char **endptr) {
     if (*src == IEEE754_DOUBLE_B64_PREFIX[0]) {
         // double parsing from base64
         uint64_t n = str2uint64_base64(src + sizeof(IEEE754_DOUBLE_B64_PREFIX) - 1, endptr);
-        NETDATA_DOUBLE *ptr = (NETDATA_DOUBLE *) (&n);
-        return *ptr;
+        double value;
+        memcpy(&value, &n, sizeof(value));
+        return (NETDATA_DOUBLE)value;
     }
 
     if (*src == IEEE754_DOUBLE_HEX_PREFIX[0]) {
         // double parsing from hex
         uint64_t n = str2uint64_hex(src + sizeof(IEEE754_DOUBLE_HEX_PREFIX) - 1, endptr);
-        NETDATA_DOUBLE *ptr = (NETDATA_DOUBLE *) (&n);
-        return *ptr;
+        double value;
+        memcpy(&value, &n, sizeof(value));
+        return (NETDATA_DOUBLE)value;
     }
 
     double sign = 1.0;
@@ -599,14 +601,17 @@ static int read_txt_file(const char *filename, char *buffer, size_t size) {
 
 ALWAYS_INLINE
 static bool read_txt_file_to_buffer(const char *filename, BUFFER *wb, size_t max_size) {
-    // Open the file
-    int fd = open(filename, O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    if (stat(filename, &st) == -1 || !S_ISREG(st.st_mode))
+        return false;
+
+    // O_NONBLOCK prevents a replacement FIFO from waiting during open().
+    int fd = open(filename, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (fd == -1)
         return false;
 
     // Get the file size
-    struct stat st;
-    if (fstat(fd, &st) == -1) {
+    if (fstat(fd, &st) == -1 || !S_ISREG(st.st_mode)) {
         close(fd);
         return false;
     }
@@ -622,12 +627,23 @@ static bool read_txt_file_to_buffer(const char *filename, BUFFER *wb, size_t max
     buffer_need_bytes(wb, file_size + 1);
 
     // Read the file contents into the buffer
-    ssize_t r = read(fd, &wb->buffer[wb->len], file_size);
-    if (r != (ssize_t)file_size) {
+    size_t original_len = wb->len;
+    size_t bytes_read = 0;
+    while(bytes_read < file_size) {
+        ssize_t r = read(fd, &wb->buffer[original_len + bytes_read], file_size - bytes_read);
+        if (r > 0) {
+            bytes_read += (size_t)r;
+            continue;
+        }
+
+        if (r == -1 && errno == EINTR)
+            continue;
+
         close(fd);
-        return false; // Read error
+        return false; // Read error or unexpected end of file
     }
-    wb->len = r;
+    wb->len = original_len + bytes_read;
+    wb->buffer[wb->len] = '\0';
 
     // Close the file descriptor
     close(fd);

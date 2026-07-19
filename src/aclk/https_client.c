@@ -241,7 +241,7 @@ const char *get_http_header_by_name(http_parse_ctx *ctx, const char *name)
 
 static int parse_http_hdr(rbuf_t buf, http_parse_ctx *parse_ctx)
 {
-    int idx, idx_end;
+    size_t idx, idx_end;
     char buf_key[HTTP_HDR_BUFFER_SIZE];
     char buf_val[HTTP_HDR_BUFFER_SIZE];
     char *ptr;
@@ -252,7 +252,7 @@ static int parse_http_hdr(rbuf_t buf, http_parse_ctx *parse_ctx)
     }
 
     char *separator = rbuf_find_bytes(buf, HTTP_KEYVAL_SEPARATOR, strlen(HTTP_KEYVAL_SEPARATOR), &idx);
-    if (!separator) {
+    if (!separator || idx >= idx_end) {
         netdata_log_error("ACLK: Missing Key/Value separator");
         return 1;
     }
@@ -275,7 +275,7 @@ static int parse_http_hdr(rbuf_t buf, http_parse_ctx *parse_ctx)
     buf_val[idx_end] = 0;
 
     for (ptr = buf_key; *ptr; ptr++)
-        *ptr = tolower(*ptr);
+        *ptr = tolower((uint8_t)*ptr);
 
     if (process_http_hdr(parse_ctx, buf_key, buf_val))
         return 1;
@@ -296,7 +296,7 @@ static inline void chunked_response_buffer_grow_by(http_parse_ctx *parse_ctx, si
 
 static int process_chunked_content(rbuf_t buf, http_parse_ctx *parse_ctx)
 {
-    int idx;
+    size_t idx;
     size_t bytes_to_copy;
 
     do {
@@ -378,7 +378,7 @@ static int process_chunked_content(rbuf_t buf, http_parse_ctx *parse_ctx)
 
 http_parse_rc parse_http_response(rbuf_t buf, http_parse_ctx *parse_ctx)
 {
-    int idx;
+    size_t idx;
     char rc[4];
 
     do {
@@ -503,6 +503,11 @@ static int socket_write_all(https_req_ctx_t *ctx, char *data, size_t data_len) {
     ctx->poll_fd.events = POLLOUT;
 
     do {
+        // evaluate the overall request timeout every iteration, not only on a poll() timeout:
+        // otherwise a persistent poll()-ready-but-no-progress state spins the CPU unbounded
+        if (https_req_check_timedout(ctx))
+            return 2;
+
         int ret = poll(&ctx->poll_fd, 1, POLL_TO_MS);
         if (ret < 0) {
             netdata_log_error("ACLK: poll error");
@@ -533,6 +538,11 @@ static int ssl_write_all(https_req_ctx_t *ctx, char *data, size_t data_len) {
     ctx->poll_fd.events |= POLLOUT;
 
     do {
+        // evaluate the overall request timeout every iteration, not only on a poll() timeout:
+        // otherwise a persistent poll()-ready-but-no-progress state spins the CPU unbounded
+        if (https_req_check_timedout(ctx))
+            return 2;
+
         int ret = poll(&ctx->poll_fd, 1, POLL_TO_MS);
         if (ret < 0) {
             netdata_log_error("ACLK: poll error");
@@ -582,6 +592,11 @@ static https_client_resp_t read_parse_response(https_req_ctx_t *ctx) {
 
     ctx->poll_fd.events = POLLIN;
     do {
+        // evaluate the overall request timeout every iteration, not only on a poll() timeout:
+        // otherwise a persistent poll()-ready-but-no-progress state spins the CPU unbounded
+        if (https_req_check_timedout(ctx))
+            return HTTPS_CLIENT_RESP_TIMEOUT;
+
         ret = poll(&ctx->poll_fd, 1, POLL_TO_MS);
         if (ret < 0) {
             netdata_log_error("ACLK: poll error");
@@ -765,7 +780,7 @@ https_client_resp_t https_request(https_req_t *request, https_req_response_t *re
     https_req_ctx_t *ctx = callocz(1, sizeof(https_req_ctx_t));
     ctx->req_start_time = now_realtime_sec();
 
-    ctx->buf_rx = rbuf_create(RX_BUFFER_SIZE);
+    ctx->buf_rx = rbuf_create(RX_BUFFER_SIZE, RX_BUFFER_SIZE);
     if (!ctx->buf_rx) {
         rc = HTTPS_CLIENT_RESP_NO_MEM;
         netdata_log_error("ACLK: couldn't allocate buffer for RX data");

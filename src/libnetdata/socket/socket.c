@@ -14,8 +14,8 @@ bool ip_to_hostname(const char *ip, char *dst, size_t dst_len) {
     if(!dst || !dst_len)
         return false;
 
-    struct sockaddr_in sa;
-    struct sockaddr_in6 sa6;
+    struct sockaddr_in sa = { 0 };
+    struct sockaddr_in6 sa6 = { 0 };
     struct sockaddr *sa_ptr;
     int sa_len;
 
@@ -366,7 +366,12 @@ inline int wait_on_socket_or_cancel_with_timeout(
     // WSAPoll() (used internally by MinGW poll()) only works for sockets.
     // For pipe file descriptors (e.g. stdin when launched as a subprocess),
     // poll() fails and kills the reader thread. Use PeekNamedPipe instead.
-    if(poll_events & POLLIN) {
+    //
+    // Sockets must be excluded from the pipe path: GetFileType() reports
+    // FILE_TYPE_PIPE for Winsock sockets too (they sit on \Device\Afd), so
+    // relying on GetFileType() alone would route stream sockets through
+    // PeekNamedPipe(), which fails on a socket and breaks receiving.
+    if((poll_events & POLLIN) && !fd_is_socket(fd)) {
         HANDLE h = (HANDLE)_get_osfhandle(fd);
         if(h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_PIPE) {
             bool forever = (timeout_ms <= 0);
@@ -644,23 +649,29 @@ int accept_socket(int fd, int flags, char *client_ip, size_t ipsize, char *clien
 
     int nfd = accept4(fd, (struct sockaddr *)&sadr, &addrlen, flags | DEFAULT_SOCKET_FLAGS);
     if (likely(nfd >= 0)) {
+        if(unlikely(!client_ip || ipsize < 2 || !client_port || portsize < 2)) {
+            close(nfd);
+            errno = EINVAL;
+            return -1;
+        }
+
         if (getnameinfo((struct sockaddr *)&sadr, addrlen, client_ip, (socklen_t)ipsize,
                         client_port, (socklen_t)portsize, NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
 
             nd_log(NDLS_DAEMON, NDLP_ERR,
                    "LISTENER: cannot getnameinfo() on received client connection.");
 
-            strncpyz(client_ip, "UNKNOWN", ipsize);
-            strncpyz(client_port, "UNKNOWN", portsize);
+            strncpyz(client_ip, "UNKNOWN", ipsize - 1);
+            strncpyz(client_port, "UNKNOWN", portsize - 1);
         }
         if (!strcmp(client_ip, "127.0.0.1") || !strcmp(client_ip, "::1")) {
-            strncpyz(client_ip, "localhost", ipsize);
+            strncpyz(client_ip, "localhost", ipsize - 1);
         }
         sock_setcloexec(nfd, true);
 
 #ifdef __FreeBSD__
         if(((struct sockaddr *)&sadr)->sa_family == AF_LOCAL)
-            strncpyz(client_ip, "localhost", ipsize);
+            strncpyz(client_ip, "localhost", ipsize - 1);
 #endif
 
         client_ip[ipsize - 1] = '\0';
@@ -670,7 +681,7 @@ int accept_socket(int fd, int flags, char *client_ip, size_t ipsize, char *clien
             case AF_UNIX:
                 // netdata_log_debug(D_LISTENER, "New UNIX domain web client from %s on socket %d.", client_ip, fd);
                 // set the port - certain versions of libc return garbage on unix sockets
-                strncpyz(client_port, "UNIX", portsize);
+                strncpyz(client_port, "UNIX", portsize - 1);
                 break;
 
             case AF_INET:

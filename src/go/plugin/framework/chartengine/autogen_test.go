@@ -102,7 +102,7 @@ func runTestBuildHistogramBucketAutogenRoute(t *testing.T) {
 		wantID     string
 		wantDim    string
 	}{
-		"histogram bucket excludes le from chart id and uses bucket dimension": {
+		"histogram bucket excludes le from chart id and uses upper-bound dimension": {
 			metricName: "svc.latency_seconds_bucket",
 			labels: map[string]string{
 				"instance": "db1",
@@ -110,7 +110,7 @@ func runTestBuildHistogramBucketAutogenRoute(t *testing.T) {
 				"method":   "GET",
 			},
 			wantID:  "svc.latency_seconds-instance=db1-method=GET",
-			wantDim: "bucket_0.5",
+			wantDim: "0.5",
 		},
 	}
 
@@ -129,6 +129,7 @@ func runTestBuildHistogramBucketAutogenRoute(t *testing.T) {
 			assert.Equal(t, tc.wantDim, route.dimensionName)
 			assert.Equal(t, metrix.HistogramBucketLabel, route.dimensionKeyLabel)
 			assert.Equal(t, program.AlgorithmIncremental, route.algorithm)
+			assert.Equal(t, program.ChartTypeHeatmap, route.chartType)
 			assert.False(t, route.staticDimension)
 		})
 	}
@@ -368,6 +369,27 @@ func TestFitsTypeIDBudget(t *testing.T) {
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			assert.Equal(t, tc.want, fitsTypeIDBudget(tc.maxLen, tc.typeIDPrefix, tc.chartID))
+		})
+	}
+}
+
+func TestGetAutogenChartContext(t *testing.T) {
+	tests := map[string]struct {
+		namespace string
+		metric    string
+		want      string
+	}{
+		"empty namespace returns bare metric":        {namespace: "", metric: "foo", want: "foo"},
+		"single-segment namespace is prefixed":       {namespace: "prometheus", metric: "foo", want: "prometheus.foo"},
+		"multi-segment namespace composes with dot":  {namespace: "prometheus.app", metric: "foo", want: "prometheus.app.foo"},
+		"whitespace-only namespace is treated empty": {namespace: "  ", metric: "foo", want: "foo"},
+		"empty metric falls back to metric":          {namespace: "", metric: "", want: "metric"},
+		"namespace with empty metric":                {namespace: "prometheus", metric: "", want: "prometheus.metric"},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, getAutogenChartContext(tc.namespace, tc.metric))
 		})
 	}
 }

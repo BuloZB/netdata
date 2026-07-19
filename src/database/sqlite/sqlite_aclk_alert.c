@@ -315,6 +315,7 @@ done:
 static void commit_alert_events(RRDHOST *host)
 {
     sqlite3_stmt *res = NULL;
+    sqlite3_stmt *res_version = NULL;
 
     if (!PREPARE_STATEMENT(db_meta, SQL_SELECT_ALERT_TO_DUMMY, &res))
         return;
@@ -325,7 +326,6 @@ static void commit_alert_events(RRDHOST *host)
     int64_t first_sequence_id = 0;
     int64_t last_sequence_id = 0;
 
-    sqlite3_stmt *res_version = NULL;
     param = 0;
     while (sqlite3_step_monitored(res) == SQLITE_ROW) {
 
@@ -349,6 +349,7 @@ static void commit_alert_events(RRDHOST *host)
 done:
     REPORT_BIND_FAIL(res, param);
     SQLITE_FINALIZE(res);
+    SQLITE_FINALIZE(res_version);
 }
 
 typedef enum {
@@ -402,8 +403,8 @@ void health_alarm_log_populate(
     char *source = (char *) sqlite3_column_text(res, SOURCE);
     alarm_log->command = source ? health_edit_command_from_source(source) : strdupz("UNKNOWN=0=UNKNOWN");
 
-    alarm_log->chart = strdupz((char *) sqlite3_column_text(res, CHART));
-    alarm_log->name = strdupz((char *) sqlite3_column_text(res, NAME));
+    alarm_log->chart = sqlite3_text_strdupz_empty(res, CHART);
+    alarm_log->name = sqlite3_text_strdupz_empty(res, NAME);
 
     alarm_log->when = sqlite3_column_int64(res, WHEN_KEY);
 
@@ -1051,12 +1052,14 @@ done:
 #define ALARM_EVENTS_PER_CHUNK 1000
 void send_alert_snapshot_to_cloud(RRDHOST *host __maybe_unused)
 {
-    struct aclk_sync_cfg_t *aclk_host_config = __atomic_load_n(&host->aclk_host_config, __ATOMIC_ACQUIRE);
-
     if (unlikely(!host)) {
-        nd_log(NDLS_ACCESS, NDLP_WARNING, "AC [%s (N/A)]: Node id not found", aclk_host_config->node_id);
+        nd_log(NDLS_ACCESS, NDLP_WARNING, "AC [N/A (N/A)]: Node id not found");
         return;
     }
+
+    struct aclk_sync_cfg_t *aclk_host_config = __atomic_load_n(&host->aclk_host_config, __ATOMIC_ACQUIRE);
+    if (unlikely(!aclk_host_config))
+        return;
 
     CLAIM_ID claim_id = claim_id_get();
     if (unlikely(!claim_id_is_set(claim_id)))
@@ -1120,6 +1123,9 @@ void send_alert_snapshot_to_cloud(RRDHOST *host __maybe_unused)
         if (cnt == ALARM_EVENTS_PER_CHUNK) {
             if (aclk_online_for_alerts())
                 aclk_send_alarm_snapshot(snapshot_proto);
+            else
+                destroy_alarm_snapshot_proto(snapshot_proto);
+            snapshot_proto = NULL;
             cnt = 0;
             if (alarm_snap.chunk < chunks) {
                 alarm_snap.chunk++;
@@ -1130,6 +1136,8 @@ void send_alert_snapshot_to_cloud(RRDHOST *host __maybe_unused)
     }
     if (cnt)
         aclk_send_alarm_snapshot(snapshot_proto);
+    else
+        destroy_alarm_snapshot_proto(snapshot_proto);
 
     nd_log(
         NDLS_ACCESS,
