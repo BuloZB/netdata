@@ -14,6 +14,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_traps/internal/model"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_traps/internal/output"
 )
 
 const (
@@ -46,7 +49,7 @@ type trapDeduper struct {
 	jobName         string
 	window          time.Duration
 	maxEntries      int
-	writer          TrapWriter
+	writer          output.Writer
 	metrics         *perJobMetrics
 	writeFailureDim string
 	monotonicNow    func() int64
@@ -81,7 +84,7 @@ func validateDedupConfig(cfg DedupConfig) error {
 	return nil
 }
 
-func newTrapDeduper(jobName string, cfg DedupConfig, writer TrapWriter, metrics *perJobMetrics, writeFailureDim string, monotonicNow ...func() int64) *trapDeduper {
+func newTrapDeduper(jobName string, cfg DedupConfig, writer output.Writer, metrics *perJobMetrics, writeFailureDim string, monotonicNow ...func() int64) *trapDeduper {
 	if !cfg.Enabled {
 		return nil
 	}
@@ -174,7 +177,7 @@ func (d *trapDeduper) Admit(entry *TrapEntry, td *TrapDef, jobKeys []string) (de
 	if elem, ok := d.entries[key]; ok {
 		cacheEntry := elem.Value.(*dedupCacheEntry)
 		if now.Before(cacheEntry.expiresAt) {
-			d.recordSuppressedLocked(key, cacheEntry.trapOID, entry)
+			d.recordSuppressedLocked(key, cacheEntry.trapOID)
 			return dedupAdmission{}, true
 		}
 		d.removeElementLocked(elem)
@@ -201,7 +204,7 @@ func (d *trapDeduper) Rollback(admission dedupAdmission) {
 	}
 }
 
-func (d *trapDeduper) recordSuppressedLocked(key dedupKey, trapOID string, entry *TrapEntry) {
+func (d *trapDeduper) recordSuppressedLocked(key dedupKey, trapOID string) {
 	if trapOID == "" {
 		trapOID = "unknown"
 	}
@@ -210,7 +213,7 @@ func (d *trapDeduper) recordSuppressedLocked(key dedupKey, trapOID string, entry
 	d.period.fingerprints[key] = struct{}{}
 	if d.metrics != nil {
 		d.metrics.incDedupSuppressed()
-		d.metrics.recordSourceDedupSuppressed(entry)
+		d.metrics.incPipelineDedupSuppressed()
 	}
 }
 
@@ -342,8 +345,8 @@ func dedupFingerprint(entry *TrapEntry, td *TrapDef, jobKeys []string) dedupKey 
 		buf = appendFingerprintPart(buf, dedupVarbindPresent)
 		buf = appendFingerprintPart(buf, vb.OID)
 		buf = appendFingerprintPart(buf, string(vb.Type))
-		if isSensitiveTrapVarbind(vb) {
-			buf = appendFingerprintValue(buf, redactedTrapVarbind)
+		if model.IsSensitiveVarbind(vb) {
+			buf = appendFingerprintValue(buf, model.RedactedVarbindValue)
 			continue
 		}
 		buf = appendFingerprintValue(buf, vb.Value)
@@ -382,13 +385,11 @@ func dedupVarbind(entry *TrapEntry, name string) (VarbindValue, bool) {
 	if entry == nil {
 		return VarbindValue{}, false
 	}
-	for _, vb := range entry.Varbinds {
-		if vb.Name == name {
-			return vb, true
-		}
+	if value, ok := model.FindVarbindByName(entry.Varbinds, name); ok {
+		return value, true
 	}
-	if isNumericOID(name) {
-		return findVarbindForProfileOID(entry, name)
+	if model.IsNumericOID(name) {
+		return model.FindVarbindForProfileOID(entry.Varbinds, name)
 	}
 	return VarbindValue{}, false
 }

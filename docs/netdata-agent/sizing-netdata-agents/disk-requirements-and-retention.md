@@ -39,6 +39,12 @@ gantt
 | `tier1` | 60 iterations of `tier0`, so when metrics are collected per-second, this tier is per-minute. |         16 bytes         |     6 bytes     |
 | `tier2` |  60 iterations of `tier1`, so when metrics are collected per second, this tier is per-hour.  |         16 bytes         |    18 bytes     |
 
+:::note
+
+Tier resolution shifts proportionally when you change `[db].update every`, and a longer `update every` lets the same per-tier disk size hold more time of data. See [Update Every and Tier Granularity](/src/database/CONFIGURATION.md#update-every-and-tier-granularity) for the full mechanics and the Parent-Child behavior.
+
+:::
+
 ### Default Disk Footprint
 
 Netdata Agent metrics storage is limited to 3 GiB by default (configurable), using 1 GiB per tier × 3 tiers. In total, with SQLite databases, alert transitions, and other metadata, expect about 4 GiB of disk usage under normal conditions. The default retention limits are:
@@ -54,6 +60,8 @@ Data is deleted when retention enforcement detects that **either** the size limi
 In practice, with default settings and an ingestion rate of about 4,000 metrics per second, Netdata provides about 14 days of high resolution (per-second) data, 3 months of medium resolution (per-minute) data, and more than 1 year of low resolution (per-hour) data.
 
 These limits are fully configurable. See [Changing how long Netdata stores metrics](/src/database/CONFIGURATION.md#tiers).
+
+Under sustained archived-instance churn, such as repeatedly creating short-lived containers, the metric metadata database (`netdata-meta.db`) can grow beyond these defaults. See [Extreme Cardinality Protection](/docs/extreme-cardinality-protection.md) for the cleanup thresholds, timing, and reasons the database file may not shrink immediately.
 
 ### Parent Retention Sizing
 

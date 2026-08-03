@@ -5,7 +5,6 @@ package snmp_traps
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"strings"
 
 	"github.com/netdata/netdata/go/plugins/pkg/metrix"
 )
@@ -24,14 +23,32 @@ type trapMetricSourceIdentity struct {
 	routeKey    string
 }
 
-func resolveTrapMetricSourceIdentity(entry *TrapEntry, jobName string, identity ProfileMetricIdentityConfig, sourceHashSalt string) (trapMetricSourceIdentity, bool) {
+func trapEntryHasAmbiguousSourceEvidence(entry *TrapEntry) bool {
+	if entry == nil || entry.Enrichment == nil {
+		return false
+	}
+	if src := entry.Enrichment.Source; src != nil && len(src.RejectedCandidates) > 0 {
+		return true
+	}
+	return trapLookupIsAmbiguous(entry.Enrichment.Registry) || trapLookupIsAmbiguous(entry.Enrichment.Topology)
+}
+
+func trapLookupIsAmbiguous(lookup *TrapEnrichmentLookup) bool {
+	if lookup == nil {
+		return false
+	}
+	switch lookup.Status {
+	case "ambiguous", "conflict":
+		return true
+	default:
+		return lookup.Reason == "ambiguous_source" || lookup.Reason == "vnode_mismatch"
+	}
+}
+
+func resolveTrapMetricSourceIdentity(entry *TrapEntry, jobName string, identity profileMetricIdentityPolicy, sourceHashSalt string) (trapMetricSourceIdentity, bool) {
 	if entry == nil {
 		return trapMetricSourceIdentity{}, false
 	}
-
-	identity.Device = defaultString(strings.ToLower(strings.TrimSpace(identity.Device)), profileMetricIdentitySource)
-	identity.UnresolvedSource = defaultString(strings.ToLower(strings.TrimSpace(identity.UnresolvedSource)), profileMetricUnresolvedSourceLabel)
-	identity.SourceIDPrivacy = defaultString(strings.ToLower(strings.TrimSpace(identity.SourceIDPrivacy)), profileMetricSourceIDHash)
 
 	sourceID, sourceKind := rawFallbackTrapSourceIdentity(entry)
 	rawRouteKey := ""
@@ -59,10 +76,7 @@ func resolveTrapMetricSourceIdentity(entry *TrapEntry, jobName string, identity 
 		key.sourceKind = "vnode"
 		key.sourceID = entry.SourceVnodeID
 	default:
-		if identity.UnresolvedSource == profileMetricDropMetricInstance {
-			return trapMetricSourceIdentity{}, false
-		}
-		sourceID, sourceKind = fallbackTrapSourceIdentity(entry, jobName, identity.SourceIDPrivacy, sourceHashSalt)
+		sourceID, sourceKind = fallbackTrapSourceIdentity(entry, jobName, sourceHashSalt)
 		if sourceID == "" {
 			return trapMetricSourceIdentity{}, false
 		}
@@ -85,16 +99,13 @@ func resolveTrapMetricSourceIdentity(entry *TrapEntry, jobName string, identity 
 	}, true
 }
 
-func fallbackTrapSourceIdentity(entry *TrapEntry, jobName, privacy, sourceHashSalt string) (string, string) {
+func fallbackTrapSourceIdentity(entry *TrapEntry, jobName, sourceHashSalt string) (string, string) {
 	source, kind := rawFallbackTrapSourceIdentity(entry)
 	if source == "" {
 		return "", ""
 	}
-	if privacy == profileMetricSourceIDHash {
-		sum := sha256.Sum256([]byte(sourceHashSalt + ":" + jobName + ":" + source))
-		return hex.EncodeToString(sum[:])[:16], kind
-	}
-	return source, kind
+	sum := sha256.Sum256([]byte(sourceHashSalt + ":" + jobName + ":" + source))
+	return hex.EncodeToString(sum[:])[:16], kind
 }
 
 func rawFallbackTrapSourceIdentity(entry *TrapEntry) (string, string) {
@@ -129,11 +140,4 @@ func fallbackTrapSourceKind(method string) string {
 	default:
 		return "other"
 	}
-}
-
-func profileMetricSourceHashSalt() string {
-	if provider, err := defaultJournalHostProvider(); err == nil {
-		return "machine-id:" + provider.MachineID().String()
-	}
-	return "netdata-agent"
 }

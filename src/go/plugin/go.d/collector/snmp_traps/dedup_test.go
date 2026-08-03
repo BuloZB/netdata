@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/netdata/netdata/go/plugins/pkg/metrix"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_traps/internal/model"
 )
 
 func TestValidateDedupConfig(t *testing.T) {
@@ -341,17 +342,6 @@ func TestTrapDeduperSummaryEntry(t *testing.T) {
 		t.Fatalf("summary message does not include trap name/count: %q", summary.Message)
 	}
 
-	fields, err := serializeToJournalFields(summary)
-	if err != nil {
-		t.Fatalf("serialize summary: %v", err)
-	}
-	fieldMap := fieldsToMap(fields)
-	if _, ok := fieldMap["_HOSTNAME"]; ok {
-		t.Fatal("dedup summary unexpectedly emitted _HOSTNAME")
-	}
-	if _, ok := fieldMap["ND_NIDL_NODE"]; ok {
-		t.Fatal("dedup summary unexpectedly emitted ND_NIDL_NODE")
-	}
 	if got := metrics.dedup.suppressed.Load(); got != 2 {
 		t.Fatalf("dedup suppressed metric = %d, want 2", got)
 	}
@@ -485,7 +475,7 @@ func dedupTestEntryWithCommunity(sourceIP, community string) *TrapEntry {
 		TrapOID:  "1.3.6.1.6.3.1.1.5.3",
 		Varbinds: []VarbindValue{{
 			Name:  "snmpTrapCommunity",
-			OID:   snmpTrapCommunityOID,
+			OID:   model.SNMPTrapCommunityOID,
 			Type:  "OctetString",
 			Value: community,
 		}},

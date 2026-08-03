@@ -49,7 +49,7 @@ terminology stay out of the operator docs.
 
 ## 3. Journal-writer queue depth and flush mechanics
 
-Authoritative home: `netdata.md` §19 ("TrapWriter interface contract", default
+Authoritative home: `netdata.md` §19 ("Output writer interface contract", default
 queue/flush policy) and §11 ("Journal Storage").
 
 - The journal-direct writer accepts entries into a per-job bounded queue
@@ -71,7 +71,7 @@ is omitted there.
 Authoritative home: `netdata.md` §12 ("Commitment and attribution rules") and
 §19 (writer ownership / non-blocking `Write`).
 
-- `accepted` and source-attributed error counters are recorded before dedup
+- `accepted` and job-level processing error counters are recorded before dedup
   suppression.
 - `committed`, category/severity counters, and profile-defined metrics are
   recorded only after successful authoritative output commitment.
@@ -139,24 +139,12 @@ multipath, filename-dedup, field-merge on extends-chain").
   creation, shared by all listeners, released when no runnable trap jobs remain.
 - Operator profiles load eagerly at job creation; stock profiles keep only an
   OID-to-file route table until a matching trap loads the routed vendor file.
-- While a trap job runs, operator profile edits are picked up automatically;
-  invalid edits are logged and the last valid index stays active; stock updates
-  apply after an Agent restart.
+- Profiles are immutable while the shared cache has active job references.
+  Operator and stock changes apply after an Agent restart or after every trap
+  job is recreated.
 
-Operator-observable effect retained in `docs/snmp-traps/trap-profiles.md`: edits
-to operator profiles are picked up automatically while a job runs; invalid edits
-are logged and the last valid profiles stay active; stock updates apply after a
-restart; confirm with Logs + receiver metrics. The lazy-load / memory-footprint
-/ shared-cache-release / file-watcher-vs-periodic-scan mechanics are omitted.
-
-## 8. Source-attributed metric cap
-
-Authoritative home: `trap-metrics-profiles.md` (source identity resolver, cap
-and expiry).
-
-- Source-attributed built-in metrics are capped at 2,000 active sources per
-  job; inactive source identities expire after 60 successful collection cycles.
-
-Operator-observable effect retained in `docs/snmp-traps/metrics.md`:
-the 2,000-source cap (plan cardinality around it) and that inactive sources age
-out automatically. The "60 successful collection cycles" expiry unit is omitted.
+Operator-observable effect retained in `docs/npm/snmp-traps/trap-profiles.md`:
+profile changes require an Agent restart or recreation of every trap job.
+Invalid operator profiles fail the next job creation; invalid lazy stock
+profiles fail their first matching lookup and increment profile-load-failure
+metrics.

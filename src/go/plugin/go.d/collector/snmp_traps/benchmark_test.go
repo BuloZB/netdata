@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,6 +15,10 @@ import (
 	"github.com/gosnmp/gosnmp"
 	"github.com/netdata/netdata/go/plugins/pkg/metrix"
 	"github.com/netdata/netdata/go/plugins/pkg/multipath"
+	"github.com/netdata/netdata/go/plugins/plugin/framework/charttpl"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_traps/internal/model"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_traps/internal/output"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_traps/internal/output/journal"
 )
 
 // ---------------------------------------------------------------------------
@@ -27,8 +30,8 @@ func buildBenchV2cTrap(b testing.TB, community, trapOID string, extra ...gosnmp.
 	b.Helper()
 	x := &gosnmp.GoSNMP{Version: gosnmp.Version2c, Community: community}
 	pdus := []gosnmp.SnmpPDU{
-		{Name: sysUpTimeOID, Type: gosnmp.TimeTicks, Value: uint32(10)},
-		{Name: snmpTrapOIDOID, Type: gosnmp.ObjectIdentifier, Value: trapOID},
+		{Name: model.SysUpTimeOID, Type: gosnmp.TimeTicks, Value: uint32(10)},
+		{Name: model.SNMPTrapOID, Type: gosnmp.ObjectIdentifier, Value: trapOID},
 	}
 	pdus = append(pdus, extra...)
 	data, err := x.MkSnmpPacket(gosnmp.SNMPv2Trap, pdus, 0, 0).MarshalMsg()
@@ -41,6 +44,12 @@ func buildBenchV2cTrap(b testing.TB, community, trapOID string, extra ...gosnmp.
 // setBenchProfileIndex seeds the global profile index for benchmarks.
 func setBenchProfileIndex(b *testing.B, traps map[string]*TrapDef) {
 	b.Helper()
+	for _, trap := range traps {
+		if err := compileTrapTemplates(trap, nil); err != nil {
+			b.Fatalf("compile benchmark trap templates: %v", err)
+		}
+		trap.sharedVarbinds = buildSharedVarbinds(trap, nil)
+	}
 	// Benchmark-only shortcut: swap the atomic current index without touching
 	// the lazy-load/refcount state used by production job creation.
 	prev := globalProfileCache.current.Load()
@@ -57,7 +66,7 @@ type countingWriter struct {
 
 func (w *countingWriter) Write(entry *TrapEntry) error {
 	if atomic.LoadInt32(&w.closed) != 0 {
-		return errWriterClosed
+		return output.ErrClosed
 	}
 	atomic.AddInt64(&w.count, 1)
 	return nil
@@ -67,7 +76,7 @@ func (w *countingWriter) Flush() error   { return nil }
 func (w *countingWriter) Close() error   { atomic.StoreInt32(&w.closed, 1); return nil }
 func (w *countingWriter) Written() int64 { return atomic.LoadInt64(&w.count) }
 
-var _ TrapWriter = (*countingWriter)(nil)
+var _ output.Writer = (*countingWriter)(nil)
 
 // benchMakePDUs creates n synthetic PDU values with integer types.
 func benchMakePDUs(n int) []gosnmp.SnmpPDU {
@@ -129,7 +138,7 @@ func BenchmarkPacketTrap(b *testing.B) {
 		Name:        "TEST-MIB::coldStartSecurity",
 		Category:    "security",
 		Severity:    "warning",
-		Description: "coldStart from {TRAP_SOURCE_IP}",
+		Description: "coldStart from {{source_ip}}",
 	}
 	setBenchProfileIndex(b, map[string]*TrapDef{trap.OID: trap})
 
@@ -137,7 +146,7 @@ func BenchmarkPacketTrap(b *testing.B) {
 
 	writer := &countingWriter{}
 	c := &Collector{
-		jobName:    jobName,
+		Config:     Config{Name: jobName},
 		trapWriter: writer,
 		versions:   map[SnmpVersion]struct{}{SnmpVersionV2c: {}},
 		allowlist:  NewAllowlist(nil, []string{"public"}),
@@ -179,7 +188,7 @@ func BenchmarkMultiJob(b *testing.B) {
 				Name:        "TEST-MIB::coldStart",
 				Category:    "security",
 				Severity:    "warning",
-				Description: "coldStart from {TRAP_SOURCE_IP}",
+				Description: "coldStart from {{source_ip}}",
 			}
 			setBenchProfileIndex(b, map[string]*TrapDef{trap.OID: trap})
 
@@ -191,7 +200,7 @@ func BenchmarkMultiJob(b *testing.B) {
 				peers[i] = net.ParseIP(fmt.Sprintf("10.1.2.%d", i+1))
 				writers[i] = &countingWriter{}
 				collectors[i] = &Collector{
-					jobName:    jn,
+					Config:     Config{Name: jn},
 					trapWriter: writers[i],
 					versions:   map[SnmpVersion]struct{}{SnmpVersionV2c: {}},
 					allowlist:  NewAllowlist(nil, []string{"public"}),
@@ -257,27 +266,23 @@ func BenchmarkProfileMetricRuntimeUpdateAndCollect(b *testing.B) {
 	idx := benchmarkProfileMetricIndex(b)
 	cfg, err := normalizeProfileMetricsConfig(ProfileMetricsConfig{
 		Enabled: true,
-		Mode:    profileMetricModeExact,
 		Include: []string{
 			"bench.config.changed",
 			"bench.config.terminal_type",
 			"bench.config.console_state",
 			"bench.port_security.ifindex",
 		},
-		Identity: ProfileMetricIdentityConfig{
-			SourceIDPrivacy: profileMetricSourceIDHash,
-		},
-		Limits: ProfileMetricLimitsConfig{
-			MaxRules:              4,
-			MaxSources:            64,
-			MaxResourcesPerSource: 32,
-			MaxInstancesPerJob:    4096,
-		},
 	})
 	if err != nil {
 		b.Fatalf("normalizeProfileMetricsConfig: %v", err)
 	}
-	rt, _, err := newProfileMetricRuntime(cfg, idx)
+	cfg.limits = profileMetricLimitsPolicy{
+		MaxRules:              4,
+		MaxSources:            64,
+		MaxResourcesPerSource: 32,
+		MaxInstancesPerJob:    4096,
+	}
+	rt, _, err := newProfileMetricRuntime(cfg, idx, "benchmark")
 	if err != nil {
 		b.Fatalf("newProfileMetricRuntime: %v", err)
 	}
@@ -335,55 +340,6 @@ func BenchmarkProfileMetricRuntimeUpdateAndCollect(b *testing.B) {
 	}
 }
 
-// BenchmarkPipelineSourceMetricsUpdateAndCollect exercises the built-in
-// receiver/pipeline source-metric hot path near the internal source cap.
-func BenchmarkPipelineSourceMetricsUpdateAndCollect(b *testing.B) {
-	const jobName = "bench-pipeline"
-	metrics := &perJobMetrics{}
-	store := metrix.NewCollectorStore()
-	managed, ok := metrix.AsCycleManagedStore(store)
-	if !ok {
-		b.Fatal("metrix.AsCycleManagedStore returned false")
-	}
-
-	entries := make([]*TrapEntry, 0, defaultPipelineMetricMaxSources)
-	for i := range defaultPipelineMetricMaxSources {
-		entries = append(entries, &TrapEntry{
-			JobName:  jobName,
-			SourceIP: benchmarkSourceIP(i),
-			Severity: "warning",
-		})
-	}
-	for i := range defaultPipelineMetricMaxSources - 1 {
-		metrics.recordSourceAccepted(entries[i])
-		metrics.recordSourceCommitted(entries[i])
-	}
-
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		entry := entries[i%len(entries)]
-		metrics.recordSourceAccepted(entry)
-		metrics.recordSourceCommitted(entry)
-		managed.CycleController().BeginCycle()
-		collectSourceMetrics(store, jobName, metrics)
-		if err := managed.CycleController().CommitCycleSuccess(); err != nil {
-			b.Fatalf("CommitCycleSuccess: %v", err)
-		}
-	}
-	b.StopTimer()
-
-	metrics.sourceMu.Lock()
-	sourceCount := len(metrics.sources)
-	overflowDropped := metrics.sourceDiagnostics.overflowDropped
-	metrics.sourceMu.Unlock()
-	b.ReportMetric(float64(sourceCount), "sources")
-	b.ReportMetric(float64(overflowDropped), "overflow_dropped")
-	if elapsed := b.Elapsed().Seconds(); elapsed > 0 {
-		b.ReportMetric(float64(b.N)/elapsed, "cycles/s")
-	}
-}
-
 func benchmarkProfileMetricIndex(b testing.TB) *ProfileIndex {
 	b.Helper()
 	idx := &ProfileIndex{
@@ -408,8 +364,8 @@ func benchmarkProfileMetricIndex(b testing.TB) *ProfileIndex {
 						"4": "aux",
 					},
 				},
-				sysUpTimeOID: {
-					OID:     sysUpTimeOID,
+				model.SysUpTimeOID: {
+					OID:     model.SysUpTimeOID,
 					Type:    "TimeTicks",
 					rawName: "sysUpTime.0",
 				},
@@ -472,10 +428,10 @@ func benchmarkProfileMetricIndex(b testing.TB) *ProfileIndex {
 		},
 	}
 	charts := []profileMetricChart{
-		{ID: "bench_config_changes", Title: "Benchmark config changes", Context: "snmp.trap.bench.config.changes", Units: "events/s", Algorithm: "incremental", sourceFile: "benchmark-profile.yaml"},
-		{ID: "bench_terminal_type", Title: "Benchmark terminal type", Context: "snmp.trap.bench.terminal.type", Units: "type", Algorithm: "absolute", sourceFile: "benchmark-profile.yaml"},
-		{ID: "bench_console_state", Title: "Benchmark console state", Context: "snmp.trap.bench.console.state", Units: "state", Algorithm: "absolute", sourceFile: "benchmark-profile.yaml"},
-		{ID: "bench_port_security", Title: "Benchmark port security", Context: "snmp.trap.bench.port.security", Units: "events/s", Algorithm: "incremental", sourceFile: "benchmark-profile.yaml"},
+		{ID: "bench_config_changes", Title: "Benchmark config changes", Context: "snmp.trap.bench.config.changes", Units: "events/s", Algorithm: "incremental", Lifecycle: &charttpl.Lifecycle{ExpireAfterCycles: 256}, sourceFile: "benchmark-profile.yaml"},
+		{ID: "bench_terminal_type", Title: "Benchmark terminal type", Context: "snmp.trap.bench.terminal.type", Units: "type", Algorithm: "absolute", Lifecycle: &charttpl.Lifecycle{ExpireAfterCycles: 256}, sourceFile: "benchmark-profile.yaml"},
+		{ID: "bench_console_state", Title: "Benchmark console state", Context: "snmp.trap.bench.console.state", Units: "state", Algorithm: "absolute", Lifecycle: &charttpl.Lifecycle{ExpireAfterCycles: 256}, sourceFile: "benchmark-profile.yaml"},
+		{ID: "bench_port_security", Title: "Benchmark port security", Context: "snmp.trap.bench.port.security", Units: "events/s", Algorithm: "incremental", Lifecycle: &charttpl.Lifecycle{ExpireAfterCycles: 256}, sourceFile: "benchmark-profile.yaml"},
 	}
 	if err := idx.addProfileMetrics(rules, charts); err != nil {
 		b.Fatalf("addProfileMetrics: %v", err)
@@ -496,7 +452,7 @@ func benchmarkProfileMetricConfigTrapEntry(jobName, sourceIP string, terminalTyp
 		}},
 		Varbinds: []VarbindValue{
 			{OID: testCiscoTerminalTypeOID, Type: "INTEGER", Value: terminalType},
-			{OID: sysUpTimeOID, Type: "TimeTicks", Value: uint64(12345)},
+			{OID: model.SysUpTimeOID, Type: "TimeTicks", Value: uint64(12345)},
 		},
 	}
 }
@@ -522,86 +478,8 @@ func benchmarkSourceIP(i int) string {
 	return fmt.Sprintf("10.%d.%d.%d", 100+(i/65025), (i/255)%255, i%255+1)
 }
 
-// ---------------------------------------------------------------------------
-// 4. SDK-backed journal writer/drain throughput (enhanced existing benchmarks)
-// ---------------------------------------------------------------------------
-
-func BenchmarkTrapWriterWrite(b *testing.B) {
-	tw := newJournalTrapWriter(nil, 1<<20)
-	entry := benchmarkTrapEntry()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		writeTrapEntryWithBackpressure(b, tw, entry)
-	}
-	b.StopTimer()
-	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "entries/s")
-	_ = tw.Close()
-}
-
-func BenchmarkJournalTrapWriterDrain(b *testing.B) {
-	dir := b.TempDir()
-	w, err := newTestJournalWriter(dir, JournalConfig{RotateSize: 200 * bytesPerMB})
-	if err != nil {
-		b.Fatalf("NewJournalWriter: %v", err)
-	}
-	tw := newJournalTrapWriter(w, 1<<20)
-	entry := benchmarkTrapEntry()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		writeTrapEntryWithBackpressure(b, tw, entry)
-	}
-	if err := tw.Flush(); err != nil {
-		b.Fatalf("Flush: %v", err)
-	}
-	b.StopTimer()
-	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "entries/s")
-	if err := tw.Close(); err != nil {
-		b.Fatalf("Close: %v", err)
-	}
-}
-
-func writeTrapEntryWithBackpressure(b *testing.B, tw *journalTrapWriter, entry *TrapEntry) {
-	b.Helper()
-	for {
-		err := tw.Write(entry)
-		if err == nil {
-			return
-		}
-		if err != errQueueFull {
-			b.Fatalf("Write: %v", err)
-		}
-		runtime.Gosched()
-	}
-}
-
-func BenchmarkJournalWriterWriteEntry(b *testing.B) {
-	dir := b.TempDir()
-	w, err := newTestJournalWriter(dir, JournalConfig{RotateSize: 200 * bytesPerMB})
-	if err != nil {
-		b.Fatalf("NewJournalWriter: %v", err)
-	}
-	defer w.Close()
-
-	fields, err := serializeToJournalFields(benchmarkTrapEntry())
-	if err != nil {
-		b.Fatalf("serializeToJournalFields: %v", err)
-	}
-	now := time.Now().UnixMicro()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := w.WriteEntry(fields, now+int64(i), now+int64(i)); err != nil {
-			b.Fatalf("WriteEntry: %v", err)
-		}
-	}
-	b.StopTimer()
-	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "entries/s")
-}
-
 // BenchmarkFullPacketToJournal measures the combined path:
-// synthetic SNMPv2c packet -> handlePacket -> journalTrapWriter queue ->
+// synthetic SNMPv2c packet -> handlePacket -> journal writer queue ->
 // SDK-backed journal append/sync. journalctl row counting runs after the timed
 // section so the throughput metric reflects ingestion and persistence only.
 func BenchmarkFullPacketToJournal(b *testing.B) {
@@ -620,18 +498,14 @@ func BenchmarkFullPacketToJournal(b *testing.B) {
 		Name:        "TEST-MIB::coldStartSecurity",
 		Category:    "security",
 		Severity:    "warning",
-		Description: "coldStart from {TRAP_SOURCE_IP}",
+		Description: "coldStart from {{source_ip}}",
 	}
 	setBenchProfileIndex(b, map[string]*TrapDef{trap.OID: trap})
 
 	dir := b.TempDir()
-	w, err := newTestJournalWriter(dir, JournalConfig{RotateSize: 200 * bytesPerMB})
-	if err != nil {
-		b.Fatalf("NewJournalWriter: %v", err)
-	}
-	tw := newJournalTrapWriter(w, 1<<20)
+	tw := newBenchmarkJournalWriter(b, dir, 1<<20)
 	c := &Collector{
-		jobName:    "bench-full",
+		Config:     Config{Name: "bench-full"},
 		trapWriter: tw,
 		versions:   map[SnmpVersion]struct{}{SnmpVersionV2c: {}},
 		allowlist:  NewAllowlist(nil, []string{"public"}),
@@ -650,7 +524,7 @@ func BenchmarkFullPacketToJournal(b *testing.B) {
 	}
 	b.StopTimer()
 
-	journalDir := w.JournalDirectory()
+	journalDir := tw.Directory()
 	if err := tw.Close(); err != nil {
 		b.Fatalf("Close: %v", err)
 	}
@@ -666,9 +540,27 @@ func BenchmarkFullPacketToJournal(b *testing.B) {
 	}
 }
 
+func newBenchmarkJournalWriter(b *testing.B, dir string, queueCapacity int) *journal.Writer {
+	b.Helper()
+	writer, err := journal.Prepare(
+		dir,
+		journal.Config{RotateSize: 200 * 1024 * 1024},
+		newTestJournalHostProvider(),
+		journal.Options{QueueCapacity: queueCapacity},
+	)
+	if err != nil {
+		b.Fatalf("prepare journal writer: %v", err)
+	}
+	if err := writer.Start(); err != nil {
+		_ = writer.Close()
+		b.Fatalf("start journal writer: %v", err)
+	}
+	return writer
+}
+
 // BenchmarkUDPPacketToJournal measures the real local UDP receive path:
 // UDP socket -> Listener.readLoop -> Collector.handlePacket ->
-// journalTrapWriter queue -> SDK-backed journal append/sync.
+// journal writer queue -> SDK-backed journal append/sync.
 func BenchmarkUDPPacketToJournal(b *testing.B) {
 	requireJournalctlBenchmark(b)
 
@@ -714,7 +606,7 @@ func BenchmarkUDPPacketToJournalPaced(b *testing.B) {
 
 type udpPacketToJournalBenchmark struct {
 	data       []byte
-	writer     *journalTrapWriter
+	writer     *journal.Writer
 	listener   *Listener
 	conn       *net.UDPConn
 	delivered  atomic.Int64
@@ -736,21 +628,17 @@ func newUDPPacketToJournalBenchmark(b *testing.B) *udpPacketToJournalBenchmark {
 		Name:        "TEST-MIB::coldStartSecurity",
 		Category:    "security",
 		Severity:    "warning",
-		Description: "coldStart from {TRAP_SOURCE_IP}",
+		Description: "coldStart from {{source_ip}}",
 	}
 	setBenchProfileIndex(b, map[string]*TrapDef{trap.OID: trap})
 
-	w, err := newTestJournalWriter(b.TempDir(), JournalConfig{RotateSize: 200 * bytesPerMB})
-	if err != nil {
-		b.Fatalf("NewJournalWriter: %v", err)
-	}
-	tw := newJournalTrapWriter(w, defaultQueueCapacity)
+	tw := newBenchmarkJournalWriter(b, b.TempDir(), journal.DefaultQueueCapacity)
 	b.Cleanup(func() {
 		_ = tw.Close()
 	})
 
 	c := &Collector{
-		jobName:    "bench-udp",
+		Config:     Config{Name: "bench-udp"},
 		trapWriter: tw,
 		versions:   map[SnmpVersion]struct{}{SnmpVersionV2c: {}},
 		allowlist:  NewAllowlist(nil, []string{"public"}),
@@ -780,7 +668,7 @@ func newUDPPacketToJournalBenchmark(b *testing.B) *udpPacketToJournalBenchmark {
 		writer:     tw,
 		listener:   listener,
 		conn:       conn,
-		journalDir: w.JournalDirectory(),
+		journalDir: tw.Directory(),
 	}
 	listener.start(func(pkt []byte, peerIP net.IP, conn *net.UDPConn, peer *net.UDPAddr) {
 		c.handlePacket(pkt, peerIP, conn, peer)
@@ -960,31 +848,6 @@ func countJournalRowsBenchmark(b *testing.B, dir, match string) int64 {
 		return 0
 	}
 	return int64(bytes.Count(trimmed, []byte{'\n'}) + 1)
-}
-
-func benchmarkTrapEntry() *TrapEntry {
-	return &TrapEntry{
-		JobName:               "bench",
-		ReportType:            ReportTypeTrap,
-		ReceivedRealtimeUsec:  1000000,
-		ReceivedMonotonicUsec: 1000,
-		TrapOID:               "1.3.6.1.6.3.1.1.5.1",
-		TrapName:              "TEST-MIB::coldStart",
-		Category:              "security",
-		Severity:              "warning",
-		Message:               "benchmark trap",
-		SourceIP:              "192.0.2.10",
-		SourceUDPPeer:         "192.0.2.10",
-		PduType:               PduTypeTrap,
-		SnmpVersion:           SnmpVersionV2c,
-		Labels: map[string]string{
-			"site": "lab",
-		},
-		Varbinds: []VarbindValue{
-			{Name: "ifIndex", OID: "1.3.6.1.2.1.2.2.1.1", Type: "INTEGER", Value: int64(1)},
-			{Name: "ifDescr", OID: "1.3.6.1.2.1.31.1.1.1.1", Type: "OctetString", Value: "Ethernet1"},
-		},
-	}
 }
 
 func benchmarkDedupEntry() *TrapEntry {

@@ -5,13 +5,13 @@ package snmp_traps
 import (
 	"net"
 	"net/netip"
-	"strconv"
 	"testing"
 
 	"github.com/gosnmp/gosnmp"
 	"github.com/netdata/netdata/go/plugins/pkg/metrix"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp/ddsnmp"
 	snmptopology "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_topology"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_traps/internal/output"
 )
 
 func readSinglePcapUDPPacket(t *testing.T, fixture string) pcapUDPPacket {
@@ -44,9 +44,9 @@ func setSingleTestTrap(t *testing.T, trap *TrapDef) {
 	setTestProfileIndex(t, map[string]*TrapDef{trap.OID: trap})
 }
 
-func newTestV2Collector(jobName string, writer TrapWriter, prefixes []netip.Prefix, communities []string) *Collector {
+func newTestV2Collector(jobName string, writer output.Writer, prefixes []netip.Prefix, communities []string) *Collector {
 	return &Collector{
-		jobName:     jobName,
+		Config:      Config{Name: jobName},
 		trapWriter:  writer,
 		journalHost: newTestJournalHostProvider(),
 		versions:    map[SnmpVersion]struct{}{SnmpVersionV2c: {}},
@@ -54,7 +54,7 @@ func newTestV2Collector(jobName string, writer TrapWriter, prefixes []netip.Pref
 	}
 }
 
-func newDefaultTestV2Collector(writer TrapWriter) *Collector {
+func newDefaultTestV2Collector(writer output.Writer) *Collector {
 	return newTestV2Collector("test", writer, nil, []string{"public"})
 }
 
@@ -98,24 +98,13 @@ func collectJobMetricsForTest(t *testing.T, jobName string) metrix.CollectorStor
 	return store
 }
 
-func (m *perJobMetrics) fallbackSourceIdentityForTest(entry *TrapEntry) (string, string) {
-	m.sourceMu.Lock()
-	defer m.sourceMu.Unlock()
-	m.initSourceMetricsLocked()
-	return fallbackTrapSourceIdentity(entry, entry.JobName, profileMetricSourceIDHash, m.sourceHashSalt)
-}
-
-func privateTestIP(i int) string {
-	return "10." + strconv.Itoa((i/65536)%256) + "." + strconv.Itoa((i/256)%256) + "." + strconv.Itoa(i%256)
-}
-
-func newDedupTestV2Collector(t *testing.T, jobName string, writer TrapWriter) (*Collector, *perJobMetrics) {
+func newDedupTestV2Collector(t *testing.T, jobName string, writer output.Writer) (*Collector, *perJobMetrics) {
 	t.Helper()
 
 	metrics := withCleanJobMetrics(t, jobName)
 	metrics.setDedupEnabled(true)
 	c := newTestV2Collector(jobName, writer, nil, []string{"public"})
-	c.Config = Config{Dedup: DedupConfig{Enabled: true}}
+	c.Dedup = DedupConfig{Enabled: true}
 	c.metrics = metrics
 	c.deduper = newTrapDeduper(jobName, c.Dedup, writer, metrics, "", c.monotonicUsec)
 	return c, metrics
@@ -159,12 +148,12 @@ func registerTestLocalEngineID(
 
 func newTestV3Collector(
 	jobName string,
-	writer TrapWriter,
+	writer output.Writer,
 	secTable *gosnmp.SnmpV3SecurityParametersTable,
 	engineIDs map[string]struct{},
 ) *Collector {
 	return &Collector{
-		jobName:     jobName,
+		Config:      Config{Name: jobName},
 		trapWriter:  writer,
 		journalHost: newTestJournalHostProvider(),
 		versions:    map[SnmpVersion]struct{}{SnmpVersionV3: {}},
@@ -192,9 +181,8 @@ func newDynamicEngineIDTestCollector(
 	}
 	writer := &mockTrapWriter{}
 	c := &Collector{
-		jobName:            jobName,
+		Config:             Config{Name: jobName, USMUsers: []USMUserConfig{user}},
 		trapWriter:         writer,
-		Config:             Config{USMUsers: []USMUserConfig{user}},
 		versions:           map[SnmpVersion]struct{}{SnmpVersionV3: {}},
 		allowlist:          NewAllowlist(nil, nil),
 		v3SecTable:         secTable,

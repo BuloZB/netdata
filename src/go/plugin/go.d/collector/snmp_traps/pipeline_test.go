@@ -16,11 +16,17 @@ import (
 	"github.com/netdata/netdata/go/plugins/pkg/metrix"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp/ddsnmp"
 	snmptopology "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_topology"
-	"gopkg.in/yaml.v2"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_traps/internal/model"
 )
 
 func setTestProfileIndex(t *testing.T, traps map[string]*TrapDef) {
 	t.Helper()
+	for _, trap := range traps {
+		if err := compileTrapTemplates(trap, nil); err != nil {
+			t.Fatalf("compile test trap templates: %v", err)
+		}
+		trap.sharedVarbinds = buildSharedVarbinds(trap, nil)
+	}
 	// Test-only shortcut: direct packet-path tests do not run Collector.Init(),
 	// so they seed the immutable shared index without touching refcounts.
 	globalProfileCache.current.Store(&ProfileIndex{trapsByOID: traps})
@@ -56,7 +62,7 @@ func (panicTrapWriter) Close() error           { return nil }
 
 func TestCollectorHandlePacketWritesProfileResolvedTrapEntry(t *testing.T) {
 	packet := readColdStartUDPPacket(t)
-	trap := testColdStartTrap("security", "warning", "security coldStart from {TRAP_SOURCE_IP}")
+	trap := testColdStartTrap("security", "warning", "security coldStart from {{source_ip}}")
 	setSingleTestTrap(t, trap)
 	writer := &mockTrapWriter{}
 	c := newDefaultTestV2Collector(writer)
@@ -83,7 +89,7 @@ func TestCollectorHandlePacketWritesProfileResolvedTrapEntry(t *testing.T) {
 
 func TestCollectorHandlePacketAssignsReceiveSequencePerPacket(t *testing.T) {
 	packet := readColdStartUDPPacket(t)
-	trap := testColdStartTrap("security", "warning", "coldStart from {TRAP_SOURCE_IP}")
+	trap := testColdStartTrap("security", "warning", "coldStart from {{source_ip}}")
 	setSingleTestTrap(t, trap)
 	writer := &mockTrapWriter{}
 	c := newDefaultTestV2Collector(writer)
@@ -104,7 +110,7 @@ func TestCollectorHandlePacketAssignsReceiveSequencePerPacket(t *testing.T) {
 
 func TestCollectorHandlePacketRecoversFromPanic(t *testing.T) {
 	packet := readColdStartUDPPacket(t)
-	trap := testColdStartTrap("security", "warning", "security coldStart from {TRAP_SOURCE_IP}")
+	trap := testColdStartTrap("security", "warning", "security coldStart from {{source_ip}}")
 	setSingleTestTrap(t, trap)
 	metrics := withCleanJobMetrics(t, "panic-recover")
 	c := newTestV2Collector("panic-recover", panicTrapWriter{}, nil, []string{"public"})
@@ -127,7 +133,7 @@ func TestCollectorHandlePacketRendersTemplatesAfterEnrichment(t *testing.T) {
 		Vendor:   "cisco",
 	})
 
-	trap := testColdStartTrap("security", "warning", "security coldStart on {_HOSTNAME} from {TRAP_DEVICE_VENDOR}")
+	trap := testColdStartTrap("security", "warning", "security coldStart on {{hostname}} from {{vendor}}")
 	setSingleTestTrap(t, trap)
 	writer := &mockTrapWriter{}
 	c := newDefaultTestV2Collector(writer)
@@ -145,7 +151,7 @@ func TestCollectorHandlePacketRendersTemplatesAfterEnrichment(t *testing.T) {
 
 func TestCollectorHandlePacketDoesNotUseListenerVnodeAsSourceNode(t *testing.T) {
 	packet := readColdStartUDPPacket(t)
-	trap := testColdStartTrap("security", "warning", "coldStart from {TRAP_SOURCE_IP}")
+	trap := testColdStartTrap("security", "warning", "coldStart from {{source_ip}}")
 	setSingleTestTrap(t, trap)
 	writer := &mockTrapWriter{}
 	c := newDefaultTestV2Collector(writer)
@@ -192,7 +198,7 @@ func TestCollectorHandlePacketRendersTopologyEnrichmentBeforeReverseDNS(t *testi
 	trap := testColdStartTrap(
 		"security",
 		"warning",
-		"trap on {_HOSTNAME} vendor {TRAP_DEVICE_VENDOR}",
+		"trap on {{hostname}} vendor {{vendor}}",
 	)
 	setSingleTestTrap(t, trap)
 	writer := &mockTrapWriter{}
@@ -222,7 +228,7 @@ func TestCollectorHandlePacketDedupSuppressesDuplicates(t *testing.T) {
 	const jobName = "test-dedup-packet"
 
 	packet := readColdStartUDPPacket(t)
-	trap := testColdStartTrap("security", "warning", "coldStart from {TRAP_SOURCE_IP}")
+	trap := testColdStartTrap("security", "warning", "coldStart from {{source_ip}}")
 	setSingleTestTrap(t, trap)
 	writer := &mockTrapWriter{}
 	c, metrics := newDedupTestV2Collector(t, jobName, writer)
@@ -269,17 +275,6 @@ func TestCollectorHandlePacketDedupSuppressesDuplicates(t *testing.T) {
 			t.Fatalf("%s = %v/%v, want %v/true", name, v, ok, expected)
 		}
 	}
-	sourceID, sourceKind := metrics.fallbackSourceIdentityForTest(writer.entries[0])
-	sourceLabels := metrix.Labels{"job_name": jobName, "source_id": sourceID, "source_kind": sourceKind}
-	for name, expected := range map[string]float64{
-		"snmp_trap_source_pipeline_accepted":         2,
-		"snmp_trap_source_pipeline_committed":        1,
-		"snmp_trap_source_pipeline_dedup_suppressed": 1,
-	} {
-		if v, ok := store.Read().Value(name, sourceLabels); !ok || v != expected {
-			t.Fatalf("%s = %v/%v, want %v/true", name, v, ok, expected)
-		}
-	}
 }
 
 func TestCollectorHandlePacketDedupPreservesHealthErrorCounters(t *testing.T) {
@@ -313,7 +308,12 @@ func TestCollectorHandlePacketDedupPreservesHealthErrorCounters(t *testing.T) {
 	t.Run("template unresolved", func(t *testing.T) {
 		const jobName = "test-dedup-template-unresolved"
 
-		trap := testColdStartTrap("security", "warning", "coldStart from {DOES_NOT_EXIST}")
+		trap := testColdStartTrap("security", "warning", `coldStart from {{with value "missing_var"}}{{.}}{{else}}<missing>{{end}}`)
+		trap.VarbindRefs = []any{map[any]any{
+			"name": "missing_var",
+			"oid":  "1.3.6.1.4.1.99999.1",
+			"type": "OctetString",
+		}}
 		trap.Name = "TEST-MIB::coldStartTemplate"
 		setSingleTestTrap(t, trap)
 		writer := &mockTrapWriter{}
@@ -342,7 +342,7 @@ func TestCollectorHandlePacketDedupRollsBackFingerprintAfterWriteFailure(t *test
 	const jobName = "test-dedup-write-rollback"
 
 	packet := readColdStartUDPPacket(t)
-	trap := testColdStartTrap("security", "warning", "coldStart from {TRAP_SOURCE_IP}")
+	trap := testColdStartTrap("security", "warning", "coldStart from {{source_ip}}")
 	setSingleTestTrap(t, trap)
 	writer := &mockTrapWriter{err: errors.New("write failed")}
 	c, metrics := newDedupTestV2Collector(t, jobName, writer)
@@ -355,22 +355,6 @@ func TestCollectorHandlePacketDedupRollsBackFingerprintAfterWriteFailure(t *test
 	jobLabels := metrix.Labels{"job_name": jobName}
 	if v, ok := store.Read().Value("snmp_trap_pipeline_write_failed", jobLabels); !ok || v != 1 {
 		t.Fatalf("snmp_trap_pipeline_write_failed = %v/%v, want 1/true", v, ok)
-	}
-	sourceEntry := &TrapEntry{
-		JobName:       jobName,
-		SourceIP:      packet.peer.String(),
-		SourceUDPPeer: packet.peer.String(),
-		Enrichment:    &TrapEnrichmentAudit{Source: &TrapSourceAudit{Selected: packet.peer.String(), Method: "udp_peer"}},
-	}
-	sourceID, sourceKind := metrics.fallbackSourceIdentityForTest(sourceEntry)
-	sourceLabels := metrix.Labels{"job_name": jobName, "source_id": sourceID, "source_kind": sourceKind}
-	for name, expected := range map[string]float64{
-		"snmp_trap_source_pipeline_write_failed":       1,
-		"snmp_trap_source_errors_journal_write_failed": 1,
-	} {
-		if v, ok := store.Read().Value(name, sourceLabels); !ok || v != expected {
-			t.Fatalf("%s = %v/%v, want %v/true", name, v, ok, expected)
-		}
 	}
 	if got := metrics.dedup.suppressed.Load(); got != 0 {
 		t.Fatalf("dedup suppressed after failed first write = %d, want 0", got)
@@ -395,7 +379,7 @@ func TestCollectorHandlePacketDropsDisallowedVersion(t *testing.T) {
 	packet := readColdStartUDPPacket(t)
 	writer := &mockTrapWriter{}
 	c := &Collector{
-		jobName:    "test",
+		Config:     Config{Name: "test"},
 		trapWriter: writer,
 		versions:   map[SnmpVersion]struct{}{SnmpVersionV3: {}},
 		allowlist:  NewAllowlist(nil, nil),
@@ -433,7 +417,7 @@ func TestCollectorHandlePacketDropsDisallowedV3BeforeDecode(t *testing.T) {
 	data := buildV3Trap(t, "testuser", "1.3.6.1.6.3.1.1.5.1")
 	writer := &mockTrapWriter{}
 	c := &Collector{
-		jobName:    jobName,
+		Config:     Config{Name: jobName},
 		trapWriter: writer,
 		versions:   map[SnmpVersion]struct{}{SnmpVersionV2c: {}},
 		allowlist:  NewAllowlist(nil, nil),
@@ -599,7 +583,7 @@ func TestCollectorHandlePacketDropsDisallowedCommunity(t *testing.T) {
 
 func TestCollectorHandlePacketAllowsAllowedCommunity(t *testing.T) {
 	packet := readColdStartUDPPacket(t)
-	trap := testColdStartTrap("state_change", "warning", "coldStart from {TRAP_SOURCE_IP}")
+	trap := testColdStartTrap("state_change", "warning", "coldStart from {{source_ip}}")
 	setSingleTestTrap(t, trap)
 	writer := &mockTrapWriter{}
 	c := newTestV2Collector("test", writer, nil, []string{"public"})
@@ -613,7 +597,7 @@ func TestCollectorHandlePacketAllowsAllowedCommunity(t *testing.T) {
 
 func TestCollectorHandlePacketIncrementsEventsMetric(t *testing.T) {
 	packet := readColdStartUDPPacket(t)
-	trap := testColdStartTrap("state_change", "warning", "coldStart from {TRAP_SOURCE_IP}")
+	trap := testColdStartTrap("state_change", "warning", "coldStart from {{source_ip}}")
 	setSingleTestTrap(t, trap)
 	writer := &mockTrapWriter{}
 	c := newDefaultTestV2Collector(writer)
@@ -633,7 +617,7 @@ func TestCollectorHandlePacketIncrementsSeverityMetric(t *testing.T) {
 	withCleanJobMetrics(t, jobName)
 
 	packet := readColdStartUDPPacket(t)
-	trap := testColdStartTrap("state_change", "warning", "coldStart from {TRAP_SOURCE_IP}")
+	trap := testColdStartTrap("state_change", "warning", "coldStart from {{source_ip}}")
 	setSingleTestTrap(t, trap)
 	writer := &mockTrapWriter{}
 	c := newTestV2Collector(jobName, writer, nil, []string{"public"})
@@ -695,7 +679,12 @@ func TestCollectMetricsEmitsSeverityCounters(t *testing.T) {
 
 func TestCollectorHandlePacketIncrementsTemplateUnresolved(t *testing.T) {
 	packet := readColdStartUDPPacket(t)
-	trap := testColdStartTrap("security", "warning", "security coldStart from {missing_var}")
+	trap := testColdStartTrap("security", "warning", `security coldStart from {{with value "missing_var"}}{{.}}{{else}}<missing>{{end}}`)
+	trap.VarbindRefs = []any{map[any]any{
+		"name": "missing_var",
+		"oid":  "1.3.6.1.4.1.99999.1",
+		"type": "OctetString",
+	}}
 	setSingleTestTrap(t, trap)
 	writer := &mockTrapWriter{}
 	c := newDefaultTestV2Collector(writer)
@@ -792,7 +781,7 @@ func TestCollectorHandlePacketClassifiesAuthFailureUnknownV3EngineID(t *testing.
 
 func TestCollectorHandlePacketAllowsIPv4MappedSourceCIDR(t *testing.T) {
 	packet := readColdStartUDPPacket(t)
-	trap := testColdStartTrap("security", "warning", "coldStart from {TRAP_SOURCE_IP}")
+	trap := testColdStartTrap("security", "warning", "coldStart from {{source_ip}}")
 	setSingleTestTrap(t, trap)
 	writer := &mockTrapWriter{}
 	c := newTestV2Collector("test", writer, []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}, []string{"public"})
@@ -810,7 +799,7 @@ func TestCollectorHandlePacketAllowsIPv4MappedSourceCIDR(t *testing.T) {
 
 func TestCollectorHandlePacketAllowsNativeIPv6SourceCIDR(t *testing.T) {
 	packet := readColdStartUDPPacket(t)
-	trap := testColdStartTrap("security", "warning", "coldStart from {TRAP_SOURCE_IP}")
+	trap := testColdStartTrap("security", "warning", "coldStart from {{source_ip}}")
 	setSingleTestTrap(t, trap)
 	writer := &mockTrapWriter{}
 	c := newTestV2Collector("test", writer, []netip.Prefix{netip.MustParsePrefix("2001:db8::/32")}, []string{"public"})
@@ -824,10 +813,10 @@ func TestCollectorHandlePacketAllowsNativeIPv6SourceCIDR(t *testing.T) {
 }
 
 func TestCollectorHandlePacketUsesSnmpTrapAddressOnlyForTrustedRelay(t *testing.T) {
-	trap := testColdStartTrap("security", "warning", "coldStart from {TRAP_SOURCE_IP}")
+	trap := testColdStartTrap("security", "warning", "coldStart from {{source_ip}}")
 	setSingleTestTrap(t, trap)
 	data := buildV2cTrap(t, "public", "1.3.6.1.6.3.1.1.5.1", gosnmp.SnmpPDU{
-		Name:  snmpTrapAddressOID,
+		Name:  model.SNMPTrapAddressOID,
 		Type:  gosnmp.IPAddress,
 		Value: "192.0.2.20",
 	})
@@ -945,7 +934,7 @@ func TestCollectorHandlePacketRateLimitSampleWritesTrap(t *testing.T) {
 	const jobName = "test-rate-limit-sample"
 	withCleanJobMetrics(t, jobName)
 
-	trap := testColdStartTrap("security", "warning", "coldStart from {TRAP_SOURCE_IP}")
+	trap := testColdStartTrap("security", "warning", "coldStart from {{source_ip}}")
 	setSingleTestTrap(t, trap)
 	peer := &net.UDPAddr{IP: net.ParseIP("10.1.2.3"), Port: 9162}
 	rl := newRateLimiter(true, 1, "sample")
@@ -1012,12 +1001,12 @@ func TestCollectMetricsEmitsCounters(t *testing.T) {
 	}
 }
 
-func TestCollectorHandlePacketEmitsPipelineAndSourceMetrics(t *testing.T) {
+func TestCollectorHandlePacketEmitsPipelineMetrics(t *testing.T) {
 	packet := readColdStartUDPPacket(t)
-	const jobName = "test-pipeline-source-metrics"
+	const jobName = "test-pipeline-metrics"
 	metrics := withCleanJobMetrics(t, jobName)
 
-	trap := testColdStartTrap("security", "warning", "coldStart from {TRAP_SOURCE_IP}")
+	trap := testColdStartTrap("security", "warning", "coldStart from {{source_ip}}")
 	setSingleTestTrap(t, trap)
 	writer := &mockTrapWriter{}
 	c := newTestV2Collector(jobName, writer, nil, []string{"public"})
@@ -1037,217 +1026,10 @@ func TestCollectorHandlePacketEmitsPipelineAndSourceMetrics(t *testing.T) {
 		"snmp_trap_pipeline_accepted":  1,
 		"snmp_trap_pipeline_committed": 1,
 		"snmp_trap_pipeline_dropped":   0,
-		"snmp_trap_sources_active":     1,
 	} {
 		if v, ok := store.Read().Value(name, jobLabels); !ok || v != expected {
 			t.Fatalf("%s = %v/%v, want %v/true", name, v, ok, expected)
 		}
-	}
-	if v, ok := store.Read().Value("snmp_trap_source_attribution_fallback", jobLabels); !ok || v != 1 {
-		t.Fatalf("source fallback attribution = %v/%v, want 1/true", v, ok)
-	}
-
-	sourceID, sourceKind := metrics.fallbackSourceIdentityForTest(writer.entries[0])
-	if sourceID == "" || sourceID == writer.entries[0].SourceIP {
-		t.Fatalf("hashed source_id = %q, raw source = %q", sourceID, writer.entries[0].SourceIP)
-	}
-	sourceLabels := metrix.Labels{"job_name": jobName, "source_id": sourceID, "source_kind": sourceKind}
-	for name, expected := range map[string]float64{
-		"snmp_trap_source_pipeline_accepted":  1,
-		"snmp_trap_source_pipeline_committed": 1,
-	} {
-		if v, ok := store.Read().Value(name, sourceLabels); !ok || v != expected {
-			t.Fatalf("%s = %v/%v, want %v/true", name, v, ok, expected)
-		}
-	}
-	if _, ok := store.Read().Value("snmp_trap_source_pipeline_committed", metrix.Labels{"job_name": jobName, "source_id": writer.entries[0].SourceIP, "source_kind": "entry_source"}); ok {
-		t.Fatalf("raw source label leaked in hash mode")
-	}
-	if _, ok := store.Read().Value("snmp_trap_source_last_seen_seconds", sourceLabels); !ok {
-		t.Fatalf("source last-seen metric missing")
-	}
-}
-
-func TestCollectMetricsUsesVnodeHostScopeForSourceMetrics(t *testing.T) {
-	const jobName = "test-pipeline-vnode-source"
-	metrics := withCleanJobMetrics(t, jobName)
-	entry := &TrapEntry{
-		JobName:        jobName,
-		SourceIP:       "192.0.2.10",
-		SourceVnodeID:  "vnode-1",
-		DeviceHostname: "switch-1",
-		Enrichment: &TrapEnrichmentAudit{Source: &TrapSourceAudit{
-			Selected: "192.0.2.10",
-			Method:   "udp_peer",
-		}},
-	}
-	metrics.recordSourceAccepted(entry)
-	metrics.recordSourceCommitted(entry)
-
-	store := collectJobMetricsForTest(t, jobName)
-	labels := metrix.Labels{"job_name": jobName, "source_id": "vnode-1", "source_kind": "vnode"}
-	if _, ok := store.Read().Value("snmp_trap_source_pipeline_committed", labels); ok {
-		t.Fatalf("vnode-scoped source metric appeared on default host scope")
-	}
-	if v, ok := store.Read(metrix.ReadHostScope("vnode-1")).Value("snmp_trap_source_pipeline_committed", labels); !ok || v != 1 {
-		t.Fatalf("vnode-scoped source committed metric = %v/%v, want 1/true", v, ok)
-	}
-	if v, ok := store.Read().Value("snmp_trap_source_attribution_vnode", metrix.Labels{"job_name": jobName}); !ok || v != 1 {
-		t.Fatalf("source vnode attribution = %v/%v, want 1/true", v, ok)
-	}
-}
-
-func TestCollectMetricsUsesFallbackSourceWhenVnodeAttributionConflicts(t *testing.T) {
-	const jobName = "test-pipeline-vnode-conflict-source"
-	metrics := withCleanJobMetrics(t, jobName)
-	entry := &TrapEntry{
-		JobName:        jobName,
-		SourceIP:       "192.0.2.10",
-		SourceUDPPeer:  "192.0.2.10",
-		SourceVnodeID:  "vnode-1",
-		DeviceHostname: "switch-1",
-		Enrichment: &TrapEnrichmentAudit{
-			Source: &TrapSourceAudit{
-				Selected: "192.0.2.10",
-				Method:   "udp_peer",
-			},
-			Topology: &TrapEnrichmentLookup{
-				Status: "conflict",
-				Reason: "vnode_mismatch",
-			},
-		},
-	}
-	metrics.recordSourceAccepted(entry)
-	metrics.recordSourceCommitted(entry)
-
-	store := collectJobMetricsForTest(t, jobName)
-	vnodeLabels := metrix.Labels{"job_name": jobName, "source_id": "vnode-1", "source_kind": "vnode"}
-	if _, ok := store.Read(metrix.ReadHostScope("vnode-1")).Value("snmp_trap_source_pipeline_committed", vnodeLabels); ok {
-		t.Fatalf("conflicting vnode attribution emitted vnode-scoped source metric")
-	}
-	sourceID, sourceKind := metrics.fallbackSourceIdentityForTest(entry)
-	fallbackLabels := metrix.Labels{"job_name": jobName, "source_id": sourceID, "source_kind": sourceKind}
-	if v, ok := store.Read().Value("snmp_trap_source_pipeline_committed", fallbackLabels); !ok || v != 1 {
-		t.Fatalf("fallback-scoped source committed metric = %v/%v, want 1/true", v, ok)
-	}
-	jobLabels := metrix.Labels{"job_name": jobName}
-	if v, ok := store.Read().Value("snmp_trap_source_attribution_ambiguous", jobLabels); !ok || v != 1 {
-		t.Fatalf("source ambiguous attribution = %v/%v, want 1/true", v, ok)
-	}
-	if v, ok := store.Read().Value("snmp_trap_source_attribution_fallback", jobLabels); !ok || v != 1 {
-		t.Fatalf("source fallback attribution = %v/%v, want 1/true", v, ok)
-	}
-}
-
-func TestCollectMetricsSourceAttributionDiagnostics(t *testing.T) {
-	const jobName = "test-pipeline-source-attribution"
-	metrics := withCleanJobMetrics(t, jobName)
-
-	metrics.recordSourceAccepted(&TrapEntry{JobName: jobName})
-	metrics.recordSourceAccepted(&TrapEntry{
-		JobName:  jobName,
-		SourceIP: "192.0.2.10",
-		Enrichment: &TrapEnrichmentAudit{
-			Source: &TrapSourceAudit{
-				Selected:           "192.0.2.10",
-				Method:             "udp_peer",
-				RejectedCandidates: []string{"snmpTrapAddress.0:ambiguous_source"},
-			},
-		},
-	})
-	metrics.recordSourceAccepted(&TrapEntry{
-		JobName:  jobName,
-		SourceIP: "192.0.2.11",
-		Enrichment: &TrapEnrichmentAudit{Source: &TrapSourceAudit{
-			Selected: "192.0.2.11",
-			Method:   "udp_peer",
-		}},
-	})
-	metrics.recordSourceAccepted(&TrapEntry{
-		JobName:        jobName,
-		SourceIP:       "192.0.2.11",
-		SourceVnodeID:  "vnode-transition",
-		DeviceHostname: "switch-transition",
-		Enrichment: &TrapEnrichmentAudit{Source: &TrapSourceAudit{
-			Selected: "192.0.2.11",
-			Method:   "udp_peer",
-		}},
-	})
-
-	store := collectJobMetricsForTest(t, jobName)
-	labels := metrix.Labels{"job_name": jobName}
-	for name, expected := range map[string]float64{
-		"snmp_trap_pipeline_accepted":                     4,
-		"snmp_trap_sources_active":                        3,
-		"snmp_trap_source_attribution_failed":             1,
-		"snmp_trap_source_attribution_ambiguous":          1,
-		"snmp_trap_source_attribution_fallback":           2,
-		"snmp_trap_source_attribution_vnode":              1,
-		"snmp_trap_source_attribution_source_transitions": 1,
-	} {
-		if v, ok := store.Read().Value(name, labels); !ok || v != expected {
-			t.Fatalf("%s = %v/%v, want %v/true", name, v, ok, expected)
-		}
-	}
-}
-
-func TestCollectMetricsSourceCapAndLifecycle(t *testing.T) {
-	const jobName = "test-pipeline-source-cap"
-	metrics := withCleanJobMetrics(t, jobName)
-	for i := range defaultPipelineMetricMaxSources + 1 {
-		entry := &TrapEntry{
-			JobName:  jobName,
-			SourceIP: privateTestIP(i),
-		}
-		metrics.recordSourceAccepted(entry)
-	}
-
-	store := collectJobMetricsForTest(t, jobName)
-	labels := metrix.Labels{"job_name": jobName}
-	if v, ok := store.Read().Value("snmp_trap_sources_active", labels); !ok || v != defaultPipelineMetricMaxSources {
-		t.Fatalf("active sources = %v/%v, want %d/true", v, ok, defaultPipelineMetricMaxSources)
-	}
-	if v, ok := store.Read().Value("snmp_trap_source_attribution_overflow_dropped", labels); !ok || v != 1 {
-		t.Fatalf("source overflow = %v/%v, want 1/true", v, ok)
-	}
-
-	for range defaultPipelineMetricExpireAfterCycles {
-		store = collectJobMetricsForTest(t, jobName)
-	}
-	if v, ok := store.Read().Value("snmp_trap_sources_active", labels); !ok || v != 0 {
-		t.Fatalf("active sources after expiry = %v/%v, want 0/true", v, ok)
-	}
-}
-
-func TestCollectMetricsSourceErrorsAndDedup(t *testing.T) {
-	const jobName = "test-pipeline-source-errors"
-	metrics := withCleanJobMetrics(t, jobName)
-	entry := &TrapEntry{JobName: jobName, SourceIP: "192.0.2.10"}
-
-	metrics.recordSourceAccepted(entry)
-	metrics.recordSourceError(entry, "unknown_oid")
-	metrics.recordWriteFailure(entry, "journal_write_failed")
-	metrics.recordSourceDedupSuppressed(entry)
-
-	store := collectJobMetricsForTest(t, jobName)
-	sourceID, sourceKind := metrics.fallbackSourceIdentityForTest(entry)
-	sourceLabels := metrix.Labels{"job_name": jobName, "source_id": sourceID, "source_kind": sourceKind}
-	for name, expected := range map[string]float64{
-		"snmp_trap_source_errors_unknown_oid":          1,
-		"snmp_trap_source_errors_journal_write_failed": 1,
-		"snmp_trap_source_pipeline_write_failed":       1,
-		"snmp_trap_source_pipeline_dedup_suppressed":   1,
-	} {
-		if v, ok := store.Read().Value(name, sourceLabels); !ok || v != expected {
-			t.Fatalf("%s = %v/%v, want %v/true", name, v, ok, expected)
-		}
-	}
-	jobLabels := metrix.Labels{"job_name": jobName}
-	if v, ok := store.Read().Value("snmp_trap_pipeline_write_failed", jobLabels); !ok || v != 1 {
-		t.Fatalf("pipeline write_failed = %v/%v, want 1/true", v, ok)
-	}
-	if v, ok := store.Read().Value("snmp_trap_pipeline_dedup_suppressed", jobLabels); !ok || v != 1 {
-		t.Fatalf("pipeline dedup_suppressed = %v/%v, want 1/true", v, ok)
 	}
 }
 
@@ -1257,7 +1039,7 @@ func TestCollectorCollectEmitsBuiltInAndProfileMetrics(t *testing.T) {
 	metrics.incEvent("security")
 
 	idx := testProfileMetricIndex(t)
-	rt := newTestProfileMetricRuntime(t, idx, profileMetricModeAuto, nil)
+	rt := newTestProfileMetricRuntime(t, idx, []string{"cisco.config.changed"})
 	rt.update(ciscoConfigTrapEntry(jobName))
 
 	store := metrix.NewCollectorStore()
@@ -1267,7 +1049,7 @@ func TestCollectorCollectEmitsBuiltInAndProfileMetrics(t *testing.T) {
 	}
 
 	c := &Collector{
-		jobName:        jobName,
+		Config:         Config{Name: jobName},
 		listener:       &Listener{},
 		trapWriter:     &mockTrapWriter{},
 		metrics:        metrics,
@@ -1288,7 +1070,8 @@ func TestCollectorCollectEmitsBuiltInAndProfileMetrics(t *testing.T) {
 		t.Fatalf("snmp_trap_events_security = %v/%v, want 1/true", v, ok)
 	}
 
-	profileLabels := metrix.Labels{"job_name": jobName, "source_id": "192.0.2.10", "source_kind": "udp_peer"}
+	sourceID, sourceKind := fallbackTrapSourceIdentity(ciscoConfigTrapEntry(jobName), jobName, "test")
+	profileLabels := metrix.Labels{"job_name": jobName, "source_id": sourceID, "source_kind": sourceKind}
 	if v, ok := store.Read().Value("snmp_trap_cisco_config_events", profileLabels); !ok || v != 1 {
 		t.Fatalf("snmp_trap_cisco_config_events = %v/%v, want 1/true", v, ok)
 	}
@@ -1305,7 +1088,7 @@ func TestCollectorCollectPublishesBinaryEncodedMetric(t *testing.T) {
 	}
 
 	c := &Collector{
-		jobName:    jobName,
+		Config:     Config{Name: jobName},
 		listener:   &Listener{},
 		trapWriter: &mockTrapWriter{binaryEncodedFields: 2},
 		metrics:    getJobMetrics(jobName),
@@ -1327,14 +1110,10 @@ func TestCollectorCollectPublishesBinaryEncodedMetric(t *testing.T) {
 }
 
 func TestSnmpEngineBootsPersistence(t *testing.T) {
-	tmpDir := t.TempDir()
-	prev := engineBootsDirBase
-	engineBootsDirBase = tmpDir
-	t.Cleanup(func() { engineBootsDirBase = prev })
-
 	jobName := "test-job"
+	paths := newEngineStatePaths(t.TempDir(), jobName)
 
-	eb, err := NewEngineBoots(jobName)
+	eb, err := newEngineBoots(paths)
 	if err != nil {
 		t.Fatalf("NewEngineBoots failed: %v", err)
 	}
@@ -1342,7 +1121,7 @@ func TestSnmpEngineBootsPersistence(t *testing.T) {
 		t.Errorf("expected first boot value 1, got %d", v)
 	}
 
-	eb, err = NewEngineBoots(jobName)
+	eb, err = newEngineBoots(paths)
 	if err != nil {
 		t.Fatalf("second NewEngineBoots failed: %v", err)
 	}
@@ -1352,55 +1131,43 @@ func TestSnmpEngineBootsPersistence(t *testing.T) {
 }
 
 func TestSnmpEngineBootsCorruptFileFailsCreation(t *testing.T) {
-	tmpDir := t.TempDir()
-	prev := engineBootsDirBase
-	engineBootsDirBase = tmpDir
-	t.Cleanup(func() { engineBootsDirBase = prev })
-
 	jobName := "test-job"
-	if err := os.MkdirAll(engineBootsDir(jobName), 0750); err != nil {
+	paths := newEngineStatePaths(t.TempDir(), jobName)
+	if err := os.MkdirAll(paths.dir, 0750); err != nil {
 		t.Fatalf("mkdir engine boots dir: %v", err)
 	}
-	if err := os.WriteFile(engineBootsPath(jobName), []byte("not-a-number\n"), 0640); err != nil {
+	if err := os.WriteFile(paths.engineBoots, []byte("not-a-number\n"), 0640); err != nil {
 		t.Fatalf("write engine boots file: %v", err)
 	}
 
-	if _, err := NewEngineBoots(jobName); err == nil {
+	if _, err := newEngineBoots(paths); err == nil {
 		t.Fatal("expected corrupt engine-boots state to fail job creation")
 	}
 }
 
 func TestSnmpEngineBootsRejectsMaxValue(t *testing.T) {
-	tmpDir := t.TempDir()
-	prev := engineBootsDirBase
-	engineBootsDirBase = tmpDir
-	t.Cleanup(func() { engineBootsDirBase = prev })
-
 	jobName := "test-job"
-	if err := os.MkdirAll(engineBootsDir(jobName), 0750); err != nil {
+	paths := newEngineStatePaths(t.TempDir(), jobName)
+	if err := os.MkdirAll(paths.dir, 0750); err != nil {
 		t.Fatalf("mkdir engine boots dir: %v", err)
 	}
-	if err := os.WriteFile(engineBootsPath(jobName), []byte("2147483647\n"), 0640); err != nil {
+	if err := os.WriteFile(paths.engineBoots, []byte("2147483647\n"), 0640); err != nil {
 		t.Fatalf("write engine boots file: %v", err)
 	}
 
-	if _, err := NewEngineBoots(jobName); err == nil {
+	if _, err := newEngineBoots(paths); err == nil {
 		t.Fatal("expected error for max engine boots value")
 	}
 }
 
 func TestSnmpEngineBootsReadErrorFails(t *testing.T) {
-	tmpDir := t.TempDir()
-	prev := engineBootsDirBase
-	engineBootsDirBase = tmpDir
-	t.Cleanup(func() { engineBootsDirBase = prev })
-
 	jobName := "test-job"
-	if err := os.MkdirAll(engineBootsPath(jobName), 0750); err != nil {
+	paths := newEngineStatePaths(t.TempDir(), jobName)
+	if err := os.MkdirAll(paths.engineBoots, 0750); err != nil {
 		t.Fatalf("mkdir engine boots file path: %v", err)
 	}
 
-	if _, err := NewEngineBoots(jobName); err == nil {
+	if _, err := newEngineBoots(paths); err == nil {
 		t.Fatal("expected read error when engine boots path is a directory")
 	}
 }
@@ -1702,81 +1469,6 @@ func TestConfigValidation(t *testing.T) {
 		}
 	})
 
-	t.Run("unknown config key", func(t *testing.T) {
-		var cfg Config
-		err := yaml.Unmarshal([]byte(`
-listen:
-  endpoints:
-    - protocol: udp
-      address: "127.0.0.1"
-      port: 9162
-unexpected: true
-`), &cfg)
-		if err == nil {
-			t.Fatal("expected error for unknown top-level key")
-		}
-	})
-
-	t.Run("obsolete job-level metrics key", func(t *testing.T) {
-		var cfg Config
-		err := yaml.Unmarshal([]byte(`
-listen:
-  endpoints:
-    - protocol: udp
-      address: "127.0.0.1"
-      port: 9162
-metrics:
-  - oid: "1.3.6.1.4.1.9.9.43.2.0.1"
-`), &cfg)
-		if err == nil {
-			t.Fatal("expected error for obsolete job-level metrics key")
-		}
-		if !strings.Contains(err.Error(), "profile_metrics") {
-			t.Fatalf("expected profile_metrics guidance, got %v", err)
-		}
-	})
-
-	t.Run("framework metadata keys", func(t *testing.T) {
-		var cfg Config
-		err := yaml.Unmarshal([]byte(`
-name: local
-module: snmp_traps
-autodetection_retry: 0
-priority: 70000
-function_only: false
-labels:
-  role: edge
-__provider__: file reader
-__source__: discoverer=file_reader,file=snmp_traps.conf
-__source_type__: user
-listen:
-  endpoints:
-    - protocol: udp
-      address: "127.0.0.1"
-      port: 9162
-versions: [v2c]
-communities: [public]
-`), &cfg)
-		if err != nil {
-			t.Fatalf("expected framework metadata keys to be accepted: %v", err)
-		}
-	})
-
-	t.Run("unknown nested config key", func(t *testing.T) {
-		var cfg Config
-		err := yaml.Unmarshal([]byte(`
-listen:
-  endpoints:
-    - protocol: udp
-      address: "127.0.0.1"
-      port: 9162
-      unexpected: true
-`), &cfg)
-		if err == nil {
-			t.Fatal("expected error for unknown endpoint key")
-		}
-	})
-
 	t.Run("implemented dynamic engine discovery", func(t *testing.T) {
 		err := validateDeferredConfig(Config{DynamicEngineID: true})
 		if err != nil {
@@ -1820,7 +1512,7 @@ listen:
 	})
 
 	t.Run("deferred validator permits implemented profile metrics", func(t *testing.T) {
-		err := validateDeferredConfig(Config{ProfileMetrics: ProfileMetricsConfig{Enabled: true, Mode: profileMetricModeAuto}})
+		err := validateDeferredConfig(Config{ProfileMetrics: ProfileMetricsConfig{Enabled: true, Include: []string{"site.rule"}}})
 		if err != nil {
 			t.Fatalf("profile metrics should no longer be rejected as deferred: %v", err)
 		}

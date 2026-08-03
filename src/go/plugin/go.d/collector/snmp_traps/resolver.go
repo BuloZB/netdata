@@ -6,31 +6,26 @@ import (
 	"fmt"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_traps/internal/model"
 )
 
 const maxMessageLen = 512
 
-const redactedTrapVarbind = "<redacted>"
-
-// renderMessage renders a trap description template into a human-readable MESSAGE.
-// It resolves {varname}, {varname.raw}, {numeric.oid}, and special vars against the
-// current entry's varbinds and profile definition.
+// renderMessage renders a trap description into a human-readable MESSAGE.
 func renderMessage(entry *TrapEntry, td *TrapDef) string {
 	tmpl := ""
 	if td != nil {
 		tmpl = td.Description
 	}
-	if tmpl == "" {
-		tmpl = "{{trap_name}} on {{hostname}}."
-	}
 
 	var result string
-	if td != nil && td.descriptionTemplate != nil {
-		result = renderGoProfileTemplate(td.descriptionTemplate, tmpl, entry, td)
-	} else if isGoProfileTemplate(tmpl) {
-		result = renderGoProfileTemplate(nil, tmpl, entry, td)
+	if tmpl == "" {
+		result = resolveSpecialVar("TRAP_NAME", entry) + " on " + resolveSpecialVar("_HOSTNAME", entry) + "."
+	} else if td.descriptionTemplate != nil {
+		result = renderGoProfileTemplate(td.descriptionTemplate, entry, td)
 	} else {
-		result = renderTemplate(tmpl, entry, td)
+		result = tmpl
 	}
 	if len(result) > maxMessageLen {
 		result = truncateUTF8(result, maxMessageLen-3) + "..."
@@ -46,15 +41,11 @@ func renderLabels(entry *TrapEntry, td *TrapDef) map[string]string {
 	}
 	labels := make(map[string]string, len(td.Labels))
 	for key, tmpl := range td.Labels {
-		var val string
 		if td.labelTemplates != nil && td.labelTemplates[key] != nil {
-			val = renderGoProfileTemplate(td.labelTemplates[key], tmpl, entry, td)
-		} else if isGoProfileTemplate(tmpl) {
-			val = renderGoProfileTemplate(nil, tmpl, entry, td)
-		} else {
-			val = renderTemplate(tmpl, entry, td)
+			labels[key] = renderGoProfileTemplate(td.labelTemplates[key], entry, td)
+			continue
 		}
-		labels[key] = val
+		labels[key] = tmpl
 	}
 	return labels
 }
@@ -76,57 +67,6 @@ func trapEntryHasUnresolvedTemplate(entry *TrapEntry) bool {
 
 func hasUnresolvedTemplateMarker(s string) bool {
 	return strings.Contains(s, "<unresolved:") || strings.Contains(s, "<missing>")
-}
-
-// renderTemplate substitutes {var} references in a template string.
-func renderTemplate(tmpl string, entry *TrapEntry, td *TrapDef) string {
-	var buf strings.Builder
-	buf.Grow(len(tmpl) + 128)
-
-	i := 0
-	for i < len(tmpl) {
-		if tmpl[i] == '{' {
-			end := strings.IndexByte(tmpl[i:], '}')
-			if end == -1 {
-				buf.WriteByte(tmpl[i])
-				i++
-				continue
-			}
-			ref := tmpl[i+1 : i+end]
-			val := resolveReference(ref, entry, td)
-			buf.WriteString(val)
-			i += end + 1
-		} else {
-			buf.WriteByte(tmpl[i])
-			i++
-		}
-	}
-	return buf.String()
-}
-
-// resolveReference resolves a {var}, {var.raw}, or {special} reference.
-func resolveReference(ref string, entry *TrapEntry, td *TrapDef) string {
-	if ref == "" {
-		return "<missing>"
-	}
-
-	// special vars
-	if knownSpecialVars[ref] {
-		return resolveSpecialVar(ref, entry)
-	}
-
-	// .raw suffix for raw numeric values
-	if raw, ok := strings.CutSuffix(ref, ".raw"); ok {
-		return resolveVarbindRaw(raw, entry, td)
-	}
-
-	// numeric OID fallback
-	if isNumericOID(ref) {
-		return resolveVarbindByOID(ref, entry, td)
-	}
-
-	// varbind name
-	return resolveVarbindByName(ref, entry, td)
 }
 
 func resolveSpecialVar(ref string, entry *TrapEntry) string {
@@ -154,98 +94,6 @@ func resolveSpecialVar(ref string, entry *TrapEntry) string {
 	}
 }
 
-func resolveVarbindByName(name string, entry *TrapEntry, td *TrapDef) string {
-	// Check profile varbinds by name
-	if td != nil {
-		if vb := td.varbindByName(name); vb != nil {
-			return resolveVarbindValue(name, vb.OID, vb, entry)
-		}
-	}
-	// Check raw varbinds from PDU
-	return resolveRawVarbindByName(name, entry)
-}
-
-func resolveVarbindByOID(oid string, entry *TrapEntry, td *TrapDef) string {
-	if td != nil {
-		if vb := findVarbindDefForObservedOID(td, oid); vb != nil {
-			return resolveVarbindValue(vb.rawName, oid, vb, entry)
-		}
-	}
-	return resolveRawVarbindByOID(oid, entry)
-}
-
-func resolveVarbindRaw(name string, entry *TrapEntry, td *TrapDef) string {
-	oid := ""
-	if td != nil {
-		if vb := td.varbindByName(name); vb != nil {
-			oid = vb.OID
-		}
-	}
-	if oid == "" && isNumericOID(name) {
-		oid = name
-	}
-	if oid == "" {
-		return fmt.Sprintf("<unresolved:%s>", name)
-	}
-	return resolveRawVarbindByOID(oid, entry)
-}
-
-func resolveVarbindValue(name, oid string, vb *VarbindDef, entry *TrapEntry) string {
-	if v, ok := findVarbindForProfileOID(entry, oid); ok {
-		if isSensitiveTrapVarbind(v) {
-			return redactedTrapVarbind
-		}
-		return varbindDisplayValue(v, vb)
-	}
-	return "<missing>"
-}
-
-func resolveRawVarbindByName(name string, entry *TrapEntry) string {
-	for _, v := range entry.Varbinds {
-		if v.Name == name {
-			if isSensitiveTrapVarbind(v) {
-				return redactedTrapVarbind
-			}
-			return varbindRawValue(v)
-		}
-	}
-	return fmt.Sprintf("<unresolved:%s>", name)
-}
-
-func resolveRawVarbindByOID(oid string, entry *TrapEntry) string {
-	if v, ok := findVarbindForProfileOID(entry, oid); ok {
-		if isSensitiveTrapVarbind(v) {
-			return redactedTrapVarbind
-		}
-		return varbindRawValue(v)
-	}
-	return "<missing>"
-}
-
-func oidMatchesColumn(profileOID, observedOID string) bool {
-	if profileOID == "" || observedOID == "" || profileOID == observedOID {
-		return false
-	}
-	return strings.HasPrefix(observedOID, profileOID+".")
-}
-
-func findVarbindForProfileOID(entry *TrapEntry, profileOID string) (VarbindValue, bool) {
-	if entry == nil || profileOID == "" {
-		return VarbindValue{}, false
-	}
-	for _, v := range entry.Varbinds {
-		if v.OID == profileOID {
-			return v, true
-		}
-	}
-	for _, v := range entry.Varbinds {
-		if oidMatchesColumn(profileOID, v.OID) {
-			return v, true
-		}
-	}
-	return VarbindValue{}, false
-}
-
 func findVarbindDefForObservedOID(td *TrapDef, observedOID string) *VarbindDef {
 	if td == nil || observedOID == "" || td.sharedVarbinds == nil {
 		return nil
@@ -264,7 +112,7 @@ func findVarbindDefForObservedOID(td *TrapDef, observedOID string) *VarbindDef {
 		if profileOID == "" {
 			profileOID = oid
 		}
-		if oidMatchesColumn(profileOID, observedOID) && len(profileOID) > bestLen {
+		if model.OIDMatchesColumn(profileOID, observedOID) && len(profileOID) > bestLen {
 			best = vb
 			bestLen = len(profileOID)
 		}
@@ -280,32 +128,7 @@ func varbindDisplayValue(v VarbindValue, vb *VarbindDef) string {
 			return label
 		}
 	}
-	return varbindRawValue(v)
-}
-
-// varbindRawValue renders a varbind value as a plain string.
-func varbindRawValue(v VarbindValue) string {
-	switch val := v.Value.(type) {
-	case nil:
-		return ""
-	case string:
-		return val
-	case []byte:
-		return string(val)
-	case int64:
-		return fmt.Sprintf("%d", val)
-	case uint64:
-		return fmt.Sprintf("%d", val)
-	case float64:
-		return fmt.Sprintf("%v", val)
-	case bool:
-		if val {
-			return "true"
-		}
-		return "false"
-	default:
-		return fmt.Sprintf("%v", val)
-	}
+	return model.VarbindRawValue(v)
 }
 
 func truncateUTF8(s string, maxBytes int) string {
