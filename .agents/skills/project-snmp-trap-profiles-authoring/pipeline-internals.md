@@ -132,14 +132,19 @@ journal field-name limits" framing is omitted.
 
 ## 7. Profile loading lifecycle
 
-Authoritative home: `netdata.md` §7 ("Profile loading — lazy shared cache,
-multipath, filename-dedup, field-merge on extends-chain").
+Authoritative home: `netdata.md` §7 ("Profile loading — leased catalog epochs,
+manifest routes, targeted hydration").
 
-- The loader is plugin-wide shared state, initialized on first runnable trap job
-  creation, shared by all listeners, released when no runnable trap jobs remain.
-- Operator profiles load eagerly at job creation; stock profiles keep only an
-  OID-to-file route table until a matching trap loads the routed vendor file.
-- Profiles are immutable while the shared cache has active job references.
+- One catalog manager belongs to the plugin registration. Its first listener
+  lease creates an epoch shared by all listeners; the final lease drops it.
+- Operator profiles and the stock manifest load eagerly in `Collector.Init()`;
+  `Collector.Check()` is a no-op. Stock bodies hydrate through exact OID and
+  metric-rule routes or through the candidate-file list for a MIB-qualified
+  name.
+- Every stock manifest entry carries a SHA-256 over the exact decompressed YAML
+  bytes. Lazy hydration verifies and parses the same bytes, binding a body to
+  the epoch that indexed it; the digest is not an authenticity signature.
+- Profiles are immutable while the shared epoch has active job leases.
   Operator and stock changes apply after an Agent restart or after every trap
   job is recreated.
 
@@ -148,3 +153,63 @@ profile changes require an Agent restart or recreation of every trap job.
 Invalid operator profiles fail the next job creation; invalid lazy stock
 profiles fail their first matching lookup and increment profile-load-failure
 metrics.
+
+## 8. Receiver boundary and synchronous handoff (authoritative)
+
+Runtime ownership is split at protocol acceptance:
+
+- `internal/receiver` owns the immutable per-job reception policy, endpoint
+  sockets, reusable receive buffers, source/version/community admission,
+  BER/SNMP decode, SNMPv3 USM and engine state, dynamic engine-ID handling,
+  INFORM responses, and per-source rate limiting.
+- The root collector owns public config DTOs and lifecycle orchestration. After
+  receiver acceptance, it owns catalog lookup, overrides,
+  attribution/enrichment, template rendering, deduplication, output commitment,
+  and metric updates.
+- Receiver outcomes use one event callback. The receiver package does not
+  depend on collector telemetry, logging, profile, or output packages.
+
+Each endpoint owns one receive goroutine and one reusable datagram buffer. The
+receive loop invokes the root packet workflow synchronously before reusing that
+buffer. There is no receiver queue, channel, or intermediate worker between the
+socket read and packet handling. Output backends retain their own bounded queues
+under the `internal/output.Writer` contract.
+
+Initialization is staged so failed jobs do not leak sockets or newly created
+SNMPv3 state:
+
+1. Validate public config and build the immutable receiver policy.
+2. Prepare the journal backend when enabled; no receiver socket is bound yet.
+3. Construct the receiver and bind every endpoint; any bind failure closes
+   earlier sockets and the prepared journal backend.
+4. Prepare receiver-local SNMPv3 state when v3 is enabled.
+5. Prepare the OTLP backend, compose the output coordinator and deduper, then
+   start the prepared output backends.
+6. Publish the fully constructed collector state, start deduplication when
+   enabled, commit prepared v3 state, and start endpoint receive loops last.
+
+Failures after v3 preparation but before receiver start roll back only state
+created by that attempt and close all bound sockets. Cleanup closes receive
+loops before output, then releases job-local profile and metric state. Borrowed
+shared enrichment dependencies remain alive.
+
+## 9. Enrichment and reverse-DNS ownership (authoritative)
+
+The SNMP-family composition root creates shared enrichment dependencies once:
+
+- `ddsnmp.DeviceStore` carries SNMP polling identity.
+- `snmp_topology.TrapEnrichmentHandle` carries topology device/interface/neighbor context.
+- `pkg/reversedns.Resolver` is the one process-owned PTR cache and lookup scheduler used by topology and traps.
+
+Each trap creator builds one immutable `internal/enrichment.Enricher` from Netdata-specific value adapters under
+`internal/enrichment/netdataadapter`. All listener jobs created by that creator share the enricher, while each job keeps
+its own `reverse_dns.enabled` bit. Job initialization and cleanup MUST NOT create, close, sweep, or clear the borrowed
+resolver.
+
+The packet path performs only cache-only `Lookup` plus best-effort non-blocking `Schedule`. A cold row is written with
+reverse-DNS audit status `pending`; it is not backfilled when the PTR lookup later completes. Topology keeps live DNS I/O
+in its bounded background warmer and uses only cache hits while rendering Function responses.
+
+The generic resolver owns address canonicalization, deterministic PTR selection, positive/negative TTLs, per-address
+coalescing, bounded admission, and scan-resistant retention. Collector adapters retain source eligibility, display-name
+precedence, public audit-state mapping, and all registry/topology DTO projection.
