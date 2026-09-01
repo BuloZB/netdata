@@ -13,13 +13,15 @@ import (
 	sdkjournal "github.com/netdata/systemd-journal-sdk/go/journal"
 
 	"github.com/netdata/netdata/go/plugins/pkg/funcapi"
+	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp/ddsnmp"
+	snmptopology "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_topology"
 	"github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_traps/internal/snmptrapsfunc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestSNMPTrapsMethodsExposeLogsOnly(t *testing.T) {
-	methods := snmpTrapsMethods()
+	methods := snmpTrapsMethods(func() bool { return false })
 	require.Len(t, methods, 1)
 
 	byID := make(map[string]funcapi.FunctionConfig, len(methods))
@@ -38,18 +40,48 @@ func TestSNMPTrapsMethodsExposeLogsOnly(t *testing.T) {
 }
 
 func TestSNMPTrapsLogsMethodAvailabilityFollowsDirectJournalJobs(t *testing.T) {
-	startJournalJobs := activeDirectJournalJobs.Load()
-	activeDirectJournalJobs.Store(0)
-	t.Cleanup(func() { activeDirectJournalJobs.Store(startJournalJobs) })
-
-	methods := snmpTrapsMethods()
+	activity := &journalActivity{}
+	methods := snmpTrapsMethods(activity.Available)
 	require.Len(t, methods, 1)
 	logs := methods[0]
 	require.NotNil(t, logs.Available)
 	assert.False(t, logs.Available())
 
-	activeDirectJournalJobs.Store(1)
+	lease := activity.Acquire()
+	t.Cleanup(lease.Close)
 	assert.True(t, logs.Available())
+	lease.Close()
+	assert.False(t, logs.Available())
+}
+
+func TestSNMPTrapsLogsMethodAvailabilityTracksAllJournalLeases(t *testing.T) {
+	activity := &journalActivity{}
+	logs := snmpTrapsMethods(activity.Available)[0]
+
+	first := activity.Acquire()
+	second := activity.Acquire()
+	assert.True(t, logs.Available())
+
+	first.Close()
+	first.Close()
+	assert.True(t, logs.Available())
+
+	second.Close()
+	assert.False(t, logs.Available())
+}
+
+func TestSNMPTrapsLogsMethodAvailabilityIsCreatorScoped(t *testing.T) {
+	firstCreator := newCreator(ddsnmp.NewDeviceStore(), snmptopology.NewTrapEnrichmentHandle(), newTestReverseDNSResolver())
+	secondCreator := newCreator(ddsnmp.NewDeviceStore(), snmptopology.NewTrapEnrichmentHandle(), newTestReverseDNSResolver())
+	firstLogs := firstCreator.AgentFunctions()[0]
+	secondLogs := secondCreator.AgentFunctions()[0]
+
+	firstCollector := firstCreator.CreateV2().(*Collector)
+	lease := firstCollector.services.journalActivity.Acquire()
+	t.Cleanup(lease.Close)
+
+	assert.True(t, firstLogs.Available())
+	assert.False(t, secondLogs.Available())
 }
 
 func TestSNMPTrapsJournalFunctionUsesPublicFunctionName(t *testing.T) {
@@ -92,6 +124,8 @@ func TestSNMPTrapsLogsFunctionInfoAndQuery(t *testing.T) {
 	assert.Equal(t, 200, defaults.RawResponse["status"])
 	assertResponseFacetIDs(t, defaults.RawResponse, snmptrapsfunc.DefaultLogFacets())
 	assertResponseColumnVisible(t, defaults.RawResponse, "TRAP_NAME")
+	assertResponseColumnFilter(t, defaults.RawResponse, "timestamp", "none")
+	assertNoResponseColumnFilter(t, defaults.RawResponse, "range")
 
 	query := handler.HandleRaw(context.Background(), funcapiRawRequest("logs", false, []byte(`{
   "last": 10,
@@ -359,11 +393,39 @@ func assertResponseFacetIDs(t *testing.T, response map[string]any, want []string
 
 func assertResponseColumnVisible(t *testing.T, response map[string]any, key string) {
 	t.Helper()
-	columns, ok := response["columns"].(map[string]any)
-	require.True(t, ok, "response columns type = %T", response["columns"])
+	column := requireResponseColumn(t, response, key)
+	assert.Equal(t, true, column["visible"])
+}
+
+func assertResponseColumnFilter(t *testing.T, response map[string]any, key, want string) {
+	t.Helper()
+	column := requireResponseColumn(t, response, key)
+	assert.Equal(t, want, column["filter"])
+}
+
+func assertNoResponseColumnFilter(t *testing.T, response map[string]any, forbidden string) {
+	t.Helper()
+	columns := requireResponseColumns(t, response)
+	for key, columnAny := range columns {
+		column, ok := columnAny.(map[string]any)
+		require.True(t, ok, "column %s type = %T", key, columnAny)
+		assert.NotEqual(t, forbidden, column["filter"], "column %s", key)
+	}
+}
+
+func requireResponseColumn(t *testing.T, response map[string]any, key string) map[string]any {
+	t.Helper()
+	columns := requireResponseColumns(t, response)
 	column, ok := columns[key].(map[string]any)
 	require.True(t, ok, "missing column %s in %#v", key, columns)
-	assert.Equal(t, true, column["visible"])
+	return column
+}
+
+func requireResponseColumns(t *testing.T, response map[string]any) map[string]any {
+	t.Helper()
+	columns, ok := response["columns"].(map[string]any)
+	require.True(t, ok, "response columns type = %T", response["columns"])
+	return columns
 }
 
 func assertLogsSourceSelectorMetadata(t *testing.T, response map[string]any) {

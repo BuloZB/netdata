@@ -3,7 +3,6 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/netdata/netdata/src/collectors/ebpf.plugin/ebpfgo.plugin/libbpfloader"
 )
@@ -12,6 +11,10 @@ const cachestatKernelMask uint32 = (1 << 12) - 1
 const cachestatDefaultPIDTableSize uint32 = 32768
 const cachestatMaxPIDTableSize uint32 = 32768
 const cachestatDefaultBTFFile = "vmlinux"
+
+// cachestatMaxBaseSelector is the highest SelectKernelName index for which a
+// base-flavor (no suffix) cachestat object file is shipped.
+const cachestatMaxBaseSelector = 9 // 5.16
 
 type CachestatLegacyConfig struct {
 	PluginsDir      string
@@ -100,50 +103,26 @@ func resolveCachestatLegacyConfig() (CachestatLegacyConfig, error) {
 		return CachestatLegacyConfig{}, err
 	}
 	cfg.ConfigFound = found
-	if fileCfg.Enabled != nil {
-		cfg.Enabled = *fileCfg.Enabled
+	if fileCfg.Cachestat != nil {
+		cfg.Enabled = *fileCfg.Cachestat
 	}
-	if fileCfg.UpdateEvery != nil && *fileCfg.UpdateEvery > 0 {
-		cfg.UpdateEvery = *fileCfg.UpdateEvery
-	}
-	if fileCfg.AppsEnabled != nil {
-		cfg.AppsEnabled = *fileCfg.AppsEnabled
-	}
-	if fileCfg.Cgroups != nil {
-		cfg.CgroupsEnabled = *fileCfg.Cgroups
-	}
-	if fileCfg.PidTable != nil && *fileCfg.PidTable > 0 {
-		cfg.PidTableSize = applyPidTableSizeClamp(*fileCfg.PidTable)
-	}
-	if fileCfg.MapsPerCore != nil {
-		cfg.MapsPerCore = *fileCfg.MapsPerCore
-	}
-	if fileCfg.BTFPath != nil && *fileCfg.BTFPath != "" {
-		cfg.BTFPath = *fileCfg.BTFPath
-		cfg.HasBTF = kernelBTFSupported(cfg.BTFPath)
-	}
-	if fileCfg.Lifetime != nil && *fileCfg.Lifetime > 0 {
-		// lifetime controls how long the thread runs when activated by a cloud
-		// Function call in the old ebpf.plugin.  The Go plugin runs until
-		// signalled and has no equivalent lifecycle, so this value is parsed
-		// for compatibility but not consumed.
-	}
-	if fileCfg.CollectPidLevel != nil {
-		cfg.AppsLevel = *fileCfg.CollectPidLevel
-	}
-	if fileCfg.ObjectFlavor != nil && *fileCfg.ObjectFlavor != "" {
-		cfg.ObjectFlavor = *fileCfg.ObjectFlavor
-	}
-
-	kver, err := KernelVersion()
+	applyCommonCollectorConfig(fileCfg, collectorCommonConfig{
+		UpdateEvery:    &cfg.UpdateEvery,
+		AppsEnabled:    &cfg.AppsEnabled,
+		CgroupsEnabled: &cfg.CgroupsEnabled,
+		PidTableSize:   &cfg.PidTableSize,
+		MapsPerCore:    &cfg.MapsPerCore,
+		BTFPath:        &cfg.BTFPath,
+		HasBTF:         &cfg.HasBTF,
+		ObjectFlavor:   &cfg.ObjectFlavor,
+		AppsLevel:      &cfg.AppsLevel,
+	})
+	kver, isRHF, err := resolveKernelAndRH()
 	if err != nil {
 		return CachestatLegacyConfig{}, err
 	}
 	cfg.KernelVersion = kver
-
-	if rhf, err := RedHatRelease(); err == nil {
-		cfg.IsRHF = rhf
-	}
+	cfg.IsRHF = isRHF
 
 	if err := cfg.Targets.ResolveAccountPageTarget(); err != nil {
 		return CachestatLegacyConfig{}, err
@@ -154,34 +133,17 @@ func resolveCachestatLegacyConfig() (CachestatLegacyConfig, error) {
 }
 
 func BuildCachestatLegacyPlan(cfg CachestatLegacyConfig) LoadPlan {
-	flavor := selectCachestatObjectFlavor(cfg.ObjectFlavor, cfg.KernelVersion, cfg.IsDebian)
-	loadMode := SelectLoadMode(cfg.HasBTF, LoadCore, cfg.KernelVersion, cfg.IsRHF)
-
-	selector := SelectIndex(cfg.Kernels, cfg.IsRHF, cfg.KernelVersion)
-	return LoadPlan{
-		KernelVersion: cfg.KernelVersion,
-		IsRHF:         cfg.IsRHF,
-		Selector:      selector,
-		Flavor:        flavor,
-		ObjectPath:    BuildObjectPathWithFlavor(cfg.PluginsDir, selector, "cachestat", false, cfg.IsRHF, flavor),
-		LoadMode:      loadMode,
-		ProgramMode:   LoadTrampoline,
-	}
-}
-
-func selectCachestatObjectFlavor(requested string, kver uint32, isDebian bool) ObjectFlavor {
-	switch strings.ToLower(strings.TrimSpace(requested)) {
-	case "", "buffer":
-		if kver >= minimumKernelVersionBuffer {
-			return ObjectFlavorBuffer
-		}
-	case "arena":
-		if kver >= minimumKernelVersionArena && !isDebian {
-			return ObjectFlavorArena
-		}
-	}
-
-	return ObjectFlavorBase
+	return buildKprobeLegacyPlan(kprobePlanRequest{
+		PluginsDir:      cfg.PluginsDir,
+		Kernels:         cfg.Kernels,
+		IsRHF:           cfg.IsRHF,
+		KernelVersion:   cfg.KernelVersion,
+		IsDebian:        cfg.IsDebian,
+		HasBTF:          cfg.HasBTF,
+		ObjectFlavor:    cfg.ObjectFlavor,
+		Name:            "cachestat",
+		MaxBaseSelector: cachestatMaxBaseSelector,
+	})
 }
 
 func kernelBTFSupported(btfPath string) bool {

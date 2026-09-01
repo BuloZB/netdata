@@ -22,7 +22,9 @@ func TestReceiverBindStartDeliverClose(t *testing.T) {
 		Versions:    []string{"v2c"},
 		Communities: []string{"public"},
 	}), nil)
-	require.NoError(t, recv.Bind())
+	bindEvents, err := recv.Bind()
+	require.NoError(t, err)
+	assert.Empty(t, bindEvents)
 	t.Cleanup(recv.Close)
 	require.Len(t, recv.listener.endpoints, 1)
 	boundAddr, ok := recv.listener.endpoints[0].conn.LocalAddr().(*net.UDPAddr)
@@ -56,7 +58,7 @@ func TestReceiverBindStartDeliverClose(t *testing.T) {
 
 func TestListenerReadLoopCountsUnexpectedReadErrors(t *testing.T) {
 	reported := make(chan Endpoint, 1)
-	l, err := newListener(ListenConfig{
+	l, _, err := newListener(ListenConfig{
 		Endpoints: []Endpoint{{
 			Protocol: "udp4",
 			Address:  "127.0.0.1",
@@ -88,7 +90,7 @@ func TestListenerReadLoopCountsUnexpectedReadErrors(t *testing.T) {
 
 func TestListenerReadLoopDoesNotReportReadErrorDuringClose(t *testing.T) {
 	var reported atomic.Bool
-	l, err := newListener(ListenConfig{
+	l, _, err := newListener(ListenConfig{
 		Endpoints: []Endpoint{{
 			Protocol: "udp4",
 			Address:  "127.0.0.1",
@@ -110,95 +112,83 @@ func TestListenerReadLoopDoesNotReportReadErrorDuringClose(t *testing.T) {
 }
 
 func TestNewListenerAppliesReceiveBuffer(t *testing.T) {
-	oldSetUDPReadBuffer := setUDPReadBuffer
-	t.Cleanup(func() { setUDPReadBuffer = oldSetUDPReadBuffer })
-
 	var got []int
-	setUDPReadBuffer = func(_ *net.UDPConn, bytes int) error {
+	setReadBuffer := func(_ *net.UDPConn, bytes int) error {
 		got = append(got, bytes)
 		return nil
 	}
 
-	l, err := newListener(ListenConfig{
+	l, bindEvents, err := newListenerWithReadBuffer(ListenConfig{
 		Endpoints: []Endpoint{{
 			Protocol: "udp4",
 			Address:  "127.0.0.1",
 			Port:     0,
 		}},
 		ReceiveBuffer: 123456,
-	}, nil)
+	}, nil, setReadBuffer)
 	require.NoError(t, err)
 	t.Cleanup(l.close)
 
 	assert.Equal(t, []int{123456}, got)
+	assert.Empty(t, bindEvents)
 }
 
 func TestNewListenerSkipsReceiveBufferWhenZero(t *testing.T) {
-	oldSetUDPReadBuffer := setUDPReadBuffer
-	t.Cleanup(func() { setUDPReadBuffer = oldSetUDPReadBuffer })
-
 	called := false
-	setUDPReadBuffer = func(_ *net.UDPConn, _ int) error {
+	setReadBuffer := func(_ *net.UDPConn, _ int) error {
 		called = true
 		return nil
 	}
 
-	l, err := newListener(ListenConfig{
+	l, bindEvents, err := newListenerWithReadBuffer(ListenConfig{
 		Endpoints: []Endpoint{{
 			Protocol: "udp4",
 			Address:  "127.0.0.1",
 			Port:     0,
 		}},
-	}, nil)
+	}, nil, setReadBuffer)
 	require.NoError(t, err)
 	t.Cleanup(l.close)
 
 	assert.False(t, called)
+	assert.Empty(t, bindEvents)
 }
 
-func TestNewListenerAllowsDefaultReceiveBufferFailure(t *testing.T) {
-	oldSetUDPReadBuffer := setUDPReadBuffer
-	t.Cleanup(func() { setUDPReadBuffer = oldSetUDPReadBuffer })
-
-	setUDPReadBuffer = func(_ *net.UDPConn, _ int) error {
+func TestNewListenerReturnsDefaultReceiveBufferFailure(t *testing.T) {
+	setReadBuffer := func(_ *net.UDPConn, _ int) error {
 		return errors.New("boom")
 	}
 
-	l, err := newListener(ListenConfig{
-		Endpoints: []Endpoint{{
-			Protocol: "udp4",
-			Address:  "127.0.0.1",
-			Port:     0,
-		}},
+	l, bindEvents, err := newListenerWithReadBuffer(ListenConfig{
+		Endpoints:     []Endpoint{{Protocol: "udp4", Address: "127.0.0.1", Port: 0}},
 		ReceiveBuffer: DefaultReceiveBuffer,
-	}, nil)
+	}, nil, setReadBuffer)
 	require.NoError(t, err)
 	t.Cleanup(l.close)
 	require.Len(t, l.endpoints, 1)
-	require.Len(t, l.receiveBufferWarnings, 1)
-	assert.Equal(t, "udp4", l.receiveBufferWarnings[0].endpoint.Protocol)
-	assert.Equal(t, DefaultReceiveBuffer, l.receiveBufferWarnings[0].requested)
-	assert.ErrorContains(t, l.receiveBufferWarnings[0].err, "boom")
+	require.Len(t, bindEvents, 1)
+	assert.Equal(t, EventListenerBufferDegraded, bindEvents[0].Type)
+	assert.Equal(t, "udp4", bindEvents[0].Endpoint.Protocol)
+	assert.Equal(t, DefaultReceiveBuffer, bindEvents[0].Requested)
+	assert.ErrorContains(t, bindEvents[0].Err, "boom")
 }
 
 func TestNewListenerFailsWhenReceiveBufferCannotBeSet(t *testing.T) {
-	oldSetUDPReadBuffer := setUDPReadBuffer
-	t.Cleanup(func() { setUDPReadBuffer = oldSetUDPReadBuffer })
-
-	setUDPReadBuffer = func(_ *net.UDPConn, _ int) error {
+	setReadBuffer := func(_ *net.UDPConn, _ int) error {
 		return errors.New("boom")
 	}
 
-	l, err := newListener(ListenConfig{
+	l, bindEvents, err := newListenerWithReadBuffer(ListenConfig{
 		Endpoints: []Endpoint{{
 			Protocol: "udp4",
 			Address:  "127.0.0.1",
 			Port:     0,
 		}},
 		ReceiveBuffer: 123456,
-	}, nil)
+	}, nil, setReadBuffer)
 	require.Error(t, err)
 	assert.Nil(t, l)
+	assert.Empty(t, bindEvents)
 	assert.Contains(t, err.Error(), "set receive buffer")
 	assert.Contains(t, err.Error(), "boom")
 }

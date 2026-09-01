@@ -30,6 +30,9 @@ rest of this skill as background:
 - Framework or shared-helper change: stop and satisfy
   `src/go/plugin/framework/docs/changing-framework-code.md` before writing
   code.
+- Prometheus chart-profile authoring or review: read
+  `.agents/skills/project-prometheus-profiles/SKILL.md` and every source it marks as
+  mandatory, then run the repository real-pipeline validator it documents.
 
 Do not use this broad skill as the only implementation guide for go.d work.
 
@@ -388,23 +391,40 @@ The generic Prometheus scraper (`src/go/plugin/go.d/collector/prometheus/`) auto
 - metric name → chart ID + dimension ID
 - Prometheus labels → Netdata chart labels
 - type (`counter`, `gauge`, `histogram`, `summary`) → chart type and dimension algorithm
-- histograms and summaries explode into 3 charts each (buckets/quantiles, `_sum`, `_count`)
+- histograms produce bucket, `_sum`, and `_count` charts; summaries always produce `_sum` and `_count`, plus a
+  quantile chart when quantiles exist
 - recognized suffixes: `_total` (counter), `_bucket` + `le` label (histogram), `_sum`, `_count`, `quantile` label (summary), `_info` (skipped)
 - unit suffixes drive the units string: `_seconds`, `_bytes`, `_hertz`
 
 Operator controls (profiles documented in `src/go/plugin/go.d/collector/prometheus/profile-format.md`, relabeling in
 `src/go/plugin/go.d/collector/prometheus/relabel/README.md`):
 
-- **Scoping**: the time-series `selector` job option (allow/deny on metric name and label values, syntax in `src/go/pkg/prometheus/selector/README.md`) and `fallback_type` glob patterns for untyped metrics.
-- **Shaping**: the job-level `relabeling` option (Prometheus-compatible `metric_relabel_configs`; it replaced
-  the removed `label_prefix`) renames metrics and rewrites labels before charts are built. **Chart profiles**
-  (`match`/`app`/`autogen.selector`/`template` YAMLs, stock under
+- **Scoping**: the time-series `selector` job option (allow/deny on metric name and label values, syntax in
+  `src/go/pkg/prometheus/selector/README.md`) and `fallback_type` glob patterns for untyped metrics.
+- **Shaping**: job-level `relabeling` is operator policy and runs before profile selection. Profile-root `relabeling`
+  uses the same Prometheus-compatible block/rule format after selection and owns stable exporter normalization required
+  by that profile's charts. Do not duplicate profile-required normalization as an optional job recipe.
+- **Ordering**: the fixed namespace lifecycle is `selector -> job relabeling/safety -> fallback type + profile
+  selection -> selected profile relabeling/safety -> final gates -> charts`. A profile cannot normalize itself into
+  selection. Untyped classification is bound before profile relabeling, so a final rename cannot create or change it.
+- **Profile precedence**: selected profiles share one final metric stream. For each original source family, only the
+  first applicable selected profile's complete pipeline runs; later profiles do not see that family or names produced by
+  the first pipeline. Precedence is profile-name order in `auto`, configured entry order in `exact`, and configured
+  entries followed by the remaining name-ordered auto profiles in `combined`. Root `match` and block matchers classify
+  original source names; rule results and output names do not affect dispatch. All selected templates consume the final
+  names and labels, so authors must account for cross-profile interactions.
+- **Charts**: chart profiles (`match`/`app`/`relabeling`/`autogen.selector`/`template` YAMLs, stock under
   `src/go/plugin/go.d/config/go.d/prometheus.profiles/default/`, user under
   `/etc/netdata/go.d/prometheus.profiles/`) ship curated per-exporter dashboards — the Prometheus analog of
   statsd `synthetic_charts`. Metrics not covered by an authored profile chart keep their autogen charts unless an
   applicable profile selector rejects them. Each selector is limited to its profile's `match` scope; when scopes
   overlap, every applicable selector must accept the series. This changes fallback charts only; use the job selector
   or a relabeling `drop` action to discard samples.
+
+Use `.agents/skills/project-prometheus-profiles/SKILL.md` when creating or materially
+reviewing a profile. It teaches the dashboard-design reasoning and the
+real-pipeline validation boundary; schema validity alone is not semantic
+dashboard approval.
 
 ### 3.6 Chart priorities
 
@@ -435,8 +455,9 @@ A collector is *production-quality* when it satisfies all of:
 8. For remote targets: is vnode wiring done?
 9. For SNMP: did I extend a profile rather than hardcode OIDs?
 10. For statsd / OTEL: did I document and ship the operator-side config (synthetic_charts file or OTEL mapping YAML)?
-11. For Prometheus scraping: are selectors and relabeling rules correct? Are untyped metrics handled? Should the
-    exporter get a stock chart profile (`profile-format.md`), and should that profile suppress unmatched fallback
+11. For Prometheus scraping: are selectors and job relabeling correct? Is exporter-required normalization owned by the
+    profile instead of duplicated in job examples? Are untyped metrics handled before profile normalization? Should
+    the exporter get a stock chart profile (`profile-format.md`), and should that profile suppress unmatched fallback
     charts with a scoped `autogen.selector` while retaining their samples?
 12. For cross-plugin enrichment: am I using netipc?
 13. For Functions: does the response conform to one of the six shapes? Non-blocking with respect to the collection loop? Schema-validated?
@@ -540,6 +561,24 @@ Lifecycle semantics: `Init()` is one-time setup (failure disables permanently); 
   running until the timeout stops it.
 - Rust: `cargo test -p <crate>`
 - Whole-project install: `./netdata-installer.sh`
+- ebpfgo (`src/collectors/ebpf.plugin/ebpfgo.plugin`) compiles in **two** configurations and you must
+  validate both; a passing run in one proves nothing about the other:
+  - The CO-RE code is gated on `__has_include("<name>.skel.h")` inside an outer
+    `LIBBPF_MAJOR_VERSION >= 1 && __has_include(<linux/btf.h>)` guard. When either fails, the skeleton
+    includes, the CO-RE-only runtime fields, and the `NETDATA_*_CORE_SUPPORTED` define all vanish and only
+    the legacy kprobe path is compiled.
+  - `.github/workflows/go-tests.yml` states outright that it leaves `NETDATA_*_HAS_SKELETON` absent, so the
+    libbpf-tagged CI job exercises the **legacy path only** — generating skeletons needs a BPF toolchain CI
+    does not have. The CMake packaging build, by contrast, passes `-I <build>/ebpf-co-re`. So CO-RE-only code
+    reaches release builds having never been compiled by the Go job.
+  - Legacy path (what CI runs):
+    `CGO_CFLAGS="-I<repo>/externaldeps/libbpf/include" go test -tags netdata_ebpf_libbpf -race -count=1 ./...`
+  - CO-RE path: add `-I<repo>/build/ebpf-co-re` to `CGO_CFLAGS` and repeat. Confirm the path actually
+    switched rather than silently repeating the legacy build — `__has_include("dc.skel.h")` must be true, or
+    `gcc -E` must show the CO-RE-only call sites surviving preprocessing.
+  - Failure mode this catches: a runtime field declared inside the CO-RE guard but referenced outside it.
+    It compiles wherever CO-RE is on and fails everywhere else with `has no member named '<field>'`, which
+    surfaces as a distro build break (EL8 ships libbpf 0.x) long after the Go job went green.
 
 ## 6. Dealing with data types
 
@@ -688,7 +727,7 @@ Internal C plugins under `src/collectors/`. Reuse shared metric definitions from
 | Topology library | topology producers in Go | `src/go/pkg/topology/v1` |
 | netipc cross-plugin enrichment | C / Go / Rust | `src/libnetdata/netipc/`, `src/go/pkg/netipc/`, `src/crates/netipc/` |
 | DYNCFG protocol | dynamic configuration | `src/plugins.d/DYNCFG.md`, `docs/developer-and-contributor-corner/dyncfg.md` |
-| Health alerts reference | alert template authoring | `src/health/REFERENCE.md`, `src/health/alert-configuration-ordering.md` |
+| Health alerts | adding, changing, or reviewing an alert/template | `.agents/skills/project-health-alert-authoring/SKILL.md` |
 | Integrations pipeline | doc generation from `metadata.yaml` | `integrations/README.md` |
 | Go framework changes | changing shared Go collector/runtime framework code | `src/go/plugin/framework/docs/changing-framework-code.md` |
 | go.d V1-to-V2 migration | migrating existing go.d collectors | `src/go/plugin/go.d/docs/migrate-v1-to-v2.md` |

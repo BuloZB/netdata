@@ -35,8 +35,121 @@ func TestSpecMarshalTemplate(t *testing.T) {
 				assert.NotContains(t, out, "type:")
 			},
 		},
+		"emits optional-only instance identity without empty by_labels": {
+			spec: func() Spec {
+				spec := validationSpec()
+				spec.Groups[0].Charts[0].Instances = &Instances{
+					OptionalByLabels: []string{"pid"},
+				}
+				return spec
+			}(),
+			check: func(t *testing.T, out string) {
+				assert.Contains(t, out, "optional_by_labels:")
+				assert.NotContains(t, out, "by_labels: []")
+			},
+		},
+		"preserves explicit empty chart promotion": {
+			spec: Spec{
+				Version: VersionV1,
+				Groups: []Group{{
+					Family:  "G",
+					Metrics: []string{"m"},
+					Charts: []Chart{{
+						Title:         "C",
+						Context:       "c",
+						Units:         "u",
+						LabelPromoted: []string{},
+						Dimensions:    []Dimension{{Selector: "m", Name: "d"}},
+					}},
+				}},
+			},
+			check: func(t *testing.T, out string) {
+				assert.Contains(t, out, "label_promotion: []")
+				reDecoded, err := DecodeYAML([]byte(out))
+				require.NoError(t, err)
+				promotion := reDecoded.Groups[0].Charts[0].LabelPromoted
+				assert.NotNil(t, promotion)
+				assert.Empty(t, promotion)
+			},
+		},
+		"preserves explicit empty default promotion": {
+			spec: Spec{
+				Version: VersionV1,
+				Groups: []Group{{
+					Family:  "G",
+					Metrics: []string{"m"},
+					ChartDefaults: &ChartDefaults{
+						LabelPromoted: []string{},
+					},
+					Charts: []Chart{{
+						Title:      "C",
+						Context:    "c",
+						Units:      "u",
+						Dimensions: []Dimension{{Selector: "m", Name: "d"}},
+					}},
+				}},
+			},
+			check: func(t *testing.T, out string) {
+				assert.Contains(t, out, "label_promotion: []")
+				reDecoded, err := DecodeYAML([]byte(out))
+				require.NoError(t, err)
+				promotion := reDecoded.Groups[0].Charts[0].LabelPromoted
+				assert.NotNil(t, promotion)
+				assert.Empty(t, promotion)
+			},
+		},
+		"preserves default priority": {
+			spec: Spec{
+				Version: VersionV1,
+				Groups: []Group{{
+					Family:  "G",
+					Metrics: []string{"m"},
+					ChartDefaults: &ChartDefaults{
+						Priority: 100,
+					},
+					Charts: []Chart{{
+						Title:      "C",
+						Context:    "c",
+						Units:      "u",
+						Dimensions: []Dimension{{Selector: "m", Name: "d"}},
+					}},
+				}},
+			},
+			check: func(t *testing.T, out string) {
+				assert.Contains(t, out, "priority: 100")
+				reDecoded, err := DecodeYAML([]byte(out))
+				require.NoError(t, err)
+				assert.Equal(t, 100, reDecoded.Groups[0].Charts[0].Priority)
+			},
+		},
+		"omits transparent root family and round trips": {
+			spec: Spec{
+				Version: VersionV1,
+				Groups: []Group{{
+					Metrics: []string{"m"},
+					Groups: []Group{{
+						Family: "Service",
+						Charts: []Chart{{
+							Title:      "C",
+							Context:    "c",
+							Units:      "u",
+							Dimensions: []Dimension{{Selector: "m", Name: "d"}},
+						}},
+					}},
+				}},
+			},
+			check: func(t *testing.T, out string) {
+				assert.NotContains(t, out, "family: \"\"")
+				reDecoded, err := DecodeYAML([]byte(out))
+				require.NoError(t, err)
+				require.Len(t, reDecoded.Groups, 1)
+				assert.Empty(t, reDecoded.Groups[0].Family)
+			},
+		},
 		"errors when groups missing": {
-			spec:    Spec{Version: VersionV1},
+			spec: Spec{
+				Version: VersionV1,
+			},
 			wantErr: true,
 		},
 		"errors on wrong version": {

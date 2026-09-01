@@ -49,6 +49,33 @@ typedef struct cgroup_ebpfgo_publish_cachestat {
     cgroup_ebpfgo_cachestat_t current;
     cgroup_ebpfgo_cachestat_t prev;
 } cgroup_ebpfgo_publish_cachestat_t;
+
+/* Per-interval directory-cache totals for one cgroup.  Unlike cachestat, the
+ * raw cumulative counters are not mirrored here: the per-PID deltas are summed
+ * directly from shared memory, so nothing downstream needs them. */
+typedef struct cgroup_ebpfgo_publish_dcstat {
+    uint64_t ct;
+
+    long long ratio;
+    long long reference;
+    long long slow;
+    long long not_found;
+} cgroup_ebpfgo_publish_dcstat_t;
+
+typedef struct cgroup_ebpfgo_socket {
+    uint64_t bytes_sent;
+    uint64_t bytes_received;
+    uint64_t call_tcp_sent;
+    uint64_t call_tcp_received;
+    uint64_t retransmit;
+    uint64_t call_udp_sent;
+    uint64_t call_udp_received;
+    uint64_t call_close;
+    uint64_t call_tcp_v4_connection;
+    uint64_t call_tcp_v6_connection;
+    uint32_t socket_update_every_s;
+} cgroup_ebpfgo_socket_t;
+
 #endif
 
 // https://www.kernel.org/doc/Documentation/cgroup-v1/memory.txt
@@ -231,6 +258,37 @@ struct cgroup {
     RRDSET *st_cachestat_dirties;
     RRDSET *st_cachestat_hits;
     RRDSET *st_cachestat_misses;
+
+    // eBPF dcstat (directory cache) snapshot from ebpfgo.plugin SHM.
+    cgroup_ebpfgo_publish_dcstat_t dcstat;
+
+    RRDSET *st_dcstat_ratio;
+    RRDSET *st_dcstat_reference;
+    RRDSET *st_dcstat_not_cache;
+    RRDSET *st_dcstat_not_found;
+
+    // eBPF socket snapshot from ebpfgo.plugin SHM.
+    cgroup_ebpfgo_socket_t net;
+
+    RRDSET *st_net_conn_ipv4;
+    RRDSET *st_net_conn_ipv6;
+    RRDSET *st_net_total_bandwidth;
+    RRDDIM *st_net_bw_rd_received;
+    RRDDIM *st_net_bw_rd_sent;
+    RRDSET *st_net_tcp_recv;
+    RRDSET *st_net_tcp_send;
+    RRDSET *st_net_retransmit;
+    RRDSET *st_net_udp_send;
+    RRDSET *st_net_udp_recv;
+    long    last_socket_divisor; // tracks divisor to detect ebpfgo.plugin restarts
+
+    // PIDs from cgroup.procs, extracted once per tick and shared across all
+    // eBPFGo modules.  Populated by cgroup_ebpfgo_refresh_pid_lists() and
+    // freed by cgroup_ebpfgo_release_pid_lists(); both called from
+    // sys_fs_cgroup.c.  The procfile is closed immediately after extraction
+    // so no FDs are held during collection.
+    pid_t  *ebpf_pids;
+    size_t  ebpf_pids_count;
 #endif
 
     struct cgroup_network_interface *interfaces;
@@ -448,8 +506,8 @@ static inline char *cgroup_chart_type(char *buffer, struct cgroup *cg) {
     return buffer;
 }
 
-#define RRDFUNCTIONS_CGTOP_HELP "Lists active containers and cgroups with resource usage including CPU, memory, disk I/O, and network traffic."
-#define RRDFUNCTIONS_SYSTEMD_SERVICES_HELP "Shows systemd service cgroups with their process counts and resource consumption (CPU, memory, I/O)."
+#define FUNCTION_CGTOP_HELP "Lists active containers and cgroups with resource usage including CPU, memory, disk I/O, and network traffic."
+#define FUNCTION_SYSTEMD_SERVICES_HELP "Shows systemd service cgroups with their process counts and resource consumption (CPU, memory, I/O)."
 
 int cgroup_function_cgroup_top(BUFFER *wb, const char *function, BUFFER *payload, const char *source);
 int cgroup_function_systemd_top(BUFFER *wb, const char *function, BUFFER *payload, const char *source);
@@ -506,13 +564,46 @@ void update_io_full_pressure_chart(struct cgroup *cg);
 void update_io_full_pressure_stall_time_chart(struct cgroup *cg);
 
 #if defined(OS_LINUX)
+// Shared helper: find the best non-empty cgroup.procs file across mount points.
+procfile *cgroup_ebpfgo_open_nonempty_procs_file(char *path_buf, size_t path_buf_size, const char *cg_id);
+
+// Pre-pass: open cgroup.procs per cgroup, extract PIDs into cg->ebpf_pids, close procfile immediately.
+// Post-pass: free cg->ebpf_pids for each cgroup.
+// Call refresh before any eBPFGo module update, release after all modules finish.
+void cgroup_ebpfgo_refresh_pid_lists(void);
+void cgroup_ebpfgo_release_pid_lists(void);
+
+// Refreshes the ebpfgo SHM snapshot; returns true when valid data is present.
 bool cgroup_ebpfgo_cachestat_refresh(void);
+// Controls whether cachestat charts update this tick (set after reading SHM flags).
+void cgroup_ebpfgo_cachestat_set_snapshot_ready(bool ready);
 void cgroup_ebpfgo_cachestat_update_locked(void);
 void cgroup_ebpfgo_cachestat_update_charts(struct cgroup *cg);
+
+// Controls whether dcstat charts update this tick (set after reading SHM flags).
+void cgroup_ebpfgo_dcstat_set_snapshot_ready(bool ready);
+void cgroup_ebpfgo_dcstat_update_locked(void);
+void cgroup_ebpfgo_dcstat_update_charts(struct cgroup *cg);
+
+void cgroup_ebpfgo_socket_set_snapshot_ready(bool ready);
+void cgroup_ebpfgo_socket_update_locked(void);
+void cgroup_ebpfgo_socket_update_charts(struct cgroup *cg);
 #else
+static inline void cgroup_ebpfgo_refresh_pid_lists(void) {}
+static inline void cgroup_ebpfgo_release_pid_lists(void) {}
+
 static inline bool cgroup_ebpfgo_cachestat_refresh(void) { return false; }
+static inline void cgroup_ebpfgo_cachestat_set_snapshot_ready(bool ready) { (void)ready; }
 static inline void cgroup_ebpfgo_cachestat_update_locked(void) {}
 static inline void cgroup_ebpfgo_cachestat_update_charts(struct cgroup *cg) { (void)cg; }
+
+static inline void cgroup_ebpfgo_dcstat_set_snapshot_ready(bool ready) { (void)ready; }
+static inline void cgroup_ebpfgo_dcstat_update_locked(void) {}
+static inline void cgroup_ebpfgo_dcstat_update_charts(struct cgroup *cg) { (void)cg; }
+
+static inline void cgroup_ebpfgo_socket_set_snapshot_ready(bool ready) { (void)ready; }
+static inline void cgroup_ebpfgo_socket_update_locked(void) {}
+static inline void cgroup_ebpfgo_socket_update_charts(struct cgroup *cg) { (void)cg; }
 #endif
 
 #endif // NETDATA_CGROUP_INTERNALS_H

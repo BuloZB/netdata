@@ -32,9 +32,11 @@ func TestGroupClone(t *testing.T) {
 	clone.Metrics = append(clone.Metrics, "extra")
 	clone.ChartDefaults.LabelPromoted[0] = "mutated"
 	clone.ChartDefaults.Instances.ByLabels[0] = "mutated"
+	clone.ChartDefaults.Instances.OptionalByLabels[0] = "mutated"
 	clone.Charts[0].Title = "MUTATED"
 	clone.Charts[0].LabelPromoted[0] = "mutated"
 	clone.Charts[0].Instances.ByLabels[0] = "mutated"
+	clone.Charts[0].Instances.OptionalByLabels[0] = "mutated"
 	clone.Charts[0].Lifecycle.MaxInstances = 999
 	clone.Charts[0].Lifecycle.Dimensions.MaxDims = 999
 	clone.Charts[0].Dimensions[0].Name = "MUTATED"
@@ -63,8 +65,12 @@ func richGroup() Group {
 		ContextNamespace: "ns",
 		Metrics:          []string{"metric_a"},
 		ChartDefaults: &ChartDefaults{
+			Priority:      100,
 			LabelPromoted: []string{"region"},
-			Instances:     &Instances{ByLabels: []string{"resource_uid"}},
+			Instances: &Instances{
+				ByLabels:         []string{"resource_uid"},
+				OptionalByLabels: []string{"pid"},
+			},
 		},
 		Charts: []Chart{
 			{
@@ -74,17 +80,28 @@ func richGroup() Group {
 				Aggregation:   AggregationMax,
 				Type:          "line",
 				LabelPromoted: []string{"zone"},
-				Instances:     &Instances{ByLabels: []string{"id"}},
+				Instances: &Instances{
+					ByLabels:         []string{"id"},
+					OptionalByLabels: []string{"pid"},
+				},
 				Lifecycle: &Lifecycle{
 					MaxInstances:      10,
 					ExpireAfterCycles: 5,
-					Dimensions:        &DimensionLifecycle{MaxDims: 100, ExpireAfterCycles: 3},
+					Dimensions: &DimensionLifecycle{
+						MaxDims:           100,
+						ExpireAfterCycles: 3,
+					},
 				},
 				Dimensions: []Dimension{
 					{
 						Selector: "metric_a",
 						Name:     "a",
-						Options:  &DimensionOptions{Multiplier: 2, Divisor: 1000, Hidden: true, Float: true},
+						Options: &DimensionOptions{
+							Multiplier: 2,
+							Divisor:    1000,
+							Hidden:     true,
+							Float:      true,
+						},
 					},
 				},
 			},
@@ -103,7 +120,9 @@ func richGroup() Group {
 							{
 								Selector: "metric_c",
 								Name:     "b",
-								Options:  &DimensionOptions{Divisor: 10},
+								Options: &DimensionOptions{
+									Divisor: 10,
+								},
 							},
 						},
 					},

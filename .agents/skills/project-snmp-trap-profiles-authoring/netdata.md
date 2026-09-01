@@ -147,13 +147,16 @@ The implementation language is **Go** (user decision recorded on 2026-05-25). Th
 **Process model** (accepted by SOW-0035 M1 ADR-0001): The trap plugin is a **standard in-process go.d collector V2 module** at `src/go/plugin/go.d/collector/snmp_traps/`, registered as `snmp_traps`. No separate process, no CGo, no subprocess bridge.
 
 **Journal writer backend**: The trap collector uses the Go systemd journal SDK module
-`github.com/netdata/systemd-journal-sdk/go/journal` at `go/v0.8.0` behind `internal/output.Writer`.
+`github.com/netdata/systemd-journal-sdk/go/journal` at `go/v0.8.1` behind `internal/output.Writer`.
 `internal/output/journal.Prepare()` constructs `journal.NewLog()` with `LogOpenEager` and `LogIdentityStrict`, so journal
 directory creation/open, active file creation, writer lock acquisition, machine ID parsing, boot ID parsing, rotation
 policy validation, and retention policy validation are proven during job creation. `Writer.Start()` launches the queue
 worker only after every job resource has passed preflight.
 
-The configured per-job root is `${NETDATA_LOG_DIR}/traps/{job_name}/`. The plugin validates that `${NETDATA_LOG_DIR}` exists before creating the Netdata-owned child tree. The SDK appends the machine-id child directory, so the effective query directory is `${NETDATA_LOG_DIR}/traps/{job_name}/{machine_id}/`. Use the SDK-backed writer's effective `Directory()` for `journalctl --directory` validation.
+The configured per-job root is `${NETDATA_LOG_DIR}/traps/{job_name}/`. The plugin validates that `${NETDATA_LOG_DIR}`
+exists before creating the Netdata-owned child tree. The SDK appends the machine-id child directory, so the effective
+storage directory is `${NETDATA_LOG_DIR}/traps/{job_name}/{machine_id}/`. Use the configured per-job root for recursive
+`journalctl --directory` validation.
 
 **Output backend selection**:
 
@@ -191,12 +194,24 @@ SOW-0035 M1 finalizes the exact process/writer boundary for the Go implementatio
 - `internal/receiver` owns the immutable per-job reception policy, endpoint sockets and receive loops,
   source/version/community admission, BER/SNMP decode, SNMPv3 USM and engine state, dynamic engine-ID handling, INFORM
   responses, and per-source rate limiting.
-- The root collector owns public config DTOs and job orchestration. After receiver acceptance, it owns catalog lookup,
-  overrides, attribution/enrichment, template rendering, deduplication, output commitment, and metric updates.
-- The endpoint receive loop calls the root packet workflow synchronously. There is no receiver-owned queue or goroutine
-  between socket read and packet handling; each endpoint keeps one goroutine and one reusable datagram buffer.
-- Receiver health and policy outcomes cross the boundary through one event callback. `internal/receiver` does not import
-  collector telemetry, logging, profile, or output packages.
+- `internal/dedup` owns normalized policy, fingerprint/cache state, admission/rollback, summary scheduling/rendering, and
+  synchronous final callback completion. It receives model entries plus resolved key names and does not own output,
+  telemetry, or catalog lookup.
+- `internal/telemetry` owns retained built-in per-job counters and `metrix` emission through explicit registry/job
+  handles. Event and collection paths use the retained handle directly; registry locking is lifecycle-only.
+- `internal/jobruntime` owns one job's acquired resources, initialization/rollback/cleanup order, synchronous packet
+  transaction, and metric collection. After receiver acceptance, it sequences catalog lookup, overrides,
+  attribution/enrichment, template rendering, dedup admission, output commitment, profile-metric updates, and built-in
+  metric updates.
+- The root collector owns public config DTOs and normalization, framework methods/assets, and composition of shared
+  plugin services into an immutable `jobruntime.Policy` plus explicit dependencies. It does not own live receiver,
+  writer, dedup, profile-metric, or telemetry state.
+- The endpoint receive loop calls the `jobruntime.Job` packet workflow synchronously. There is no receiver-owned queue or
+  goroutine between socket read and packet handling; each endpoint keeps one goroutine and one reusable datagram buffer.
+- Runtime receiver health and policy outcomes cross the boundary through one event callback. `internal/receiver` does
+  not import collector telemetry, logging, profile, or output packages.
+- Non-fatal bind-time outcomes are returned as explicit events. `jobruntime.Job` attaches the per-job telemetry handle
+  before handling them; runtime outcomes continue through the receiver callback.
 
 ### Hot path (executes per trap, per job)
 
@@ -209,14 +224,21 @@ SOW-0035 M1 finalizes the exact process/writer boundary for the Go implementatio
 7. OID lookup against the prebuilt OID index (perfect-hash or radix-trie at scale). Lookup is exact-match-first; on primary miss, the receiver tries one SMIv1 / SMIv2 `.0.` alternate trap-OID key by adding or removing a single `.0.` segment immediately before the final OID arc. If neither key matches a profile entry, set `category: unknown`, `severity: notice`, `name: ""`, increment `snmp.trap.errors.unknown_oid`, and continue — the trap still emits to journal with the raw OID + varbinds.
 8. Apply profile entry (or unknown defaults from step 7): category tag, severity default, symbolic name.
 9. Enrich: device identity (sysName, vendor); topology position if co-located; recent polling state if available. Go in-process access is preferred; any alternate boundary must be justified by SOW-0035 M1.
-10. **(Opt-in dedup, default off — see §10)** If dedup is enabled for this job: check `(source_device, trap_OID, key_varbinds)` fingerprint. If hit, increment in-memory suppression counter and skip steps 11-12. If miss or dedup disabled, continue.
-11. Atomic increment of in-memory counters for `snmp.trap.events` (per device, per category, per severity), with `job_name` as a label.
-12. Build the semantic trap entry; one `output.Writer.Write()` call (see §19). The journal-direct writer serializes the entry directly into SDK-managed per-job journal files (NOT via `sd_journal_send()` — journald is bypassed so the writer can set `_HOSTNAME` to the source device, see §11).
-13. Return.
+10. Build and render the semantic trap entry.
+11. **(Opt-in dedup, default off — see §10)** If dedup is enabled for this job: reserve/check the
+    `(source_device, trap_OID, key_varbinds)` fingerprint. If hit, increment the suppression counters and return. If miss
+    or dedup is disabled, continue.
+12. Call `output.Writer.Write()` once (see §19). On an immediate authoritative write failure, roll back the dedup
+    reservation and record write failure; do not commit trap-derived metrics. The journal-direct writer serializes
+    accepted entries directly into SDK-managed per-job journal files (NOT via `sd_journal_send()` — journald is bypassed
+    so the writer can set `_HOSTNAME` to the source device, see §11).
+13. After successful authoritative output acceptance, update profile-defined metrics and the built-in committed,
+    category, and severity counters, then return.
 
 ### Cold path (per Netdata collection tick, default 1Hz)
 
-Walk per-job counter maps → emit PLUGINSD `BEGIN`/`SET`/`END` lines on stdout → flush. Standard Netdata pattern.
+Collect the per-job atomic telemetry handle plus selected profile-metric series → emit PLUGINSD `BEGIN`/`SET`/`END`
+lines on stdout → flush. Standard Netdata pattern.
 
 This decoupling means the hot path is not blocked by stdout back-pressure; if the pipe stalls, traps still ingest, journal still writes, counters still increment, metrics catch up on next tick.
 
@@ -600,10 +622,9 @@ Implementation ownership:
 - `internal/profilemetrics` owns per-job selection/compilation, generated chart
   templates, predicates and value extraction, mutable series/cardinality state,
   diagnostics, and `metrix` collection.
-- For profile metrics, the root collector owns the public config DTO and
-  orchestration: it constructs the runtime during `Init()`, updates it after a successful
-  authoritative write, collects it during `Collect()`, and releases it during
-  cleanup.
+- For profile metrics, the root collector owns the public config DTO and normalization. `internal/jobruntime` constructs
+  the runtime during `Init()`, updates it after a successful authoritative write, collects it during `Collect()`, and
+  releases it during cleanup.
 
 ### Per-OID overrides and labels
 
@@ -747,9 +768,18 @@ When enabled, dedup operates per-job: each listener has its own in-memory dedup 
 
 ### Mechanism — hot path (only when `dedup.enabled: true` on the job)
 
-1. Compute fingerprint per trap after enrichment: `hash(source_device, trap_OID, key_varbinds)`. **Default key varbinds = `[]` meaning the fingerprint uses only `(source_device, trap_OID)`.** Profiles can override per-OID via `dedup_key_varbinds:` (e.g., port-security trap fingerprints by `[macAddress, vlan]` so different MAC/VLAN combinations are NOT collapsed). If a configured key varbind is absent from a received PDU, the canonical fingerprint uses a missing-value sentinel distinct from the empty string and from legitimate literal varbind values. Operators should list only varbinds that the trap normally emits. The "all non-timestamp varbinds" default was rejected by Phase B because volatile counter varbinds (`ifInErrors`, BGP counters) trivially differ per event, bypassing dedup entirely.
-2. Check the per-job in-memory dedup cache (LRU-bounded, default 100k entries, configurable):
-   - **Fingerprint NOT present** → write journal entry immediately, increment per-event counters, insert fingerprint into cache with TTL = dedup window. **Real-time, no buffering, no delay.**
+1. Compute fingerprint per trap after enrichment: `hash(source_device, trap_OID, key_varbinds)`. **Default key varbinds =
+   `[]` meaning the fingerprint uses only `(source_device, trap_OID)`.** Profiles can override per-OID via
+   `dedup_key_varbinds:` (e.g., port-security trap fingerprints by `[macAddress, vlan]` so different MAC/VLAN
+   combinations are NOT collapsed). If a configured key varbind is absent from a received PDU, the canonical fingerprint
+   uses a missing-value sentinel distinct from the empty string and from legitimate literal varbind values. Operators
+   should list only varbinds that the trap normally emits. The "all non-timestamp varbinds" default was rejected by Phase
+   B because volatile counter varbinds (`ifInErrors`, BGP counters) trivially differ per event, bypassing dedup entirely.
+2. Check the per-job in-memory dedup cache (bounded insertion order, default 100k entries, configurable):
+   - **Fingerprint NOT present** → reserve the fingerprint in the cache with TTL = dedup window, write the entry
+     immediately, then increment committed/category/severity/profile counters after authoritative output acceptance. An
+     immediate authoritative write failure removes that reservation so a retry can be admitted. **Real-time, no
+     buffering, no delay.**
    - **Fingerprint present** → suppress: no journal write, no per-event metric increment. Increment the in-memory per-period suppression counter (broken down by trap-OID). Pipeline-health/error counters such as `unknown_oid` and `template_unresolved` are incremented before the dedup gate, so operators still see profile/template coverage gaps at received-PDU volume even when duplicates are suppressed.
 3. Cache entries expire after the dedup window (default 5 seconds; configurable per-job).
 
@@ -1225,7 +1255,7 @@ trap-derived state gauges; see `trap-metrics-profiles.md` and
 
 Phase B resolved most of the original questions. What remains:
 
-1. **Go process / writer backend** — **ACCEPTED (SOW-0035 M1, ADR-0001; amended through 2026-08-02 for SDK `go/v0.8.0`, Netdata log directory placement, raw-payload serialization, and internal output ownership)**: Standard in-process go.d collector V2 module with a thin SDK-backed Go journal adapter over `github.com/netdata/systemd-journal-sdk/go/journal` `go/v0.8.0`. No separate process, no CGo, no subprocess bridge. See `.agents/skills/project-snmp-trap-profiles-authoring/decisions/0001-go-process-and-trapwriter.md`.
+1. **Go process / writer backend** — **ACCEPTED (SOW-0035 M1, ADR-0001; amended through 2026-08-12 for SDK `go/v0.8.1`, Netdata log directory placement, raw-payload serialization, and internal output ownership)**: Standard in-process go.d collector V2 module with a thin SDK-backed Go journal adapter over `github.com/netdata/systemd-journal-sdk/go/journal` `go/v0.8.1`. No separate process, no CGo, no subprocess bridge. See `.agents/skills/project-snmp-trap-profiles-authoring/decisions/0001-go-process-and-trapwriter.md`.
 
 2. **Profile YAML lifecycle — ACCEPTED (superseded 2026-08-02)**: operators add or edit YAML files under
    `/etc/netdata/go.d/snmp.trap-profiles/`. Profiles are immutable while the plugin-scoped catalog epoch has active job

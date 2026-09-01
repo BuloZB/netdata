@@ -4,6 +4,7 @@
 #define NETDATA_RRDHOST_H
 
 #include "libnetdata/libnetdata.h"
+#include "nrpc/nrpc.h"   // NRPC_OWNER: the host doubles as the owner token of its function registry
 
 #define HOST_LABEL_IS_EPHEMERAL "_is_ephemeral"
 #define NETDATA_VIRTUAL_HOST "Netdata Virtual Host 1.0"
@@ -38,15 +39,27 @@ DEFINE_JUDYL_TYPED_ADVANCED(RRDCONTEXT_QUEUE, struct rrdcontext *, JUDYL_TYPED_N
 
 // ----------------------------------------------------------------------------
 // RRDHOST flags
-// use this for configuration flags, not for state control
-// flags are set/unset in a manner that is not thread safe
-// and may lead to missing information.
+// use this for runtime state that changes while the agent runs.
+// accesses go through atomic_flags_* (see rrdhost_flag_* below), so concurrent
+// set/clear of different bits is safe - unlike rrdhost_options, which is a plain
+// bitfield. State written by one thread and read by another belongs here.
 
 typedef enum __attribute__ ((__packed__)) rrdhost_flags {
 
     // Careful not to overlap with rrdhost_options to avoid bugs if
-    // rrdhost_flags_xxx is used instead of rrdhost_option_xxx or vice-versa
-    // Orphan, Archived and Obsolete flags
+    // rrdhost_flags_xxx is used instead of rrdhost_option_xxx or vice-versa.
+    // rrdhost_options occupies bits 0-3, so flags start above them.
+    //
+    // bits 5 and 6 are free and may be used by new flags.
+
+    // this host is a virtual node, defined by a local collector via HOST_DEFINE/HOST.
+    // it lives here and not in rrdhost_options because it is runtime state, toggled as a vnode
+    // goes stale and comes back, and because it gates writer admission: rrdhost_set_receiver()
+    // reads it to refuse a streaming receiver for a host the local collector owns. A plain
+    // read-modify-write on rrdhost_options could lose this bit against a concurrent
+    // RRDHOST_OPTION_EPHEMERAL_HOST write from another thread, which would silently reopen
+    // both vnode gates.
+    RRDHOST_FLAG_VIRTUAL_HOST                   = (1 << 4),
 
     /*
      * 3 BASE FLAGS FOR HOSTS:
@@ -121,7 +134,9 @@ typedef enum __attribute__ ((__packed__)) {
     RRDHOST_OPTION_REPLICATION              = (1 << 1), // when set, we support replication for this host
 
     // Other options
-    RRDHOST_OPTION_VIRTUAL_HOST             = (1 << 2), // when set, this host is a virtual one
+    // bit 2 is free - it held RRDHOST_OPTION_VIRTUAL_HOST, now RRDHOST_FLAG_VIRTUAL_HOST.
+    // Keep bits 0-3 reserved to rrdhost_options even when unused, so the non-overlap guard
+    // with rrdhost_flags above still holds.
     RRDHOST_OPTION_EPHEMERAL_HOST           = (1 << 3), // when set, this host is an ephemeral one
 } RRDHOST_OPTIONS;
 
@@ -230,6 +245,9 @@ struct rrdhost {
         // --- receiver ---
 
         struct {
+            uint32_t min_update_every;
+            uint32_t min_update_every_applied;
+
             struct {
                 SPINLOCK spinlock;                  // lock for the management of the allocation
                 uint32_t size;
@@ -317,6 +335,16 @@ struct rrdhost {
     // all RRDCALCs are primarily allocated and linked here
     DICTIONARY *rrdcalc_root_index;
 
+    // Secondary index of the above, keyed by the interned STRING* of
+    // rc->config.name, so health expression variable lookups can resolve an
+    // alert name without scanning every alert of the host. Alert names are not
+    // unique per host (the primary key is "{alert},on[{chart}]"), so each entry
+    // is the head of a list threaded through RRDCALC.name_next / name_prev.
+    struct {
+        RW_SPINLOCK spinlock;
+        Pvoid_t JudyL;
+    } rrdcalc_by_name;
+
     ALARM_LOG health_log;                           // alarms historical events (event log)
     uint32_t health_last_processed_id;              // the last processed health id from the log
     uint32_t health_max_unique_id;                  // the max alarm log unique id given for the host
@@ -338,10 +366,6 @@ struct rrdhost {
     // ------------------------------------------------------------------------
     // Support for host-level labels
     RRDLABELS *rrdlabels;
-
-    // ------------------------------------------------------------------------
-    // Support for functions
-    DICTIONARY *functions;                          // collector functions this rrdset supports, can be NULL
 
     // ------------------------------------------------------------------------
     // indexes
@@ -424,7 +448,7 @@ extern RRDHOST *localhost;
 #define rrdhost_sender_replicating_charts_zero(host) (__atomic_store_n(&((host)->stream.snd.status.replication.charts), 0, __ATOMIC_RELAXED))
 
 #define rrdhost_is_virtual(host)                                                                                \
-    rrdhost_option_check(host, RRDHOST_OPTION_VIRTUAL_HOST)
+    rrdhost_flag_check(host, RRDHOST_FLAG_VIRTUAL_HOST)
 
 #define rrdhost_is_local(host)  ( \
     (host) == localhost ||                                                                                      \
@@ -460,6 +484,12 @@ RRDHOST *rrdhost_find_by_hostname(const char *hostname);
 RRDHOST *rrdhost_find_by_guid(const char *guid);
 RRDHOST *rrdhost_find_by_node_id(const char *node_id);
 
+// lifetime-safe host lookup for callers that hold no reference to the host: resolves by machine_guid
+// and runs `cb` under the rrd read lock. `may_block` false skips the callback instead of waiting for
+// the lock, which threads an rrd_wrlock() holder can be blocked on MUST use - see the definition for
+// the lifetime argument, that constraint, and why this is not keyed on node_id
+bool rrdhost_apply_by_machine_guid(const char *machine_guid, void (*cb)(RRDHOST *host, void *data), void *data, bool may_block);
+
 #ifdef RRDHOST_INTERNALS
 RRDHOST *rrdhost_create(
     const char *hostname,
@@ -489,6 +519,16 @@ RRDHOST *rrdhost_create(
 
 void rrdhost_init(void);
 #endif
+
+// The host as an nRPC owner: the token the component keys its function-
+// registry index on and hands back to the owner callbacks. The component never
+// dereferences it - these two lines are the only place that casts.
+static inline NRPC_OWNER rrdhost_nrpc_owner(RRDHOST *host) { return (NRPC_OWNER){ .ptr = host }; }
+static inline RRDHOST *rrdhost_from_nrpc_owner(NRPC_OWNER id) { return (RRDHOST *)id.ptr; }
+
+// fill the host's nRPC function-registry owner vtable (see rrdhost.c); also
+// used by the nRPC unittests to re-init localhost's registry identically
+void rrdhost_nrpc_registry_owner(RRDHOST *host, struct nrpc_registry_owner *owner);
 
 RRDHOST *rrdhost_find_or_create(
     const char *hostname,

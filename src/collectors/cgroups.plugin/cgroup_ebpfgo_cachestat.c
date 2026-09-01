@@ -11,9 +11,14 @@
 
 static bool cgroup_ebpfgo_cachestat_snapshot_ready = false;
 
+void cgroup_ebpfgo_cachestat_set_snapshot_ready(bool ready)
+{
+    cgroup_ebpfgo_cachestat_snapshot_ready = ready;
+}
+
 static procfile *cgroup_ebpfgo_open_procfile_fd(const char *path);
 
-static procfile *cgroup_ebpfgo_open_nonempty_procs_file(char *path_buf, size_t path_buf_size, const char *cg_id)
+procfile *cgroup_ebpfgo_open_nonempty_procs_file(char *path_buf, size_t path_buf_size, const char *cg_id)
 {
     struct stat buf;
     const char *bases[] = {
@@ -123,10 +128,13 @@ static procfile *cgroup_ebpfgo_open_procfile_fd(const char *path)
     return ff;
 }
 
+/* Refreshes the shared memory snapshot.  Returns true if valid data is
+ * available.  The caller (sys_fs_cgroup.c) reads the per-module flags via
+ * cgroup_ebpfgo_shared_memory_flags() and then calls
+ * cgroup_ebpfgo_cachestat_set_snapshot_ready() accordingly. */
 bool cgroup_ebpfgo_cachestat_refresh(void)
 {
-    cgroup_ebpfgo_cachestat_snapshot_ready = cgroup_ebpfgo_shared_memory_refresh();
-    return cgroup_ebpfgo_cachestat_snapshot_ready;
+    return cgroup_ebpfgo_shared_memory_refresh();
 }
 
 static inline void cgroup_ebpfgo_cachestat_initialize(struct cgroup *cg)
@@ -167,8 +175,6 @@ static inline void cgroup_ebpfgo_cachestat_calculate(struct cgroup *cg)
 
 static void cgroup_ebpfgo_cachestat_sum_pids(struct cgroup *cg)
 {
-    char path_buf[FILENAME_MAX + 1];
-    procfile *ff = NULL;
     uint64_t mpa = 0;
     uint64_t mbd = 0;
     uint64_t apcl = 0;
@@ -186,17 +192,11 @@ static void cgroup_ebpfgo_cachestat_sum_pids(struct cgroup *cg)
     cg->cachestat.miss = 0;
     cg->cachestat.ct = 0;
 
-    ff = cgroup_ebpfgo_open_nonempty_procs_file(path_buf, sizeof(path_buf), cg->id);
-    if (!ff)
+    if (!cg->ebpf_pids_count)
         goto calculate;
 
-    /* cgroup_ebpfgo_open_nonempty_procs_file() returns a procfile that has already
-     * been procfile_readall()'d while selecting the best mount point. */
-
-    for (size_t l = 0; l < procfile_lines(ff); l++) {
-        pid_t pid = (pid_t)str2l(procfile_lineword(ff, l, 0));
-        if (pid <= 0)
-            continue;
+    for (size_t i = 0; i < cg->ebpf_pids_count; i++) {
+        pid_t pid = cg->ebpf_pids[i];
 
         const struct ebpf_pid_stat *item = cgroup_ebpfgo_shared_memory_lookup(pid);
         if (!item)
@@ -220,9 +220,6 @@ static void cgroup_ebpfgo_cachestat_sum_pids(struct cgroup *cg)
     }
 
 calculate:
-    if (ff)
-        procfile_close(ff);
-
     cg->cachestat.current.mark_page_accessed = mpa;
     cg->cachestat.current.mark_buffer_dirty = mbd;
     cg->cachestat.current.add_to_page_cache_lru = apcl;
@@ -238,43 +235,50 @@ calculate:
     cgroup_ebpfgo_cachestat_calculate(cg);
 }
 
-static void cgroup_ebpfgo_cachestat_update_single_chart(
-    struct cgroup *cg,
-    RRDSET **chart_ptr,
-    const char *chart_id,
-    const char *title,
-    const char *context,
-    const char *dimension,
-    const char *units,
-    int priority,
-    collected_number divisor,
-    collected_number value)
+void cgroup_ebpfgo_refresh_pid_lists(void)
 {
-    RRDSET *chart = *chart_ptr;
-    collected_number scale = divisor ? divisor : 1;
+    char path_buf[FILENAME_MAX + 1];
+    for (struct cgroup *cg = cgroup_root; cg; cg = cg->next) {
+        cg->ebpf_pids       = NULL;
+        cg->ebpf_pids_count = 0;
 
-    if (unlikely(!chart)) {
-        char buff[RRD_ID_LENGTH_MAX + 1];
-        chart = *chart_ptr = rrdset_create_localhost(
-            cgroup_chart_type(buff, cg),
-            chart_id,
-            NULL,
-            "page_cache",
-            context,
-            title,
-            units,
-            PLUGIN_CGROUPS_NAME,
-            is_cgroup_systemd_service(cg) ? PLUGIN_CGROUPS_MODULE_SYSTEMD_NAME : PLUGIN_CGROUPS_MODULE_CGROUPS_NAME,
-            priority,
-            cgroup_update_every,
-            RRDSET_TYPE_LINE);
+        if (unlikely(!cg->enabled || cg->pending_renames))
+            continue;
 
-        rrdset_update_rrdlabels(chart, cg->chart_labels);
-        rrddim_add(chart, dimension, NULL, 1, scale, RRD_ALGORITHM_ABSOLUTE);
+        procfile *ff = cgroup_ebpfgo_open_nonempty_procs_file(
+            path_buf, sizeof(path_buf), cg->id);
+        if (!ff)
+            continue;
+
+        size_t lines = procfile_lines(ff);
+        if (lines > 0) {
+            pid_t *pids = mallocz(lines * sizeof(pid_t));
+            size_t count = 0;
+            for (size_t l = 0; l < lines; l++) {
+                pid_t pid = (pid_t)str2l(procfile_lineword(ff, l, 0));
+                if (pid > 0)
+                    pids[count++] = pid;
+            }
+            if (count > 0) {
+                cg->ebpf_pids       = pids;
+                cg->ebpf_pids_count = count;
+            } else {
+                freez(pids);
+            }
+        }
+
+        /* Procfile closed immediately — data is in ebpf_pids; no FD held. */
+        procfile_close(ff);
     }
+}
 
-    rrddim_set(chart, dimension, value);
-    rrdset_done(chart);
+void cgroup_ebpfgo_release_pid_lists(void)
+{
+    for (struct cgroup *cg = cgroup_root; cg; cg = cg->next) {
+        freez(cg->ebpf_pids);
+        cg->ebpf_pids       = NULL;
+        cg->ebpf_pids_count = 0;
+    }
 }
 
 void cgroup_ebpfgo_cachestat_update_locked(void)
@@ -298,6 +302,13 @@ void cgroup_ebpfgo_cachestat_update_charts(struct cgroup *cg)
     if (unlikely(!cgroup_ebpfgo_cachestat_snapshot_ready))
         return;
 
+    // Don't create charts until the cgroup has actual page-cache activity.
+    // Once st_cachestat_ratio exists the guard is skipped — charts persist even on idle.
+    if (!cg->st_cachestat_ratio &&
+        !cg->cachestat.ratio && !cg->cachestat.dirty &&
+        !cg->cachestat.hit && !cg->cachestat.miss)
+        return;
+
     const bool is_service = is_cgroup_systemd_service(cg);
     const char *ratio_context = is_service ? "systemd.service.cachestat_ratio" : "cgroup.cachestat_ratio";
     const char *dirty_context = is_service ? "systemd.service.cachestat_dirties" : "cgroup.cachestat_dirties";
@@ -305,11 +316,12 @@ void cgroup_ebpfgo_cachestat_update_charts(struct cgroup *cg)
     const char *miss_context = is_service ? "systemd.service.cachestat_misses" : "cgroup.cachestat_misses";
     const int prio = (is_service ? NETDATA_CHART_PRIO_CGROUPS_SYSTEMD : NETDATA_CHART_PRIO_CGROUPS_CONTAINERS) + 5200;
 
-    cgroup_ebpfgo_cachestat_update_single_chart(
+    cgroup_ebpfgo_update_single_chart(
         cg,
         &cg->st_cachestat_ratio,
         "cachestat_ratio",
         "Hit ratio",
+        "page_cache",
         ratio_context,
         "ratio",
         "%",
@@ -317,11 +329,12 @@ void cgroup_ebpfgo_cachestat_update_charts(struct cgroup *cg)
         1,
         (collected_number)cg->cachestat.ratio);
 
-    cgroup_ebpfgo_cachestat_update_single_chart(
+    cgroup_ebpfgo_update_single_chart(
         cg,
         &cg->st_cachestat_dirties,
         "cachestat_dirties",
         "Number of dirty pages",
+        "page_cache",
         dirty_context,
         "dirty",
         "page/s",
@@ -329,11 +342,12 @@ void cgroup_ebpfgo_cachestat_update_charts(struct cgroup *cg)
         cgroup_update_every,
         (collected_number)cg->cachestat.dirty);
 
-    cgroup_ebpfgo_cachestat_update_single_chart(
+    cgroup_ebpfgo_update_single_chart(
         cg,
         &cg->st_cachestat_hits,
         "cachestat_hits",
         "Number of accessed files",
+        "page_cache",
         hit_context,
         "hit",
         "hits/s",
@@ -341,11 +355,12 @@ void cgroup_ebpfgo_cachestat_update_charts(struct cgroup *cg)
         cgroup_update_every,
         (collected_number)cg->cachestat.hit);
 
-    cgroup_ebpfgo_cachestat_update_single_chart(
+    cgroup_ebpfgo_update_single_chart(
         cg,
         &cg->st_cachestat_misses,
         "cachestat_misses",
         "Files out of page cache",
+        "page_cache",
         miss_context,
         "miss",
         "misses/s",

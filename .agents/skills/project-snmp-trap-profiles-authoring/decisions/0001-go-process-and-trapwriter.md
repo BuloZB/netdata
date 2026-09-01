@@ -1,7 +1,7 @@
 # ADR-0001: Go Process Model, Journal Writer Backend, and Output Writer Contract
 
-**Status**: Accepted for SOW-0035 implementation after reviewer round 5; amended through 2026-08-02 to use the
-published Go journal SDK `go/v0.8.0`, route the journal hot path through one reusable raw-payload serializer, place direct
+**Status**: Accepted for SOW-0035 implementation after reviewer round 5; amended through 2026-08-12 to use the
+published Go journal SDK `go/v0.8.1`, route the journal hot path through one reusable raw-payload serializer, place direct
 journals under `${NETDATA_LOG_DIR}/traps/`, classify startup environment failures as retryable HTTP-503 coded errors,
 remove profile hot reload, and give output components explicit internal package and lifecycle ownership.
 **Date**: 2026-05-25
@@ -40,7 +40,7 @@ The implementation language is **Go** (user decision, 2026-05-25). The journal w
 - Registered through the standard `collectorapi.Register(...)` path in the existing `collector/init.go` import registry as `snmp_traps`, mirroring the existing `snmp_topology` naming style. A scan found no existing go.d collector registration name containing a dot, so the module name must not use `snmp.traps`.
 - Uses V2 collector interface (`collectorapi.CollectorV2`), mirroring the `ping/` collector pattern
 - Job lifecycle managed by the existing go.d framework (`src/go/plugin/agent/jobmgr/dyncfg_collector_callbacks.go`)
-- Journal writing via a thin adapter around `github.com/netdata/systemd-journal-sdk/go/journal` `go/v0.8.0`, keeping the internal `output.Writer` abstraction and delegating journal file format, active-file indexing, rotation, retention, and writer locking to the SDK.
+- Journal writing via a thin adapter around `github.com/netdata/systemd-journal-sdk/go/journal` `go/v0.8.1`, keeping the internal `output.Writer` abstraction and delegating journal file format, active-file indexing, rotation, retention, and writer locking to the SDK.
 - Shared profile catalog: an in-process manager owned by the plugin registration, loaded on first runnable job creation
 
 ### Option B: Separate Go process (external plugin) via PLUGINSD
@@ -140,19 +140,28 @@ Registration in `src/go/plugin/go.d/collector/init.go`:
 _ "github.com/netdata/netdata/go/plugins/plugin/go.d/collector/snmp_traps"
 ```
 
+#### Final ownership outcome
+
+The initial layout above was an implementation starting point. The completed ownership split keeps the selected
+in-process model and writer contract, but moves all per-job lifecycle and packet orchestration into
+`internal/jobruntime`. The root `collector.go` is now the framework adapter; `config.go` / `init.go` own public DTOs and
+normalization; `register.go` / `services.go` compose plugin-scoped services; and `internal/jobruntime` owns acquired
+resources, rollback, cleanup, synchronous packet handling, and metric collection. The former root `pipeline.go`,
+`decode_error.go`, `enrich.go`, and compatibility bridge files were removed rather than retained as forwarding layers.
+
 ### 2. Journal Writer Backend
 
 `internal/output/journal` owns the journal backend. It does **not** implement the systemd journal binary format locally;
 it delegates format, active-file indexing, writer locks, rotation, retention, and chain validation/reopen behavior to
-`github.com/netdata/systemd-journal-sdk/go/journal` `go/v0.8.0`.
+`github.com/netdata/systemd-journal-sdk/go/journal` `go/v0.8.1`.
 
 The backend has an explicit two-phase lifecycle:
 
 - `journal.Prepare(dir, cfg, host, opts)` eagerly opens the SDK log and proves the directory, lock, active file, host
   identity, rotation policy, and retention policy without starting a goroutine.
 - `Writer.Start()` starts the one queue worker after every job resource has passed preflight.
-- `Writer.Write()`, `Flush()`, `Close()`, `Directory()`, and `BinaryEncodedFields()` expose only the runtime behavior needed
-  by the root collector. Closing a prepared-but-not-started writer is safe.
+- `Writer.Write()`, `Flush()`, `Close()`, and `BinaryEncodedFields()` expose only the runtime behavior needed
+  by the job runtime and output-owner tests. Closing a prepared-but-not-started writer is safe.
 - The package owns parsed `Retention` and SDK-facing `Config`; the root package retains only the human-readable config DTO
   and maps it into these normalized types.
 
@@ -162,8 +171,7 @@ The backend has an explicit two-phase lifecycle:
   per-job root `${NETDATA_LOG_DIR}/traps/{job_name}/`.
 - The plugin checks that `${NETDATA_LOG_DIR}` already exists before calling the
   SDK. It creates only the Netdata-owned trap child tree.
-- The SDK appends `<machine-id>/`; `Writer.Directory()` returns the effective query directory for
-  `journalctl --directory`.
+- The SDK appends `<machine-id>/`; `journalctl --directory` can query the configured per-job root recursively.
 - `LogOpenEager` is mandatory so active journal file creation/open and writer
   lock acquisition fail during job creation.
 - `LogIdentityStrict` is mandatory. The adapter reads `/etc/machine-id` and
@@ -424,7 +432,7 @@ On `Update()`, current jobmgr behavior stops the old running job before creating
 | Shared profile catalog lease leak leaves an epoch allocated | Every collector stores and closes its exact lease in `Cleanup()` and on partial initialization failure; test idempotent close, final release, retry, and concurrent acquisition |
 | Framework coded-error change breaks other collectors | Preserve existing behavior for plain errors; only `CodedError` suppresses retry and controls HTTP code; add Start and Update tests |
 | Direct journal writer cannot sustain target trap volume | Run `go test -benchmem` / throughput benchmarks for queue enqueue and the SDK-backed raw serializer/drain path; if allocation or throughput misses the tens-of-thousands/sec target, reopen batching or backend design |
-| SDK dependency API drifts | Pin to `github.com/netdata/systemd-journal-sdk/go v0.8.0`; review API changes before updating |
+| SDK dependency API drifts | Pin to `github.com/netdata/systemd-journal-sdk/go v0.8.1`; review API changes before updating |
 | SDK chain handling has an upstream defect | Keep `internal/output.Writer` and the internal journal adapter boundary narrow so the SDK can be updated or replaced without changing ingestion semantics |
 
 ## Validation Requirements

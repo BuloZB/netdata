@@ -96,7 +96,7 @@ progress "Attempt to create user/group netdata/netadata"
 
 # These variables are consumed by helper functions from functions.sh.
 # shellcheck disable=SC2034
-NETDATA_WANTED_GROUPS="docker nginx varnish haproxy adm nsd proxy squid ceph nobody I2C"
+NETDATA_WANTED_GROUPS="docker nginx varnish adm nsd proxy squid ceph nobody I2C"
 # shellcheck disable=SC2034
 NETDATA_ADDED_TO_GROUPS=""
 # Default user/group
@@ -199,6 +199,17 @@ if [ -e "${NETDATA_PREFIX}/usr/libexec/netdata/plugins.d/cgroup-name.sh" ] ||
   [ -L "${NETDATA_PREFIX}/usr/libexec/netdata/plugins.d/cgroup-name.sh" ]; then
   run rm -f "${NETDATA_PREFIX}/usr/libexec/netdata/plugins.d/cgroup-name.sh"
 fi
+
+# The otel-signal-viewer plugin was removed in favour of otel-plugin plus the
+# read-only legacy-otel-logs function. Native packages drop its files via
+# Obsoletes/Replaces, but an overlay upgrade only stops shipping them, so both
+# artifacts linger here. Only stock paths are touched, never user config.
+for x in usr/libexec/netdata/plugins.d/otel-signal-viewer-plugin \
+  usr/lib/netdata/conf.d/otel-signal-viewer.yaml; do
+  if [ -e "${NETDATA_PREFIX}/${x}" ] || [ -L "${NETDATA_PREFIX}/${x}" ]; then
+    run rm -f "${NETDATA_PREFIX}/${x}"
+  fi
+done
 
 # -----------------------------------------------------------------------------
 

@@ -213,7 +213,6 @@ type Epoch struct {
 	metricRulesByOut  map[string]*profileMetricRule
 	metricChartsByID  map[string]*profileMetricChart
 	stock             *stockProfileStore
-	profiles          []ProfileInfo
 
 	// Validation overlays exist only on a staged epoch. They let one bundle
 	// validate against already-published definitions and parsed lazy
@@ -227,8 +226,7 @@ type Epoch struct {
 	validationStockProfile string
 }
 
-// NewEpoch returns an empty epoch for callers that assemble static trap definitions.
-func NewEpoch() *Epoch {
+func newEpoch() *Epoch {
 	return &Epoch{
 		trapsByOID:        make(map[string]*TrapDef),
 		namesByTrapName:   make(map[string]*TrapDef),
@@ -236,41 +234,6 @@ func NewEpoch() *Epoch {
 		metricRulesByOut:  make(map[string]*profileMetricRule),
 		metricChartsByID:  make(map[string]*profileMetricChart),
 	}
-}
-
-// AddTraps validates and adds static trap definitions to an unpublished epoch.
-func (idx *Epoch) AddTraps(traps []*TrapDef) error { return idx.addTraps(traps) }
-
-// PrepareTrap compiles one manually assembled trap definition.
-func PrepareTrap(td *TrapDef) error {
-	if td == nil {
-		return errors.New("trap definition is nil")
-	}
-	fileVarbinds := make(map[string]VarbindDef, len(td.SharedVarbinds))
-	for _, vb := range td.SharedVarbinds {
-		if vb != nil && vb.RawName != "" {
-			fileVarbinds[vb.RawName] = *vb
-		}
-	}
-	if td.SharedVarbinds == nil {
-		td.SharedVarbinds = buildSharedVarbinds(td, fileVarbinds)
-	}
-	return compileTrapTemplates(td, fileVarbinds)
-}
-
-// ProfileInfo describes one effective extensionless profile identity.
-type ProfileInfo struct {
-	Name    string
-	Path    string
-	IsStock bool
-}
-
-// Profiles returns the effective profile inventory sorted by identity.
-func (idx *Epoch) Profiles() []ProfileInfo {
-	if idx == nil {
-		return nil
-	}
-	return append([]ProfileInfo(nil), idx.profiles...)
 }
 
 // Lookup returns the TrapDef for a given numeric OID, or nil if not found.
@@ -472,9 +435,9 @@ func validateTrapDef(td *TrapDef, fileVarbinds map[string]VarbindDef) error {
 		return fmt.Errorf("%s: trap entry %s: invalid status %q (must be current, deprecated, mandatory, obsolete, or optional)", src, td.OID, td.Status)
 	}
 
-	for _, name := range td.DedupKeyVarbinds {
-		if name == "" {
-			continue
+	for i, name := range td.DedupKeyVarbinds {
+		if strings.TrimSpace(name) == "" {
+			return fmt.Errorf("%s: trap entry %s: dedup_key_varbinds[%d] must not be empty", src, td.OID, i)
 		}
 		if _, ok := fileVarbinds[name]; !ok {
 			return fmt.Errorf("%s: trap entry %s: dedup_key_varbind %q not found in file-scoped varbinds table", src, td.OID, name)

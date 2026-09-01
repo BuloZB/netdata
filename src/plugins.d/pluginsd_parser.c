@@ -3,6 +3,7 @@
 #include "pluginsd_internals.h"
 #include "streaming/stream-replication-receiver.h"
 #include "database/rrddim-collection.h"
+#include "database/rrdset-collection.h"
 
 static inline PARSER_RC pluginsd_set(char **words, size_t num_words, PARSER *parser) {
     int idx = 1;
@@ -209,6 +210,50 @@ static inline bool pluginsd_update_host_ephemerality(RRDHOST *host) {
 
 #define VNODE_BASE_EPOCH (1704067200L)  // Jan 1, 2024 00:00:00 UTC
 
+// A host has exactly one writer. For a vnode that writer is the local collector that defines it.
+//
+// RRDHOST_FLAG_VIRTUAL_HOST makes the streaming handshake reject incoming connections for this
+// machine GUID (stream_receiver_accept_connection(), STREAM_HANDSHAKE_PARENT_VNODE_IS_LOCAL), but it
+// does not evict a receiver that is already attached: while the vnode was stale the flag was
+// cleared, so a peer that also collects this device may have streamed it back to us in the meantime.
+//
+// Callers MUST set RRDHOST_FLAG_VIRTUAL_HOST before calling this and MUST NOT write to the host
+// when this returns false. Setting the flag first is what keeps a receiver from attaching behind
+// our back: rrdhost_set_receiver() re-checks it under the receiver lock we take below, so a
+// connection that passed the accept-time check is refused once we have claimed the host.
+//
+// On failure the caller MUST clear the flag again, unless the host is already registered in
+// parser->user.vnodes.JudyL - the stale detection and the plugin teardown clear it only for hosts
+// in that index, so an unregistered host would keep the gate closed with nobody collecting.
+static bool pluginsd_host_claim_as_local_vnode(RRDHOST *host, const char *keyword) {
+    // stream_receiver_signal_to_stop_and_wait() also returns true when no receiver is attached,
+    // so we check first: that is the only way to tell "nothing to do" (the common case, silent)
+    // from "we disconnected someone" (rare, and the only diagnostic for a GUID conflict).
+    rrdhost_receiver_lock(host);
+    bool has_receiver = host->receiver != NULL;
+    rrdhost_receiver_unlock(host);
+
+    if(!has_receiver)
+        return true;
+
+    // the peer identity is logged by the receiver itself, with this disconnect reason
+    if(!stream_receiver_signal_to_stop_and_wait(host, STREAM_HANDSHAKE_RCV_DISCONNECT_LOCAL_VNODE_CLAIMED)) {
+        nd_log_daemon(NDLP_ERR,
+                      "PLUGINSD: %s: host '%s' (machine guid %s) is collected locally as a vnode, but its "
+                      "streaming receiver could not be stopped - not collecting into it",
+                      keyword, rrdhost_hostname(host), host->machine_guid);
+        return false;
+    }
+
+    nd_log_daemon(NDLP_WARNING,
+                  "PLUGINSD: %s: host '%s' (machine guid %s) was receiving a stream while it is collected "
+                  "locally as a vnode - the stream has been disconnected. If this is a real child node, "
+                  "its machine guid conflicts with the guid of a locally collected vnode.",
+                  keyword, rrdhost_hostname(host), host->machine_guid);
+
+    return true;
+}
+
 static inline PARSER_RC pluginsd_host_define_end(char **words __maybe_unused, size_t num_words __maybe_unused, PARSER *parser) {
     if(!parser->user.host_define.parsing_host)
         return PLUGINSD_DISABLE_PLUGIN(parser, PLUGINSD_KEYWORD_HOST_DEFINE_END, "missing initialization, send " PLUGINSD_KEYWORD_HOST_DEFINE " before this");
@@ -249,7 +294,21 @@ static inline PARSER_RC pluginsd_host_define_end(char **words __maybe_unused, si
         return PARSER_RC_ERROR;
     }
 
-    rrdhost_option_set(host, RRDHOST_OPTION_VIRTUAL_HOST);
+    rrdhost_flag_set(host, RRDHOST_FLAG_VIRTUAL_HOST);
+
+    // the flag above closes the door to new receivers; this evicts one that is already inside.
+    // on failure we clear it again: this host is not in parser->user.vnodes.JudyL yet (JudyLIns is
+    // at the end of this function), so neither the stale detection nor the plugin teardown - both
+    // iterate that index - would ever clear it. We are not collecting into this host, so leaving
+    // the gate closed would reject the receiver we just failed to evict, plus every later
+    // reconnect of a legitimate child with this machine guid, while nothing writes to it at all.
+    if(!pluginsd_host_claim_as_local_vnode(host, PLUGINSD_KEYWORD_HOST_DEFINE_END)) {
+        rrdhost_flag_clear(host, RRDHOST_FLAG_VIRTUAL_HOST);
+        pluginsd_host_define_cleanup(parser);
+        parser->user.retry = true;
+        return PARSER_RC_ERROR;
+    }
+
     rrdhost_flag_set(host, RRDHOST_FLAG_COLLECTOR_ONLINE);
     object_state_activate_if_not_activated(&host->state_id);
     ml_host_start(host);
@@ -318,13 +377,17 @@ static inline PARSER_RC pluginsd_host(char **words, size_t num_words, PARSER *pa
                     continue;
 
                 min_check_interval = MIN(min_check_interval, stale_after_seconds);
-                if (rrdhost_option_check(virtual_host, RRDHOST_OPTION_VIRTUAL_HOST)) {
+                if (rrdhost_flag_check(virtual_host, RRDHOST_FLAG_VIRTUAL_HOST)) {
                     time_t last_seen = (*Pvalue + VNODE_BASE_EPOCH);
                     uint32_t seen_seconds_ago = (now > last_seen) ? (uint32_t)(now - last_seen) : 0;
 
                     if (seen_seconds_ago >= stale_after_seconds) {
-                        rrdhost_option_clear(virtual_host, RRDHOST_OPTION_VIRTUAL_HOST);
-                        rrdhost_flag_clear(virtual_host, RRDHOST_FLAG_COLLECTOR_ONLINE);
+                        // one atomic clear: both bits describe the same transition (we stopped collecting
+                        // this vnode), so a reader that snapshots host->flags once cannot observe one
+                        // without the other - rrdhost_status_ingest() derives ingest.type from such a
+                        // snapshot. This is about consistent status reporting only; writer exclusivity is
+                        // enforced by the receiver lock, not by these bits.
+                        rrdhost_flag_clear(virtual_host, RRDHOST_FLAG_VIRTUAL_HOST | RRDHOST_FLAG_COLLECTOR_ONLINE);
                         nd_log_daemon(NDLP_INFO, "VNODE: Marking node \"%s\" as STALE, last seen %u seconds ago", rrdhost_hostname(virtual_host), seen_seconds_ago);
                         schedule_node_state_update(virtual_host, 1000);
                         stream_sender_signal_to_stop_and_wait(virtual_host, STREAM_HANDSHAKE_SND_VNODE_IS_STALE, false);
@@ -353,8 +416,19 @@ static inline PARSER_RC pluginsd_host(char **words, size_t num_words, PARSER *pa
     if (Pvalue) {
         *Pvalue = (uint32_t) (now_realtime_sec() - VNODE_BASE_EPOCH);
         // Check if we need to enable
-        if (!rrdhost_option_check(host, RRDHOST_OPTION_VIRTUAL_HOST)) {
-            rrdhost_option_set(host, RRDHOST_OPTION_VIRTUAL_HOST);
+        if (!rrdhost_flag_check(host, RRDHOST_FLAG_VIRTUAL_HOST)) {
+            rrdhost_flag_set(host, RRDHOST_FLAG_VIRTUAL_HOST);
+
+            // while this vnode was stale, a peer collecting the same device may have started
+            // streaming it to us - we must be its only writer before we collect into it again.
+            // on failure we retry the plugin: routing this data into a host we do not exclusively
+            // own would corrupt it, and routing it to localhost would misattribute it.
+            if(!pluginsd_host_claim_as_local_vnode(host, PLUGINSD_KEYWORD_HOST)) {
+                parser->user.host = NULL;
+                parser->user.retry = true;
+                return PARSER_RC_ERROR;
+            }
+
             rrdhost_flag_set(host, RRDHOST_FLAG_COLLECTOR_ONLINE);
             nd_log_daemon(NDLP_INFO, "VNODE: Re-enabling virtual host \"%s\"", rrdhost_hostname(host));
             schedule_node_state_update(host, 1000);
@@ -476,6 +550,8 @@ static inline PARSER_RC pluginsd_chart(char **words, size_t num_words, PARSER *p
             return PLUGINSD_DISABLE_PLUGIN(parser, NULL, NULL);
 
         pluginsd_rrdset_cache_put_to_slot(parser, st, slot, obsolete);
+        if(SERVING_STREAMING(parser))
+            rrdset_set_update_every_s(st, st->update_every);
     }
     else
         pluginsd_clear_scope_chart(parser, PLUGINSD_KEYWORD_CHART, NULL);
@@ -746,8 +822,9 @@ static inline PARSER_RC pluginsd_overwrite(char **words __maybe_unused, size_t n
     bool labels_changed = rrdlabels_migrate_to_these(host->rrdlabels, parser->user.new_host_labels);
     labels_changed |= pluginsd_update_host_ephemerality(host);
 
-    if(!rrdlabels_exist(host->rrdlabels, "_os"))
+    if(!rrdlabels_exist(host->rrdlabels, "_os")) {
         labels_changed |= rrdlabels_add_changed(host->rrdlabels, "_os", string2str(host->os), RRDLABEL_SRC_AUTO);
+    }
 
     if(!rrdlabels_exist(host->rrdlabels, "_hostname"))
         labels_changed |= rrdlabels_add_changed(host->rrdlabels, "_hostname", string2str(host->hostname), RRDLABEL_SRC_AUTO);
@@ -777,7 +854,8 @@ static inline PARSER_RC pluginsd_clabel(char **words, size_t num_words, PARSER *
     if(unlikely(parser->user.clabel_count++ == 0))
         rrdlabels_unmark_all(st->rrdlabels);
 
-    rrdlabels_add(st->rrdlabels, name, value, str2l(label_source));
+    if(rrdlabels_add_changed(st->rrdlabels, name, value, str2l(label_source)))
+        parser->user.clabel_changed = true;
 
     return PARSER_RC_OK;
 }
@@ -796,18 +874,26 @@ static inline PARSER_RC pluginsd_clabel_commit(char **words __maybe_unused, size
         return PLUGINSD_DISABLE_PLUGIN(parser, NULL, NULL);
     }
 
-    bool labels_changed = rrdlabels_remove_all_unmarked_and_changed(st->rrdlabels);
+    // rrdlabels_remove_all_unmarked_and_changed() only sees added/removed pairs; a source-only
+    // change lands on an existing slot, so pick that up from the per-CLABEL results.
+    bool labels_changed = rrdlabels_remove_all_unmarked_and_changed(st->rrdlabels) ||
+                          parser->user.clabel_changed;
 
-    rrdset_flag_set(st, RRDSET_FLAG_METADATA_UPDATE);
-    rrdhost_flag_set(st->rrdhost, RRDHOST_FLAG_METADATA_UPDATE);
-    rrdset_metadata_updated(st);
-
+    // CLABEL_COMMIT arrives on every chart definition the child sends, but the labels are usually
+    // identical to what we already hold. Only flag metadata dirty and bump RRDSET.version when they
+    // actually changed - an unconditional bump re-sends the whole chart definition upstream and
+    // re-queues the chart for context post-processing on every commit.
     if(labels_changed) {
+        rrdset_flag_set(st, RRDSET_FLAG_METADATA_UPDATE);
+        rrdhost_flag_set(st->rrdhost, RRDHOST_FLAG_METADATA_UPDATE);
+        rrdset_metadata_updated(st);
+
         rrdset_flag_set(st, RRDSET_FLAG_PENDING_LABEL_RECHECK);
         rrdhost_flag_set(st->rrdhost, RRDHOST_FLAG_PENDING_HEALTH_INITIALIZATION);
     }
 
     parser->user.clabel_count = 0;
+    parser->user.clabel_changed = false;
 
     return PARSER_RC_OK;
 }
@@ -1344,7 +1430,7 @@ inline size_t pluginsd_process(RRDHOST *host, struct plugind *cd, int fd_input, 
 
     pluginsd_keywords_init(parser, PARSER_INIT_PLUGINSD);
 
-    rrd_collector_started();
+    nrpc_serving_started();
 
     size_t count = 0;
 
@@ -1403,18 +1489,44 @@ inline size_t pluginsd_process(RRDHOST *host, struct plugind *cd, int fd_input, 
     else if (!*retry)
         cd->serial_failures++;
 
+    // The vnodes this plugin fed also carry its functions, and those only become unavailable
+    // once nrpc_serving_finished() runs below. The manifest refresh therefore has to happen
+    // after that, so snapshot the hosts here - the JudyL lives in the parser, which is
+    // also destroyed below (before the manifest arms).
+    //
+    // Snapshot machine guids rather than RRDHOST pointers: the loop below clears
+    // RRDHOST_FLAG_COLLECTOR_ONLINE, which is exactly what makes rrdhost_is_online() false and so
+    // lets `netdatacli remove-stale-node --unregister` free a vnode (see remove_ephemeral_host()).
+    // A borrowed pointer would have to survive the chart sweep, the parser destroy and the
+    // collector wait below; re-resolving narrows that to the resolve-then-arm pair, and
+    // aclk_arm_node_manifest() ignores a NULL host, so a vnode that did go away is simply skipped.
+    // This does not make the pointer refcounted - holding an RRDHOST across the free paths needs
+    // more than a lock, since rrdhost_free___consume_metadata_lifetime_writelock() releases both
+    // rrd_wrlock and metadata_lifetime_lock before rrdhost_free_unlinked(). It is the same bare
+    // lookup every other caller of rrdhost_find_by_guid() does.
+    size_t vnodes_used = 0;
+    char (*vnode_guids)[GUID_LEN + 1] = NULL;
+
     {
+        Word_t vnodes_count = JudyLCount(parser->user.vnodes.JudyL, 0, -1, PJE0);
+        if (vnodes_count)
+            vnode_guids = mallocz(vnodes_count * sizeof(*vnode_guids));
+
         Word_t Index = 0;
         bool first_then_next = true;
         while (JudyLFirstThenNext(parser->user.vnodes.JudyL, &Index, &first_then_next)) {
             RRDHOST *virtual_host = (RRDHOST *) Index;
             nd_log_daemon(NDLP_INFO, "PLUGINSD: Checking virtual status for %s", rrdhost_hostname(virtual_host));
-            if (rrdhost_option_check(virtual_host, RRDHOST_OPTION_VIRTUAL_HOST)) {
+            if (rrdhost_flag_check(virtual_host, RRDHOST_FLAG_VIRTUAL_HOST)) {
                 nd_log_daemon(NDLP_INFO, "PLUGINSD: Reseting virtual host status for %s", rrdhost_hostname(virtual_host));
-                rrdhost_option_clear(virtual_host, RRDHOST_OPTION_VIRTUAL_HOST);
-                rrdhost_flag_clear(virtual_host, RRDHOST_FLAG_COLLECTOR_ONLINE);
+                // one atomic clear, for the same status-snapshot consistency reason as the stale
+                // detection in pluginsd_host()
+                rrdhost_flag_clear(virtual_host, RRDHOST_FLAG_VIRTUAL_HOST | RRDHOST_FLAG_COLLECTOR_ONLINE);
                 schedule_node_state_update(virtual_host, 1000);
             }
+
+            if (vnodes_used < (size_t)vnodes_count)
+                strncpyz(vnode_guids[vnodes_used++], virtual_host->machine_guid, GUID_LEN);
         }
         (void) JudyLFreeArray(&parser->user.vnodes.JudyL, PJE0);
     }
@@ -1427,8 +1539,24 @@ inline size_t pluginsd_process(RRDHOST *host, struct plugind *cd, int fd_input, 
     }
     rrdset_foreach_done(st);
 
+    // Invalidate the collector and drain in-flight dispatchers BEFORE freeing
+    // the parser: cancel/progress callbacks registered by this plugin's
+    // functions carry parser-derived pointers, so the parser must outlive the
+    // dispatcher drain (defense-in-depth on the plugin path; the streaming
+    // path has no per-receiver equivalent - its collector is per stream
+    // thread - and relies on the transport lifetime instead). Safe to
+    // reorder: the obsolete-charts sweep above keys on collector_tid, the
+    // vnode snapshot was taken earlier, and nrpc_serving_finished() is
+    // idempotent per worker iteration.
+    nrpc_serving_finished();
     pluginsd_process_cleanup(parser);
-    rrd_collector_finished();
+
+    // the functions this plugin registered are still in the host's function registry, but their collector
+    // is no longer running, so they must drop out of the cloud manifest
+    aclk_arm_node_manifest(host);
+    for (size_t i = 0; i < vnodes_used; i++)
+        aclk_arm_node_manifest(rrdhost_find_by_guid(vnode_guids[i]));
+    freez(vnode_guids);
 
     return count;
 }

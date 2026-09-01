@@ -68,16 +68,28 @@ func Validate(s *Spec) (Validation, error) {
 	errs = append(errs, err)
 
 	for i := range s.Groups {
-		errs = append(errs, validateGroup(s.Groups[i], fmt.Sprintf("groups[%d]", i), nil))
+		errs = append(errs, validateGroup(s.Groups[i], fmt.Sprintf("groups[%d]", i), nil, false, false))
 	}
 	return Validation{autogenRules: rules}, errors.Join(errs...)
 }
 
-func validateGroup(group Group, path string, inheritedMetrics map[string]struct{}) error {
+func validateGroup(
+	group Group,
+	path string,
+	inheritedMetrics map[string]struct{},
+	inheritedFamily bool,
+	requireFamily bool,
+) error {
 	var errs []error
-	if strings.TrimSpace(group.Family) == "" {
-		errs = append(errs, semErr(path+".family", "must not be empty"))
+	family := strings.TrimSpace(group.Family)
+	if family == "" {
+		if requireFamily {
+			errs = append(errs, semErr(path+".family", "must not be empty"))
+		} else if group.Family != "" {
+			errs = append(errs, semErr(path+".family", "must not be whitespace-only"))
+		}
 	}
+	effectiveFamily := inheritedFamily || family != ""
 	errs = append(errs, validateChartDefaults(group.ChartDefaults, path))
 
 	ownMetrics := make(map[string]struct{}, len(group.Metrics))
@@ -102,10 +114,20 @@ func validateGroup(group Group, path string, inheritedMetrics map[string]struct{
 	}
 
 	for i := range group.Charts {
+		if !effectiveFamily && strings.TrimSpace(group.Charts[i].Family) == "" {
+			errs = append(errs, semErr(fmt.Sprintf("%s.charts[%d].family", path, i),
+				"must not be empty when no group family is set"))
+		}
 		errs = append(errs, validateChart(group.Charts[i], fmt.Sprintf("%s.charts[%d]", path, i), effective))
 	}
 	for i := range group.Groups {
-		errs = append(errs, validateGroup(group.Groups[i], fmt.Sprintf("%s.groups[%d]", path, i), effective))
+		errs = append(errs, validateGroup(
+			group.Groups[i],
+			fmt.Sprintf("%s.groups[%d]", path, i),
+			effective,
+			effectiveFamily,
+			true,
+		))
 	}
 	return errors.Join(errs...)
 }
@@ -179,13 +201,21 @@ func validateInstances(instances *Instances, path string) error {
 	if instances == nil {
 		return nil
 	}
-	var errs []error
-	hasPositive := false
-	if len(instances.ByLabels) == 0 {
-		return semErr(path+".instances.by_labels", "must contain at least one token when instances is set")
+	if len(instances.ByLabels) == 0 && len(instances.OptionalByLabels) == 0 {
+		if instances.ByLabels != nil {
+			return semErr(path+".instances.by_labels", "must contain at least one token when instances is set")
+		}
+		if instances.OptionalByLabels != nil {
+			return semErr(path+".instances.optional_by_labels", "must contain at least one label key when instances is set")
+		}
+		return semErr(path+".instances", "must contain at least one required or optional label")
 	}
 
+	var errs []error
+	hasPositive := false
 	seen := make(map[string]struct{}, len(instances.ByLabels))
+	requiredKeys := make(map[string]struct{}, len(instances.ByLabels))
+	includeAll := false
 	for i, token := range instances.ByLabels {
 		token = strings.TrimSpace(token)
 		if token == "" {
@@ -195,6 +225,7 @@ func validateInstances(instances *Instances, path string) error {
 		switch {
 		case token == "*":
 			hasPositive = true
+			includeAll = true
 		case strings.HasPrefix(token, "!"):
 			key := strings.TrimPrefix(token, "!")
 			if key == "" {
@@ -205,16 +236,44 @@ func validateInstances(instances *Instances, path string) error {
 				errs = append(errs, semErr(fmt.Sprintf("%s.instances.by_labels[%d]", path, i), "exclude token must use !label_key syntax"))
 				continue
 			}
+			requiredKeys[key] = struct{}{}
 		default:
 			hasPositive = true
+			requiredKeys[token] = struct{}{}
 		}
 		if _, ok := seen[token]; ok {
 			errs = append(errs, semErr(fmt.Sprintf("%s.instances.by_labels[%d]", path, i), fmt.Sprintf("duplicate token %q", token)))
 		}
 		seen[token] = struct{}{}
 	}
-	if !hasPositive {
+	if len(instances.ByLabels) > 0 && !hasPositive {
 		errs = append(errs, semErr(path+".instances.by_labels", "must include at least one positive selector ('*' or label key)"))
+	}
+
+	seenOptional := make(map[string]struct{}, len(instances.OptionalByLabels))
+	for i, raw := range instances.OptionalByLabels {
+		key := strings.TrimSpace(raw)
+		optionalPath := fmt.Sprintf("%s.instances.optional_by_labels[%d]", path, i)
+		if key == "" {
+			errs = append(errs, semErr(optionalPath, "must not be empty"))
+			continue
+		}
+		if key == "*" || strings.HasPrefix(key, "!") {
+			errs = append(errs, semErr(optionalPath, "must be an explicit label key, not a wildcard or exclusion"))
+			continue
+		}
+		if _, ok := seenOptional[key]; ok {
+			errs = append(errs, semErr(optionalPath, fmt.Sprintf("duplicate label key %q", key)))
+			continue
+		}
+		seenOptional[key] = struct{}{}
+		if includeAll {
+			errs = append(errs, semErr(optionalPath, "cannot be combined with instances.by_labels wildcard"))
+			continue
+		}
+		if _, ok := requiredKeys[key]; ok {
+			errs = append(errs, semErr(optionalPath, fmt.Sprintf("label key %q conflicts with instances.by_labels", key)))
+		}
 	}
 	return errors.Join(errs...)
 }

@@ -206,7 +206,17 @@ cmake_dependent_option(ENABLE_CGROUPS_LOOKUP_SERVER "Enable cgroups.plugin CGROU
 cmake_dependent_option(ENABLE_CGROUPS_LOOKUP_TEST_CLIENT "Build cgroups.plugin CGROUPS_LOOKUP test client" False "ENABLE_CGROUPS_LOOKUP_SERVER" False)
 cmake_dependent_option(ENABLE_CGROUP_NAME "Build the cgroup-name helper" True "OS_LINUX;ENABLE_PLUGIN_GO" False)
 cmake_dependent_option(ENABLE_PLUGIN_DEBUGFS "Enable Linux DebugFS metric collection" ${DEFAULT_FEATURE_STATE} "OS_LINUX" False)
-cmake_dependent_option(ENABLE_PLUGIN_EBPF "Enable Linux eBPF metric collection" ${DEFAULT_FEATURE_STATE} "OS_LINUX" False)
+# eBPF support is 64-bit only: the legacy BPF objects we ship are fetched with no
+# architecture dimension (see NetdataEBPFLegacy.cmake - only libc varies), 32-bit
+# kernels provide no BTF to build CO-RE programs from, and the loaders share struct
+# layouts with the BPF side. On a 32-bit userland the plugin builds and installs but
+# cannot load a single program - it exits 1 and netdata disables it.
+cmake_dependent_option(ENABLE_PLUGIN_EBPF "Enable Linux eBPF metric collection" ${DEFAULT_FEATURE_STATE} "OS_LINUX;CMAKE_SIZEOF_VOID_P EQUAL 8" False)
+
+if(OS_LINUX AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(STATUS "eBPF plugin disabled: requires a 64-bit userland (pointer size is ${CMAKE_SIZEOF_VOID_P} bytes)")
+endif()
+
 cmake_dependent_option(ENABLE_LEGACY_EBPF_PROGRAMS "Enable eBPF programs for kernels without BTF support" True "ENABLE_PLUGIN_EBPF" False)
 mark_as_advanced(ENABLE_LEGACY_EBPF_PROGRAMS)
 cmake_dependent_option(ENABLE_PLUGIN_LOCAL_LISTENERS "Enable local listening socket tracking (including service auto-discovery support)" ${DEFAULT_FEATURE_STATE} "OS_LINUX" False)
@@ -481,11 +491,17 @@ if(ENABLE_PLUGIN_GO OR ENABLE_PLUGIN_EBPF OR ENABLE_PLUGIN_IBM OR ENABLE_PLUGIN_
     endif()
 
     if(GO_FOUND)
-        set(ENABLE_PLUGIN_EBPF_GO ON)
+        # The BPF side is always LP64, and the loader shares struct layouts with it,
+        # so this plugin is only built for 64-bit userlands.
+        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+            set(ENABLE_PLUGIN_EBPF_GO ON)
+        else()
+            message(STATUS "eBPF Go plugin disabled: requires a 64-bit userland (pointer size is ${CMAKE_SIZEOF_VOID_P} bytes)")
+        endif()
     endif()
 endif()
 
-if(ENABLE_PLUGIN_GO OR ENABLE_PLUGIN_SCRIPTS)
+if(OS_MACOS OR ENABLE_PLUGIN_GO OR ENABLE_PLUGIN_SCRIPTS)
     set(NEED_NDSUDO TRUE)
 else()
     set(NEED_NDSUDO FALSE)
@@ -651,7 +667,6 @@ check_symbol_exists(strerror_r "string.h" HAVE_STRERROR_R)
 check_symbol_exists(finite "math.h" HAVE_FINITE)
 check_symbol_exists(isfinite "math.h" HAVE_ISFINITE)
 check_symbol_exists(dlsym "dlfcn.h" HAVE_DLSYM)
-check_symbol_exists(clearenv "stdlib.h" HAVE_CLEARENV)
 
 check_function_exists(setresuid HAVE_SETRESUID)
 check_function_exists(setresgid HAVE_SETRESGID)
@@ -1387,6 +1402,8 @@ set(DAEMON_FILES
         src/daemon/pipename.h
         src/daemon/unit_test.c
         src/daemon/unit_test.h
+        src/daemon/unit_test_bridge.c
+        src/daemon/unit_test_bridge.h
         src/daemon/dyncfg/dyncfg.c
         src/daemon/dyncfg/dyncfg.h
         src/daemon/dyncfg/dyncfg-files.c
@@ -1746,6 +1763,7 @@ set(PLUGINSD_PLUGIN_FILES
         src/plugins.d/pluginsd_dyncfg.c
         src/plugins.d/pluginsd_dyncfg.h
         src/plugins.d/pluginsd_functions.c
+        src/plugins.d/pluginsd_functions-unittest.c
         src/plugins.d/pluginsd_functions.h
         src/plugins.d/pluginsd_internals.c
         src/plugins.d/pluginsd_internals.h
@@ -1753,6 +1771,20 @@ set(PLUGINSD_PLUGIN_FILES
         src/plugins.d/pluginsd_parser.h
         src/plugins.d/pluginsd_replication.c
         src/plugins.d/pluginsd_replication.h
+)
+
+set(NRPC_FILES
+        src/nrpc/nrpc.h
+        src/nrpc/nrpc-internals.h
+        src/nrpc/nrpc-lifetime.h
+        src/nrpc/nrpc-builtin.c
+        src/nrpc/nrpc-calls.c
+        src/nrpc/nrpc-catalog.c
+        src/nrpc/nrpc-registry.c
+        src/nrpc/nrpc-serving.c
+        src/nrpc/nrpc-serving-internals.h
+        src/nrpc/nrpc-transport.h
+        src/nrpc/nrpc-unittest.c
 )
 
 set(RRD_PLUGIN_FILES
@@ -1773,13 +1805,7 @@ set(RRD_PLUGIN_FILES
         src/database/contexts/rrdcontext.c
         src/database/contexts/rrdcontext.h
         src/database/contexts/rrdcontext-worker.c
-        src/database/rrdcollector.c
-        src/database/rrdcollector.h
         src/database/rrddim.c
-        src/database/rrdfunctions.c
-        src/database/rrdfunctions.h
-        src/database/rrdfunctions-inline.c
-        src/database/rrdfunctions-inline.h
         src/database/rrdhost.c
         src/database/rrdlabels.c
         src/database/rrdlabels-aggregated.c
@@ -1813,13 +1839,6 @@ set(RRD_PLUGIN_FILES
         src/database/sqlite/sqlite_aclk_alert.h
         src/web/api/queries/KolmogorovSmirnovDist.c
         src/web/api/queries/KolmogorovSmirnovDist.h
-        src/database/rrdfunctions-inflight.c
-        src/database/rrdfunctions-inflight.h
-        src/database/rrdfunctions-exporters.c
-        src/database/rrdfunctions-exporters.h
-        src/database/rrdfunctions-unittest.c
-        src/database/rrdfunctions-internals.h
-        src/database/rrdcollector-internals.h
         src/database/rrd-database-mode.h
         src/database/rrd-database-mode.c
         src/database/rrdhost-system-info.c
@@ -1965,7 +1984,6 @@ set(STREAMING_PLUGIN_FILES
         src/streaming/stream-parents.c
         src/streaming/stream-handshake.c
         src/streaming/protocol/command-function.c
-        src/streaming/protocol/command-function-del.c
         src/streaming/protocol/command-host-labels.c
         src/streaming/protocol/command-chart-definition.c
         src/streaming/protocol/command-begin-set-end-v2.c
@@ -2138,6 +2156,8 @@ set(CGROUPS_PLUGIN_FILES
         src/collectors/cgroups.plugin/cgroup-snapshot-store.c
         src/collectors/cgroups.plugin/cgroup-snapshot-store.h
         src/collectors/cgroups.plugin/cgroup_ebpfgo_cachestat.c
+        src/collectors/cgroups.plugin/cgroup_ebpfgo_dcstat.c
+        src/collectors/cgroups.plugin/cgroup_ebpfgo_socket.c
         src/collectors/collectors-ipc/ebpfgo_shared_memory.c
         src/collectors/collectors-ipc/ebpfgo_shared_memory.h
         src/collectors/cgroups.plugin/cgroup_ebpfgo_shared_memory.c
@@ -2302,6 +2322,7 @@ set(NETDATA_FILES
         ${IDLEJITTER_PLUGIN_FILES}
         ${ML_FILES}
         ${PLUGINSD_PLUGIN_FILES}
+        ${NRPC_FILES}
         ${RRD_PLUGIN_FILES}
         ${REGISTRY_PLUGIN_FILES}
         ${STATSD_PLUGIN_FILES}
@@ -2374,6 +2395,7 @@ set(ACLK_PROTO_DEFS
         src/aclk/aclk-schemas/proto/nodeinstance/connection/v1/connection.proto
         src/aclk/aclk-schemas/proto/nodeinstance/create/v1/creation.proto
         src/aclk/aclk-schemas/proto/nodeinstance/info/v1/info.proto
+        src/aclk/aclk-schemas/proto/nodeinstance/manifest/v1/manifest.proto
         src/aclk/aclk-schemas/proto/context/v1/context.proto
         src/aclk/aclk-schemas/proto/context/v1/stream.proto
         src/aclk/aclk-schemas/proto/agent/v1/cmds.proto
@@ -2406,6 +2428,8 @@ set(ACLK_FILES
         src/aclk/schema-wrappers/alarm_config.h
         src/aclk/schema-wrappers/node_info.cc
         src/aclk/schema-wrappers/node_info.h
+        src/aclk/schema-wrappers/node_manifest.cc
+        src/aclk/schema-wrappers/node_manifest.h
         src/aclk/schema-wrappers/capability.cc
         src/aclk/schema-wrappers/capability.h
         src/aclk/schema-wrappers/proto_2_json.cc
@@ -3251,8 +3275,6 @@ if(ENABLE_PLUGIN_EBPF)
     set(EBPF_PLUGIN_FILES
             src/collectors/ebpf.plugin/ebpf.c
             src/collectors/ebpf.plugin/ebpf.h
-            src/collectors/ebpf.plugin/ebpf_dcstat.c
-            src/collectors/ebpf.plugin/ebpf_dcstat.h
             src/collectors/ebpf.plugin/ebpf_disk.c
             src/collectors/ebpf.plugin/ebpf_disk.h
             src/collectors/ebpf.plugin/ebpf_fd.c
@@ -3271,10 +3293,6 @@ if(ENABLE_PLUGIN_EBPF)
             src/collectors/ebpf.plugin/ebpf_process.h
             src/collectors/ebpf.plugin/ebpf_shm.c
             src/collectors/ebpf.plugin/ebpf_shm.h
-            src/collectors/ebpf.plugin/ebpf_socket.c
-            src/collectors/ebpf.plugin/ebpf_socket.h
-            src/collectors/ebpf.plugin/ebpf_socket_ipc.c
-            src/collectors/ebpf.plugin/ebpf_socket_ipc.h
             src/collectors/ebpf.plugin/ebpf_softirq.c
             src/collectors/ebpf.plugin/ebpf_softirq.h
             src/collectors/ebpf.plugin/ebpf_sync.c
@@ -3289,8 +3307,6 @@ if(ENABLE_PLUGIN_EBPF)
             src/collectors/ebpf.plugin/ebpf_cgroup.h
             src/collectors/ebpf.plugin/ebpf_unittest.c
             src/collectors/ebpf.plugin/ebpf_unittest.h
-            src/collectors/ebpf.plugin/ebpf_functions.c
-            src/collectors/ebpf.plugin/ebpf_functions.h
              src/collectors/ebpf.plugin/libbpf_api/ebpf.c
              src/collectors/ebpf.plugin/libbpf_api/ebpf.h
              src/collectors/ebpf.plugin/libbpf_api/ebpf_library.c
@@ -3387,12 +3403,13 @@ if(ENABLE_PLUGIN_EBPF)
             src/collectors/ebpf.plugin/ebpf.d/fd.conf
             src/collectors/ebpf.plugin/ebpf.d/filesystem.conf
             src/collectors/ebpf.plugin/ebpf.d/hardirq.conf
+            src/collectors/ebpf.plugin/ebpf.d/dns.conf
             src/collectors/ebpf.plugin/ebpf.d/mdflush.conf
             src/collectors/ebpf.plugin/ebpf.d/mount.conf
-            src/collectors/ebpf.plugin/ebpf.d/network.conf
             src/collectors/ebpf.plugin/ebpf.d/oomkill.conf
             src/collectors/ebpf.plugin/ebpf.d/process.conf
             src/collectors/ebpf.plugin/ebpf.d/shm.conf
+            src/collectors/ebpf.plugin/ebpf.d/socket.conf
             src/collectors/ebpf.plugin/ebpf.d/softirq.conf
             src/collectors/ebpf.plugin/ebpf.d/swap.conf
             src/collectors/ebpf.plugin/ebpf.d/sync.conf
@@ -3455,6 +3472,8 @@ if(ENABLE_PLUGIN_NETWORK_VIEWER)
                 src/collectors/network-viewer.plugin/network-viewer-apps-lookup-client.h
                 src/collectors/network-viewer.plugin/network-viewer-topology-containers.c
                 src/collectors/network-viewer.plugin/network-viewer-topology-containers.h
+                src/collectors/network-viewer.plugin/network-viewer-topology.c
+                src/collectors/network-viewer.plugin/network-viewer-topology.h
                 src/collectors/network-viewer.plugin/network-viewer.c
         )
 
@@ -3463,12 +3482,30 @@ if(ENABLE_PLUGIN_NETWORK_VIEWER)
                 list(APPEND NETWORK_VIEWER_FILES
                         src/libnetdata/local-sockets/local-sockets.h
                         src/collectors/network-viewer.plugin/network-viewer-apps-lookup-client.c
+                        src/collectors/collectors-ipc/ebpfgo_shared_memory.c
+                        src/collectors/collectors-ipc/ebpfgo_shared_memory.h
+                        src/collectors/collectors-ipc/ebpfgo_dns_shared_memory.c
+                        src/collectors/collectors-ipc/ebpfgo_dns_shared_memory.h
+                        src/collectors/network-viewer.plugin/network_viewer_ebpf_shared_memory.c
+                        src/collectors/network-viewer.plugin/network_viewer_ebpf_shared_memory.h
+                        src/collectors/network-viewer.plugin/network_viewer_dns_shared_memory.c
+                        src/collectors/network-viewer.plugin/network_viewer_dns_shared_memory.h
                         ${NETWORK_VIEWER_COMMON_FILES}
                 )
         endif()
         if(OS_WINDOWS)
                 list(APPEND NETWORK_VIEWER_FILES
                         src/collectors/network-viewer.plugin/network-viewer-windows.c
+                        src/collectors/common-cgroups/cgroup-path.c
+                        src/collectors/common-cgroups/cgroup-path.h
+                        src/collectors/common-cgroups/cgroup-topology-rules.c
+                        src/collectors/common-cgroups/cgroup-topology-rules.h
+                        src/collectors/network-viewer.plugin/network-viewer-apps-lookup-client.h
+                        src/collectors/network-viewer.plugin/network-viewer-topology-containers.c
+                        src/collectors/network-viewer.plugin/network-viewer-topology-containers.h
+                        src/collectors/network-viewer.plugin/network-viewer-topology.c
+                        src/collectors/network-viewer.plugin/network-viewer-topology.h
+                        src/libnetdata/local-sockets/local-sockets-windows.h
                 )
         endif()
         if(OS_FREEBSD)
@@ -3579,6 +3616,16 @@ if(OS_WINDOWS)
         configure_file(packaging/windows/Top.bmp Top.bmp COPYONLY)
         configure_file(packaging/windows/BackGround.bmp BackGround.bmp COPYONLY)
         configure_file(src/collectors/windows.plugin/driver/netdata_driver.inf netdata_driver.inf COPYONLY)
+endif()
+
+if(CMAKE_C_COMPILER_ID MATCHES "^(GNU|Clang|AppleClang)$" AND
+   NOT CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        set_property(
+                SOURCE src/daemon/unit_test_bridge.c
+                APPEND PROPERTY COMPILE_OPTIONS "-fno-lto" "-fvisibility=hidden")
+elseif(CMAKE_INTERPROCEDURAL_OPTIMIZATION)
+        message(WARNING
+                "Netdata test bridge cannot disable IPO for unsupported C compiler '${CMAKE_C_COMPILER_ID}'")
 endif()
 
 add_executable(netdata
@@ -4290,18 +4337,13 @@ if(BUILD_FOR_PACKAGING AND NETDATA_PACKAGING_FORMAT STREQUAL "rpm")
         # Linux 2) defaults %_docdir_fmt to %{NAME}-%{VERSION} where newer
         # rpm uses plain %{NAME}.
         if(NETDATA_DISTRO_SUSE)
-                set(NETDATA_RPM_DOC_DIR "usr/share/doc/packages/netdata")
+          set(NETDATA_RPM_DOC_DIR "usr/share/doc/packages/netdata")
         elseif((NETDATA_DISTRO_EL AND NETDATA_DISTRO_VERSION_MAJOR LESS_EQUAL 7) OR
                (NETDATA_DISTRO_AMZN AND NETDATA_DISTRO_VERSION_MAJOR LESS_EQUAL 2))
-                if(NETDATA_VERSION_DESCR STREQUAL "N/A")
-                        set(_rpm_doc_version "${NETDATA_VERSION_MAJOR}.${NETDATA_VERSION_MINOR}.${NETDATA_VERSION_PATCH}")
-                else()
-                        set(_rpm_doc_version "${NETDATA_VERSION_MAJOR}.${NETDATA_VERSION_MINOR}.${NETDATA_VERSION_PATCH}-${NETDATA_VERSION_TWEAK}-${NETDATA_VERSION_DESCR}")
-                endif()
-                string(REPLACE "-" "." _rpm_doc_version "${_rpm_doc_version}")
-                set(NETDATA_RPM_DOC_DIR "usr/share/doc/netdata-${_rpm_doc_version}")
+          string(REPLACE "-" "." _rpm_doc_version "${NETDATA_PACKAGE_VERSION}")
+          set(NETDATA_RPM_DOC_DIR "usr/share/doc/netdata-${_rpm_doc_version}")
         else()
-                set(NETDATA_RPM_DOC_DIR "usr/share/doc/netdata")
+          set(NETDATA_RPM_DOC_DIR "usr/share/doc/netdata")
         endif()
         install(FILES
                 README.md
@@ -4429,15 +4471,12 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         configure_file(tests/urls/request.sh.in tests/urls/request.sh @ONLY)
         configure_file(tests/alarm_repetition/alarm.sh.in tests/alarm_repetition/alarm.sh @ONLY)
         configure_file(tests/template_dimension/template_dim.sh.in tests/template_dimension/template_dim.sh @ONLY)
-        configure_file(tests/ebpf/ebpf_thread_function.sh.in tests/ebpf/ebpf_thread_function.sh @ONLY)
-
         install(FILES
                 ${CMAKE_BINARY_DIR}/tests/health_mgmtapi/health-cmdapi-test.sh
                 ${CMAKE_BINARY_DIR}/tests/acls/acl.sh
                 ${CMAKE_BINARY_DIR}/tests/urls/request.sh
                 ${CMAKE_BINARY_DIR}/tests/alarm_repetition/alarm.sh
                 ${CMAKE_BINARY_DIR}/tests/template_dimension/template_dim.sh
-                ${CMAKE_BINARY_DIR}/tests/ebpf/ebpf_thread_function.sh
                 DESTINATION usr/libexec/netdata/plugins.d)
 endif()
 
@@ -4536,7 +4575,6 @@ if(ENABLE_PLUGIN_PYTHON)
   install(FILES
           src/collectors/python.d.plugin/am2320/am2320.conf
           src/collectors/python.d.plugin/go_expvar/go_expvar.conf
-          src/collectors/python.d.plugin/haproxy/haproxy.conf
           src/collectors/python.d.plugin/pandas/pandas.conf
           src/collectors/python.d.plugin/traefik/traefik.conf
           COMPONENT plugin-pythond
@@ -4545,7 +4583,6 @@ if(ENABLE_PLUGIN_PYTHON)
   install(FILES
           src/collectors/python.d.plugin/am2320/am2320.chart.py
           src/collectors/python.d.plugin/go_expvar/go_expvar.chart.py
-          src/collectors/python.d.plugin/haproxy/haproxy.chart.py
           src/collectors/python.d.plugin/pandas/pandas.chart.py
           src/collectors/python.d.plugin/traefik/traefik.chart.py
           COMPONENT plugin-pythond
